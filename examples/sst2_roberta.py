@@ -1,284 +1,301 @@
-import argparse
-import time
+"""Paired fixed-C versus main-SlaClip DP-LoRA experiment on SST-2."""
 
-from tqdm import tqdm
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import time
+from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from peft import LoraConfig, get_peft_model
+from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-from dp_lora import DPLoRAEngine
+from dp_lora import (
+    DPLoRAEngine,
+    GradientObservationConfig,
+    SlaClipConfig,
+)
 from dp_lora.data.virtual_batch import VirtualBatchManager
 
-# ---------------------------------------------------------------------------
-# Fixed hyperparameters
-# ---------------------------------------------------------------------------
-LOGICAL_BATCH_SIZE = 256
-PHYSICAL_BATCH_SIZE = 32
-EPOCHS = 3
-LR = 5e-4
-MAX_GRAD_NORM = 1.0
-MAX_SEQ_LENGTH = 128
-SEED = 42
 
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Matched fixed-C baseline and main-SlaClip DP-LoRA on SST-2"
+    )
+    parser.add_argument(
+        "--clipping",
+        choices=["fixed", "slaclip", "both"],
+        default="both",
+        help="'both' runs the required paired comparison with identical shared settings",
+    )
+    parser.add_argument("--lora-method", choices=["ffa", "vanilla"], default="ffa")
+    parser.add_argument("--model", default="roberta-base")
+    parser.add_argument("--rank", type=int, default=8)
+    parser.add_argument("--epsilon", type=float, default=8.0)
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--logical-batch-size", type=int, default=256)
+    parser.add_argument("--physical-batch-size", type=int, default=32)
+    parser.add_argument("--learning-rate", type=float, default=5e-4)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--max-seq-length", type=int, default=128)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--device", choices=["auto", "cpu", "cuda", "mps"], default="auto"
+    )
+    parser.add_argument(
+        "--K", type=int, default=None, help="SlaClip slots; omit for paper rule"
+    )
+    parser.add_argument("--eta", type=float, default=0.2)
+    parser.add_argument("--beta", type=float, default=0.5)
+    parser.add_argument("--c-min", type=float, default=0.1)
+    parser.add_argument("--c-max", type=float, default=50.0)
+    parser.add_argument("--output-dir", default="results/sst2")
+    parser.add_argument(
+        "--observe-private-gradients",
+        action="store_true",
+        help="Write exact gradient norms/histograms for trusted analysis (NOT DP)",
+    )
+    parser.add_argument(
+        "--acknowledge-non-dp-diagnostics",
+        action="store_true",
+        help="Required second switch for exact private diagnostics",
+    )
+    parser.add_argument("--diagnostic-bins", type=int, default=20)
+    parser.add_argument("--store-per-sample-norms", action="store_true")
+    return parser.parse_args()
 
-def parse_args():
-    p = argparse.ArgumentParser(description="DP-LoRA SST-2 benchmark")
-    p.add_argument("--method", choices=["ffa", "vanilla", "none"], default="ffa",
-                    help="DP method: ffa, vanilla, or none (no DP baseline)")
-    p.add_argument("--epsilon", type=float, default=8.0,
-                    help="Target privacy budget epsilon (ignored if method=none)")
-    p.add_argument("--rank", type=int, default=8, help="LoRA rank")
-    p.add_argument("--device", type=str, default=None,
-                    help="Device: 'mps', 'cpu', or 'cuda'. Auto-detected if omitted.")
-    return p.parse_args()
 
-
-def get_device(requested):
-    if requested:
+def choose_device(requested: str) -> torch.device:
+    if requested != "auto":
         return torch.device(requested)
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
     if torch.cuda.is_available():
         return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
     return torch.device("cpu")
 
 
-# ---------------------------------------------------------------------------
-# Data
-# ---------------------------------------------------------------------------
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-def load_sst2(tokenizer):
+
+def prepare_data(tokenizer, max_length: int):
     dataset = load_dataset("glue", "sst2")
-    train_ds = dataset["train"]
-    val_ds = dataset["validation"]
 
     def tokenize(batch):
         return tokenizer(
-            batch["sentence"], padding="max_length",
-            truncation=True, max_length=MAX_SEQ_LENGTH,
+            batch["sentence"],
+            padding="max_length",
+            truncation=True,
+            max_length=max_length,
         )
 
-    train_ds = train_ds.map(tokenize, batched=True, remove_columns=["sentence", "idx"])
-    val_ds = val_ds.map(tokenize, batched=True, remove_columns=["sentence", "idx"])
-
-    train_ds = train_ds.rename_column("label", "labels")
-    val_ds = val_ds.rename_column("label", "labels")
-
-    train_ds.set_format("torch")
-    val_ds.set_format("torch")
-
-    return train_ds, val_ds
+    prepared = dataset.map(tokenize, batched=True, remove_columns=["sentence", "idx"])
+    prepared = prepared.rename_column("label", "labels")
+    prepared.set_format("torch")
+    return prepared["train"], prepared["validation"]
 
 
 def collate_fn(batch):
     return {
-        "input_ids": torch.stack([b["input_ids"] for b in batch]),
-        "attention_mask": torch.stack([b["attention_mask"] for b in batch]),
-        "labels": torch.stack([b["labels"] for b in batch]),
+        "input_ids": torch.stack([item["input_ids"] for item in batch]),
+        "attention_mask": torch.stack([item["attention_mask"] for item in batch]),
+        "labels": torch.stack([item["labels"] for item in batch]),
     }
 
 
-# ---------------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------------
-
 @torch.no_grad()
-def evaluate(model, val_loader, device):
+def evaluate(model, loader, device) -> dict[str, float]:
     model.eval()
-    correct = total = 0
-    for batch in val_loader:
-        batch = {k: v.to(device) for k, v in batch.items()}
-        out = model(**batch)
-        preds = out.logits.argmax(dim=-1)
-        correct += (preds == batch["labels"]).sum().item()
-        total += len(batch["labels"])
-    return correct / total
+    labels, predictions, probabilities = [], [], []
+    for batch in loader:
+        batch = {key: value.to(device) for key, value in batch.items()}
+        logits = model(**batch).logits
+        labels.append(batch["labels"].cpu())
+        predictions.append(logits.argmax(dim=-1).cpu())
+        probabilities.append(logits.softmax(dim=-1).cpu())
 
-
-# ---------------------------------------------------------------------------
-# Training
-# ---------------------------------------------------------------------------
-
-def train_one_epoch_dp(model, train_loader, dp_optimizer, device, engine, epoch, epochs):
-    """DP training with virtual batching."""
-    model.train()
-    total_loss = 0
-    n_micro_batches = 0
-
-    with VirtualBatchManager(
-        data_loader=train_loader,
-        max_physical_batch_size=PHYSICAL_BATCH_SIZE,
-        optimizer=dp_optimizer,
-    ) as vb_loader:
-        pbar = tqdm(vb_loader, desc=f"Epoch {epoch}/{epochs}", leave=True)
-        for batch in pbar:
-            batch = {k: v.to(device) for k, v in batch.items()}
-
-            dp_optimizer.zero_grad()
-            out = model(**batch)
-            loss = out.loss
-            loss.backward()
-
-            per_sample_grads = engine.grad_sample_module.get_per_sample_grads()
-            dp_optimizer.step(per_sample_grads)
-            engine.grad_sample_module.clear_per_sample_grads()
-
-            total_loss += loss.item()
-            n_micro_batches += 1
-            pbar.set_postfix(loss=f"{total_loss/n_micro_batches:.4f}")
-
-    return total_loss / max(n_micro_batches, 1)
-
-
-def train_one_epoch_nodp(model, train_loader, optimizer, device, epoch, epochs):
-    """Standard (non-DP) training."""
-    model.train()
-    total_loss = 0
-    n_batches = 0
-
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}", leave=True)
-    for batch in pbar:
-        batch = {k: v.to(device) for k, v in batch.items()}
-
-        optimizer.zero_grad()
-        out = model(**batch)
-        loss = out.loss
-        loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
-        optimizer.step()
-
-        total_loss += loss.item()
-        n_batches += 1
-        pbar.set_postfix(loss=f"{total_loss/n_batches:.4f}")
-
-    return total_loss / max(n_batches, 1)
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main():
-    args = parse_args()
-    torch.manual_seed(SEED)
-    np.random.seed(SEED)
-
-    device = get_device(args.device)
-    use_dp = args.method != "none"
-
-    print("=" * 50)
-    print("DP-LoRA Experiment")
-    print("=" * 50)
-
-    # Load model + tokenizer
-    model_name = "roberta-base"
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    base_model = AutoModelForSequenceClassification.from_pretrained(
-        model_name, num_labels=2,
+    y_true = torch.cat(labels).numpy()
+    y_pred = torch.cat(predictions).numpy()
+    y_prob = torch.cat(probabilities).numpy()
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="macro", zero_division=0
     )
-
-    # Apply LoRA
-    lora_config = LoraConfig(
-        r=args.rank,
-        lora_alpha=2 * args.rank,
-        target_modules=["query", "value"],
-        lora_dropout=0.0,
-        bias="none",
-        task_type="SEQ_CLS",
-    )
-    model = get_peft_model(base_model, lora_config)
-
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    # Load data
-    train_ds, val_ds = load_sst2(tokenizer)
-    # DP uses logical batch (256) split into physical micro-batches (32).
-    # No-DP baseline uses physical batch directly (no virtual batching needed).
-    batch_size = LOGICAL_BATCH_SIZE if use_dp else PHYSICAL_BATCH_SIZE
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              collate_fn=collate_fn, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=PHYSICAL_BATCH_SIZE, collate_fn=collate_fn)
-
-    N = len(train_ds)
-    delta = N ** (-1.1)
-
-    # Set up DP (or not)
-    engine = DPLoRAEngine()
-    dp_optimizer = None 
-
-    if use_dp:
-        optimizer = torch.optim.AdamW(
-            [p for p in model.parameters() if p.requires_grad], lr=LR
-        )
-        model, dp_optimizer, train_loader = engine.make_private_with_epsilon(
-            model=model,
-            optimizer=optimizer,
-            data_loader=train_loader,
-            target_epsilon=args.epsilon,
-            target_delta=delta,
-            epochs=EPOCHS,
-            max_grad_norm=MAX_GRAD_NORM,
-            method=args.method,
-            poisson_sampling=True,
-        )
-        # Recount trainable after FFA may have frozen lora_A
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if y_prob.shape[1] == 2:
+        auc = roc_auc_score(y_true, y_prob[:, 1])
     else:
-        optimizer = torch.optim.AdamW(
-            [p for p in model.parameters() if p.requires_grad], lr=LR
-        )
-        engine = None
+        auc = roc_auc_score(y_true, y_prob, multi_class="ovr", average="macro")
+    return {
+        "accuracy": float((y_true == y_pred).mean()),
+        "macro_precision": float(precision),
+        "macro_recall": float(recall),
+        "macro_f1": float(f1),
+        "macro_ovr_roc_auc": float(auc),
+    }
 
+
+def train_epoch(model, loader, optimizer, engine, device, physical_batch_size):
+    model.train()
+    loss_sum = 0.0
+    microbatches = 0
+    with VirtualBatchManager(
+        data_loader=loader,
+        max_physical_batch_size=physical_batch_size,
+        optimizer=optimizer,
+    ) as physical_loader:
+        for batch in tqdm(physical_loader, leave=False):
+            batch = {key: value.to(device) for key, value in batch.items()}
+            optimizer.zero_grad()
+            loss = model(**batch).loss
+            loss.backward()
+            per_sample_grads = engine.grad_sample_module.get_per_sample_grads()
+            optimizer.step(per_sample_grads)
+            engine.grad_sample_module.clear_per_sample_grads()
+            loss_sum += float(loss.item())
+            microbatches += 1
+    return loss_sum / max(1, microbatches)
+
+
+def run_one(args, clipping_mode, train_dataset, validation_dataset, device):
+    seed_everything(args.seed)
+    base_model = AutoModelForSequenceClassification.from_pretrained(
+        args.model, num_labels=2
+    )
+    model = get_peft_model(
+        base_model,
+        LoraConfig(
+            r=args.rank,
+            lora_alpha=2 * args.rank,
+            target_modules=["query", "value"],
+            lora_dropout=0.0,
+            bias="none",
+            task_type="SEQ_CLS",
+        ),
+    )
+    loader_generator = torch.Generator().manual_seed(args.seed)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.logical_batch_size,
+        shuffle=True,
+        generator=loader_generator,
+        collate_fn=collate_fn,
+    )
+    validation_loader = DataLoader(
+        validation_dataset,
+        batch_size=args.physical_batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+    )
+    delta = len(train_dataset) ** -1.1
+    optimizer = torch.optim.AdamW(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=args.learning_rate,
+    )
+    run_dir = Path(args.output_dir) / f"{clipping_mode}_seed{args.seed}"
+    observation = GradientObservationConfig(
+        enabled=args.observe_private_gradients,
+        acknowledge_non_dp=args.acknowledge_non_dp_diagnostics,
+        output_dir=str(run_dir / "private_diagnostics"),
+        histogram_bins=args.diagnostic_bins,
+        store_per_sample_norms=args.store_per_sample_norms,
+    )
+    slaclip = SlaClipConfig(
+        num_slots=args.K,
+        eta=args.eta,
+        beta=args.beta,
+        c_min=args.c_min,
+        c_max=args.c_max,
+    )
+    engine = DPLoRAEngine()
+    model, optimizer, train_loader = engine.make_private_with_epsilon(
+        model=model,
+        optimizer=optimizer,
+        data_loader=train_loader,
+        target_epsilon=args.epsilon,
+        target_delta=delta,
+        epochs=args.epochs,
+        max_grad_norm=args.max_grad_norm,
+        method=args.lora_method,
+        clipping_mode=clipping_mode,
+        slaclip=slaclip,
+        gradient_observation=observation,
+    )
     model.to(device)
 
-    print(f"Model: {model_name}")
-    print(f"Dataset: SST-2 ({N} train / {len(val_ds)} val)")
-    if use_dp:
-        print(f"Method: {args.method} | Rank: {args.rank} | "
-              f"Target eps: {args.epsilon} | delta: {delta:.2e}")
-        print(f"Noise multiplier: {dp_optimizer.noise_multiplier:.4f}")
-        print(f"Batch: logical={LOGICAL_BATCH_SIZE}, physical={PHYSICAL_BATCH_SIZE}")
-    else:
-        print(f"Method: none (no DP) | Rank: {args.rank}")
-    print(f"Trainable params: {trainable_params:,} ({100*trainable_params/total_params:.2f}% of {total_params:,})")
-    print("-" * 50)
+    epochs = []
+    start = time.time()
+    for epoch in range(1, args.epochs + 1):
+        epoch_start = time.time()
+        loss = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            engine,
+            device,
+            args.physical_batch_size,
+        )
+        metrics = evaluate(model, validation_loader, device)
+        record = {
+            "epoch": epoch,
+            "loss": loss,
+            "epsilon": engine.get_epsilon(),
+            "seconds": time.time() - epoch_start,
+            **metrics,
+        }
+        epochs.append(record)
+        print(json.dumps({"clipping": clipping_mode, **record}, sort_keys=True))
 
-    # Training loop
-    for epoch in range(1, EPOCHS + 1):
-        t0 = time.time()
-        if use_dp:
-            avg_loss = train_one_epoch_dp(model, train_loader, dp_optimizer, device, engine, epoch, EPOCHS)
-        else:
-            avg_loss = train_one_epoch_nodp(model, train_loader, optimizer, device, epoch, EPOCHS)
-        val_acc = evaluate(model, val_loader, device)
-        elapsed = time.time() - t0
+    run_dir.mkdir(parents=True, exist_ok=True)
+    result = {
+        "clipping": clipping_mode,
+        "lora_method": args.lora_method,
+        "seed": args.seed,
+        "rank": args.rank,
+        "target_epsilon": args.epsilon,
+        "final_epsilon": engine.get_epsilon(),
+        "delta": delta,
+        "noise_multiplier": optimizer.noise_multiplier,
+        "logical_batch_size": optimizer.expected_batch_size,
+        "sample_rate": engine.sample_rate,
+        "epochs": epochs,
+        "total_seconds": time.time() - start,
+        "exact_diagnostics_enabled": args.observe_private_gradients,
+    }
+    (run_dir / "metrics.json").write_text(
+        json.dumps(result, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    return result
 
-        if use_dp:
-            eps = engine.get_epsilon()
-            print(f"Epoch {epoch}/{EPOCHS}: loss={avg_loss:.4f}, "
-                  f"val_acc={100*val_acc:.2f}%, eps={eps:.2f} "
-                  f"({elapsed:.0f}s)")
-        else:
-            print(f"Epoch {epoch}/{EPOCHS}: loss={avg_loss:.4f}, "
-                  f"val_acc={100*val_acc:.2f}% ({elapsed:.0f}s)")
 
-    print("-" * 50)
-    final_acc = evaluate(model, val_loader, device)
-    if use_dp:
-        final_eps = engine.get_epsilon()
-        print(f"Final: val_acc={100*final_acc:.2f}%, "
-              f"eps={final_eps:.2f}, delta={delta:.2e}")
-    else:
-        print(f"Final: val_acc={100*final_acc:.2f}% (no DP)")
+def main() -> None:
+    args = parse_args()
+    if args.observe_private_gradients and not args.acknowledge_non_dp_diagnostics:
+        raise SystemExit(
+            "--observe-private-gradients requires --acknowledge-non-dp-diagnostics"
+        )
+    device = choose_device(args.device)
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    train_dataset, validation_dataset = prepare_data(tokenizer, args.max_seq_length)
+    modes = ["fixed", "slaclip"] if args.clipping == "both" else [args.clipping]
+    results = [
+        run_one(args, mode, train_dataset, validation_dataset, device) for mode in modes
+    ]
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / f"paired_seed{args.seed}.json").write_text(
+        json.dumps(results, indent=2, sort_keys=True), encoding="utf-8"
+    )
 
 
 if __name__ == "__main__":

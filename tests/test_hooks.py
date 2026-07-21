@@ -33,9 +33,7 @@ class TestLinearHooks2D:
         inputs = torch.randn(5, 8)
 
         # Ground truth
-        gt = _ground_truth_per_sample_grads(
-            layer, inputs, lambda out: out.sum()
-        )
+        gt = _ground_truth_per_sample_grads(layer, inputs, lambda out: out.sum())
 
         # Hook-based
         h1 = layer.register_forward_hook(linear_forward_hook)
@@ -53,6 +51,36 @@ class TestLinearHooks2D:
         assert hook_grads.shape == gt.shape
         torch.testing.assert_close(hook_grads, gt, atol=1e-5, rtol=1e-4)
 
+    def test_mean_reduction_is_restored_to_per_sample_scale(self):
+        torch.manual_seed(7)
+        layer = nn.Linear(3, 2, bias=False)
+        inputs = torch.randn(4, 3)
+        targets = torch.randn(4, 2)
+
+        truth = []
+        for i in range(4):
+            layer.zero_grad()
+            loss_i = nn.functional.mse_loss(
+                layer(inputs[i : i + 1]), targets[i : i + 1], reduction="mean"
+            )
+            loss_i.backward()
+            truth.append(layer.weight.grad.clone())
+        truth = torch.stack(truth)
+
+        layer._dp_loss_reduction = "mean"
+        h1 = layer.register_forward_hook(linear_forward_hook)
+        h2 = layer.register_full_backward_hook(linear_backward_hook)
+        layer.zero_grad()
+        # Mean over all B * output coordinates. Restoring B gives each
+        # sample's loss averaged over output coordinates, matching truth.
+        nn.functional.mse_loss(layer(inputs), targets, reduction="mean").backward()
+        observed = layer._dp_per_sample_grad_weight
+        h1.remove()
+        h2.remove()
+        del layer._dp_loss_reduction
+
+        torch.testing.assert_close(observed, truth, atol=1e-5, rtol=1e-4)
+
     def test_per_sample_grad_with_nonuniform_loss(self):
         torch.manual_seed(42)
         layer = nn.Linear(8, 4, bias=False)
@@ -61,7 +89,8 @@ class TestLinearHooks2D:
 
         # Ground truth
         gt = _ground_truth_per_sample_grads(
-            layer, inputs,
+            layer,
+            inputs,
             lambda out: nn.functional.mse_loss(out, targets[0:1], reduction="sum"),
         )
 

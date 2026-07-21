@@ -27,6 +27,14 @@ def linear_backward_hook(
     activations = module._dp_activations  # [B, (seq,) in_features]
     grad_out = grad_output[0]  # [B, (seq,) out_features]
 
+    # PyTorch/Hugging Face losses normally reduce by the batch mean. Backward
+    # hooks then see (1/B) * dL_i/dy. DP-SGD needs the unreduced per-example
+    # gradients before clipping, so restore that factor here. Direct users of
+    # this hook retain the historical "sum" behavior unless the wrapper sets
+    # the marker explicitly.
+    if getattr(module, "_dp_loss_reduction", "sum") == "mean":
+        grad_out = grad_out * activations.shape[0]
+
     if activations.dim() == 3:
         # [B, seq, out] x [B, seq, in] -> [B, out, in] (sum over seq)
         per_sample_grad = torch.einsum("bso,bsi->boi", grad_out, activations)

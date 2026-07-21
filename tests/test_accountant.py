@@ -34,34 +34,55 @@ class TestPrivacyAccountant:
             acc.step()
         assert acc.steps == 10
 
+    def test_checkpoint_round_trip(self):
+        original = PrivacyAccountant(noise_multiplier=1.2, sample_rate=0.02, delta=1e-5)
+        for _ in range(7):
+            original.step()
+        state = original.state_dict()
+
+        restored = PrivacyAccountant(noise_multiplier=1.2, sample_rate=0.02, delta=1e-5)
+        restored.load_state_dict(state)
+        assert restored.steps == 7
+        assert restored.get_epsilon() == pytest.approx(original.get_epsilon())
+
 
 class TestGetNoiseMultiplier:
     def test_returns_positive_sigma(self):
         sigma = get_noise_multiplier(
-            target_epsilon=8.0, target_delta=1e-5,
-            sample_rate=0.01, epochs=1,
+            target_epsilon=8.0,
+            target_delta=1e-5,
+            sample_rate=0.01,
+            epochs=1,
         )
         assert sigma > 0
 
     def test_tighter_epsilon_requires_more_noise(self):
         sigma_loose = get_noise_multiplier(
-            target_epsilon=8.0, target_delta=1e-5,
-            sample_rate=0.01, epochs=1,
+            target_epsilon=8.0,
+            target_delta=1e-5,
+            sample_rate=0.01,
+            epochs=1,
         )
         sigma_tight = get_noise_multiplier(
-            target_epsilon=1.0, target_delta=1e-5,
-            sample_rate=0.01, epochs=1,
+            target_epsilon=1.0,
+            target_delta=1e-5,
+            sample_rate=0.01,
+            epochs=1,
         )
         assert sigma_tight > sigma_loose
 
     def test_more_epochs_requires_more_noise(self):
         sigma_1 = get_noise_multiplier(
-            target_epsilon=8.0, target_delta=1e-5,
-            sample_rate=0.01, epochs=1,
+            target_epsilon=8.0,
+            target_delta=1e-5,
+            sample_rate=0.01,
+            epochs=1,
         )
         sigma_10 = get_noise_multiplier(
-            target_epsilon=8.0, target_delta=1e-5,
-            sample_rate=0.01, epochs=10,
+            target_epsilon=8.0,
+            target_delta=1e-5,
+            sample_rate=0.01,
+            epochs=10,
         )
         assert sigma_10 > sigma_1
 
@@ -74,12 +95,16 @@ class TestGetNoiseMultiplier:
         steps = int(1 / sample_rate) * epochs
 
         sigma = get_noise_multiplier(
-            target_epsilon=target_eps, target_delta=delta,
-            sample_rate=sample_rate, epochs=epochs,
+            target_epsilon=target_eps,
+            target_delta=delta,
+            sample_rate=sample_rate,
+            epochs=epochs,
         )
 
         # Now verify by running the accountant
-        acc = PrivacyAccountant(noise_multiplier=sigma, sample_rate=sample_rate, delta=delta)
+        acc = PrivacyAccountant(
+            noise_multiplier=sigma, sample_rate=sample_rate, delta=delta
+        )
         for _ in range(steps):
             acc.step()
 

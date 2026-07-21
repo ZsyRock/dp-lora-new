@@ -20,7 +20,9 @@ class TestSkipAccumulate:
         param = nn.Parameter(torch.ones(4))
         optimizer = torch.optim.SGD([param], lr=1.0)
         dp_opt = DPOptimizer(
-            optimizer, noise_multiplier=0.0, max_grad_norm=100.0,
+            optimizer,
+            noise_multiplier=0.0,
+            max_grad_norm=100.0,
             expected_batch_size=6,
         )
 
@@ -42,7 +44,9 @@ class TestSkipAccumulate:
         param = nn.Parameter(torch.zeros(4))
         optimizer = torch.optim.SGD([param], lr=1.0)
         dp_opt = DPOptimizer(
-            optimizer, noise_multiplier=0.0, max_grad_norm=100.0,
+            optimizer,
+            noise_multiplier=0.0,
+            max_grad_norm=100.0,
             expected_batch_size=6,
         )
 
@@ -68,7 +72,9 @@ class TestSkipAccumulate:
         param = nn.Parameter(torch.zeros(4))
         optimizer = torch.optim.SGD([param], lr=1.0)
         dp_opt = DPOptimizer(
-            optimizer, noise_multiplier=0.0, max_grad_norm=100.0,
+            optimizer,
+            noise_multiplier=0.0,
+            max_grad_norm=100.0,
             expected_batch_size=1,
         )
 
@@ -85,7 +91,9 @@ class TestSkipAccumulate:
         param = nn.Parameter(torch.zeros(4))
         optimizer = torch.optim.SGD([param], lr=1.0)
         dp_opt = DPOptimizer(
-            optimizer, noise_multiplier=0.0, max_grad_norm=100.0,
+            optimizer,
+            noise_multiplier=0.0,
+            max_grad_norm=100.0,
             expected_batch_size=1,
         )
 
@@ -100,7 +108,9 @@ class TestSkipAccumulate:
         param = nn.Parameter(torch.zeros(4))
         optimizer = torch.optim.SGD([param], lr=1.0)
         dp_opt = DPOptimizer(
-            optimizer, noise_multiplier=0.0, max_grad_norm=100.0,
+            optimizer,
+            noise_multiplier=0.0,
+            max_grad_norm=100.0,
             expected_batch_size=1,
         )
 
@@ -124,7 +134,9 @@ class TestSkipAccumulate:
         param = nn.Parameter(torch.zeros(4))
         optimizer = torch.optim.SGD([param], lr=1.0)
         dp_opt = DPOptimizer(
-            optimizer, noise_multiplier=1.0, max_grad_norm=1.0,
+            optimizer,
+            noise_multiplier=1.0,
+            max_grad_norm=1.0,
             expected_batch_size=1,
         )
 
@@ -162,9 +174,11 @@ class TestVirtualBatchManagerEndToEnd:
         torch.manual_seed(42)
         base = SimpleModel()
         config = LoraConfig(
-            r=2, lora_alpha=4,
+            r=2,
+            lora_alpha=4,
             target_modules=["linear1", "linear2"],
-            lora_dropout=0.0, bias="none",
+            lora_dropout=0.0,
+            bias="none",
         )
         model = get_peft_model(base, config)
 
@@ -184,6 +198,7 @@ class TestVirtualBatchManagerEndToEnd:
             max_grad_norm=1.0,
             method="ffa",
             poisson_sampling=False,
+            accounting_mode="disabled",
         )
         return model, dp_opt, dp_loader, engine
 
@@ -206,4 +221,4 @@ class TestVirtualBatchManagerEndToEnd:
                 engine.grad_sample_module.clear_per_sample_grads()
 
         # Should have processed all data
-        assert engine.accountant.steps > 0
+        assert dp_opt._logical_steps > 0

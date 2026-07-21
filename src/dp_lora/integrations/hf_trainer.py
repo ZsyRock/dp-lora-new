@@ -36,6 +36,11 @@ class DPLoRATrainer(Trainer):
         self.dp_config = dp_config
         self.dp_engine = DPLoRAEngine()
         self._dp_initialized = False
+        if self.args.world_size != 1:
+            raise NotImplementedError(
+                "DPLoRATrainer currently supports one process only; distributed "
+                "Poisson sampling requires a separately validated accountant path."
+            )
 
         # DP-SGD is incompatible with gradient accumulation
         if self.args.gradient_accumulation_steps != 1:
@@ -45,6 +50,14 @@ class DPLoRATrainer(Trainer):
                 self.args.gradient_accumulation_steps,
             )
             self.args.gradient_accumulation_steps = 1
+        if self.args.fp16 or self.args.bf16:
+            raise NotImplementedError(
+                "Mixed-precision loss scaling is not yet connected to the custom "
+                "per-sample gradients. Use fp32 to preserve clipping semantics."
+            )
+        # Transformers applies its own ordinary global clipping directly in the
+        # loop. DPOptimizer performs the required per-sample clipping instead.
+        self.args.max_grad_norm = 0.0
 
     def _dp_setup(self) -> None:
         """Initialize DP wrapping. Called lazily before first training step."""
@@ -62,8 +75,13 @@ class DPLoRATrainer(Trainer):
                 max_grad_norm=self.dp_config.max_grad_norm,
                 method=self.dp_config.method,
                 adapter_name=self.dp_config.adapter_name,
+                clipping_mode=self.dp_config.clipping_mode,
+                slaclip=self.dp_config.slaclip,
                 poisson_sampling=self.dp_config.poisson_sampling,
+                target_delta=self.dp_config.target_delta,
+                loss_reduction=self.dp_config.loss_reduction,
                 ghost_clipping=self.dp_config.ghost_clipping,
+                gradient_observation=self.dp_config.gradient_observation,
             )
         else:
             self.model, dp_optimizer, self._dp_dataloader = (
@@ -77,8 +95,12 @@ class DPLoRATrainer(Trainer):
                     max_grad_norm=self.dp_config.max_grad_norm,
                     method=self.dp_config.method,
                     adapter_name=self.dp_config.adapter_name,
+                    clipping_mode=self.dp_config.clipping_mode,
+                    slaclip=self.dp_config.slaclip,
                     poisson_sampling=self.dp_config.poisson_sampling,
+                    loss_reduction=self.dp_config.loss_reduction,
                     ghost_clipping=self.dp_config.ghost_clipping,
+                    gradient_observation=self.dp_config.gradient_observation,
                 )
             )
 
@@ -92,6 +114,11 @@ class DPLoRATrainer(Trainer):
     def get_train_dataloader(self) -> DataLoader:
         """Return Poisson-sampled dataloader."""
         if not self._dp_initialized:
+            # Recent Transformers versions request the loader before creating
+            # the optimizer. Create the ordinary optimizer now so _dp_setup can
+            # wrap it; the later create_optimizer() call is then a no-op.
+            if self.optimizer is None:
+                super().create_optimizer()
             self._dp_setup()
         return self._dp_dataloader
 
@@ -119,31 +146,13 @@ class DPLoRATrainer(Trainer):
         # Collect per-sample grads, clip, accumulate into _dp_summed_grad
         if self.dp_engine.grad_sample_module is not None:
             per_sample_grads = self.dp_engine.grad_sample_module.get_per_sample_grads()
-            self.optimizer.clip_and_accumulate(per_sample_grads)
+            # ``self.optimizer`` may already be Accelerate's wrapper, which
+            # deliberately exposes only the standard Optimizer API. Accumulate
+            # on the underlying DP object; Accelerate later calls its step().
+            self.dp_engine._dp_optimizer.clip_and_accumulate(per_sample_grads)
             self.dp_engine.grad_sample_module.clear_per_sample_grads()
-        elif self.dp_engine.ghost_clipping_module is not None:
-            gcm = self.dp_engine.ghost_clipping_module
-            clip_factors = gcm.compute_clip_factors(self.dp_config.max_grad_norm)
-            # TODO: ghost clipping requires a second backward pass with scaled
-            # losses, which is complex to integrate with the Trainer. For now,
-            # fall back to materializing and clipping manually.
-            logger.warning(
-                "Ghost clipping in DPLoRATrainer is not yet fully supported. "
-                "Use the engine API directly for ghost clipping."
-            )
-            gcm.clear_state()
 
         return loss.detach()
-
-    def _clip_grad_norm(self, model):
-        """Override: DP-SGD does its own per-sample clipping, skip Trainer's."""
-        return None
-
-    def _inner_training_loop(self, *args, **kwargs):
-        """Ensure DP is set up before training begins."""
-        if not self._dp_initialized:
-            self._dp_setup()
-        return super()._inner_training_loop(*args, **kwargs)
 
     def get_epsilon(self, delta: Optional[float] = None) -> float:
         """Get current (epsilon, delta)-DP guarantee."""
