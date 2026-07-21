@@ -13,9 +13,12 @@ PEP 440 form `0.2.0rc1`.
 - Correct mean-loss per-sample gradient scaling, Poisson sampling/accounting,
   virtual-batch updates and resumable DP state.
 - Add exact, opt-in private gradient diagnostics with an explicit non-DP
-  acknowledgement and Git-ignored output paths.
+  acknowledgement, per-parameter summaries, logical-step traces and Git-ignored
+  output paths.
 - Add paired SST-2 runners, five classification metrics and reproducible sweep
   entry points.
+- Handle empty Poisson draws as real noise/accounting steps and isolate SlaClip's
+  auxiliary RNG so paired runs retain the same gradient-noise stream.
 - Add unit tests, GitHub Actions, tested dependency constraints and an HPC Slurm
   template.
 

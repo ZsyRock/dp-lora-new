@@ -172,11 +172,24 @@ class GradSampleModule:
         for _, module in self._hooked_modules:
             clear_per_sample_grads(module)
 
+    def empty_per_sample_grads(self) -> list[tuple[nn.Parameter, torch.Tensor]]:
+        """Create a covered zero-length batch for an empty Poisson draw.
+
+        Empty Poisson batches still consume one logical DP step: the mechanism
+        releases Gaussian noise and the accountant advances. Skipping the step
+        would make runtime sampling disagree with privacy accounting.
+        """
+        return [
+            (parameter, parameter.new_empty((0, *parameter.shape)))
+            for parameter in self.get_trainable_params()
+        ]
+
     def get_trainable_params(self) -> list[nn.Parameter]:
         """Return the list of LoRA parameters that are trainable (have hooks)."""
         params = []
         for _, module in self._hooked_modules:
-            params.append(module.weight)
+            if module.weight.requires_grad:
+                params.append(module.weight)
             if module.bias is not None and module.bias.requires_grad:
                 params.append(module.bias)
         return params

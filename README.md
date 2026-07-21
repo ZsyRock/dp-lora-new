@@ -63,10 +63,15 @@ It writes one JSONL record per logical optimizer step containing:
 
 - exact per-record gradient-norm histogram on `[0, C_t]` plus overflow;
 - exact clipped count and fraction;
-- exact norm mean and quantiles;
+- exact global and per-parameter norm mean, standard deviation and quantiles;
+- exact clipped-sum, sampled-noise and applied private-gradient norms;
 - `C_before` and `C_after`;
 - optionally every per-record norm;
 - SlaClip's already-noised slack/controller values when applicable.
+
+Aligned `training_steps.jsonl` and `epoch_summaries.jsonl` files add exact
+training loss, epsilon, learning rate and epoch context. Exact private training
+loss is deliberately excluded from the ordinary `metrics.json` DP-output file.
 
 Files are written below a `private_diagnostics/` directory, carry the label
 `NON_DP_PRIVATE_DIAGNOSTIC`, include a warning file, and are ignored by Git.
@@ -82,6 +87,7 @@ observation = GradientObservationConfig(
     acknowledge_non_dp=True,
     output_dir="private_diagnostics/pilot_001",
     histogram_bins=20,
+    parameter_statistics=True,
     store_per_sample_norms=False,
 )
 ```
@@ -139,6 +145,32 @@ access-controlled storage and are ignored by Git.
 
 ## Paired SST-2 pilot
 
+With no `--clipping` argument the runner selects the fixed-C baseline. A default
+baseline analysis run is therefore:
+
+```bash
+python examples/sst2_roberta.py \
+  --run-name baseline_default_seed42 \
+  --observe-private-gradients \
+  --acknowledge-non-dp-diagnostics
+```
+
+For main SlaClip, `--initial-clip-norm` is `C0`, not a promised final target.
+The controller adapts `C_t` and keeps it inside the requested bounds:
+
+```bash
+python examples/sst2_roberta.py \
+  --clipping slaclip \
+  --run-name slaclip_c0_2_seed42 \
+  --initial-clip-norm 2.0 \
+  --slaclip-eta 0.2 \
+  --slaclip-beta 0.5 \
+  --slaclip-c-min 0.1 \
+  --slaclip-c-max 20 \
+  --observe-private-gradients \
+  --acknowledge-non-dp-diagnostics
+```
+
 Run the fixed baseline followed by SlaClip with the same shared settings:
 
 ```bash
@@ -152,14 +184,16 @@ python examples/sst2_roberta.py \
   --logical-batch-size 256 \
   --physical-batch-size 32 \
   --learning-rate 5e-4 \
-  --max-grad-norm 1 \
+  --initial-clip-norm 1 \
   --seed 42 \
   --device cuda
 ```
 
 `--clipping both` resets the seed, model initialization and data-loader RNG
-before each side of the pair. Results are kept separate under
-`results/sst2/{fixed,slaclip}_seed42/`.
+before each side of the pair. Poisson sampling and gradient-noise streams are
+matched internally but their secret seeds are never logged. Results are kept
+separate under `results/sst2/<run-name>/{fixed,slaclip}/`. Existing run
+directories are never mixed or overwritten.
 
 The classification report contains the five prespecified metrics:
 
@@ -182,6 +216,11 @@ python examples/sweep.py epsilon \
 
 The sweep runner always invokes `--clipping both`; it cannot create an unpaired
 fixed/SlaClip comparison.
+
+See [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) for the exact two experiment
+contracts, output schema and the boundary between Ubuntu validation and the
+remaining HPC pilot. The completed local checks are recorded in
+[docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## Library API
 

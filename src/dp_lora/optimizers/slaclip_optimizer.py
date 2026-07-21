@@ -52,8 +52,10 @@ class SlaClipOptimizer(DPOptimizer):
         c_min: float = 0.1,
         c_max: float = 50.0,
         generator: Optional[torch.Generator] = None,
+        auxiliary_generator: Optional[torch.Generator] = None,
         secure_mode: bool = False,
         observer: Optional[TrustedGradientObserver] = None,
+        parameter_names: Optional[dict[int, str]] = None,
     ):
         super().__init__(
             optimizer,
@@ -63,6 +65,7 @@ class SlaClipOptimizer(DPOptimizer):
             generator=generator,
             secure_mode=secure_mode,
             observer=observer,
+            parameter_names=parameter_names,
         )
         self.num_slots = int(
             num_slots
@@ -82,6 +85,7 @@ class SlaClipOptimizer(DPOptimizer):
         self.c_min = float(c_min)
         self.c_max = float(c_max)
         self.current_clip = float(max_grad_norm)
+        self.auxiliary_generator = auxiliary_generator
         self._slack_sum: Optional[torch.Tensor] = None
         self._slack_scale = 0.0
 
@@ -116,8 +120,14 @@ class SlaClipOptimizer(DPOptimizer):
         per_sample_norms: torch.Tensor,
         clip_factors: torch.Tensor,
         threshold: float,
+        per_parameter_norms: Optional[dict[str, torch.Tensor]] = None,
     ) -> None:
-        super()._after_clip(per_sample_norms, clip_factors, threshold)
+        super()._after_clip(
+            per_sample_norms,
+            clip_factors,
+            threshold,
+            per_parameter_norms=per_parameter_norms,
+        )
         coordinate_bound = threshold / math.sqrt(self.num_slots)
         if self._slack_scale and not math.isclose(
             self._slack_scale, coordinate_bound, rel_tol=1e-12
@@ -138,7 +148,7 @@ class SlaClipOptimizer(DPOptimizer):
         noise = _generate_noise(
             std=self.noise_multiplier * threshold,
             reference=self._slack_sum,
-            generator=self.generator,
+            generator=self.auxiliary_generator,
             secure_mode=self.secure_mode,
         )
         slack_indicator = (self._slack_sum + noise) / (
@@ -174,6 +184,11 @@ class SlaClipOptimizer(DPOptimizer):
             "c_min": self.c_min,
             "c_max": self.c_max,
             "current_clip": self.current_clip,
+            "auxiliary_generator_state": (
+                self.auxiliary_generator.get_state()
+                if self.auxiliary_generator is not None
+                else None
+            ),
         }
 
     def _load_extra_state_dict(self, state: dict[str, Any]) -> None:
@@ -184,3 +199,10 @@ class SlaClipOptimizer(DPOptimizer):
                 )
         self.current_clip = float(state["current_clip"])
         self.max_grad_norm = self.current_clip
+        auxiliary_state = state.get("auxiliary_generator_state")
+        if auxiliary_state is not None:
+            if self.auxiliary_generator is None:
+                raise ValueError(
+                    "Checkpoint has SlaClip auxiliary RNG state but no generator"
+                )
+            self.auxiliary_generator.set_state(auxiliary_state)

@@ -44,3 +44,16 @@ def test_ffa_freezes_a_but_protects_head():
     assert model.lora_B["default"].weight.requires_grad
     assert model.classifier.weight.requires_grad
     wrapper.remove_hooks()
+
+
+def test_empty_poisson_batch_covers_every_trainable_parameter():
+    model = TinyLoRAModel()
+    wrapper = GradSampleModule(model, method="ffa")
+    empty_grads = wrapper.empty_per_sample_grads()
+    protected_ids = {id(parameter) for parameter, _ in empty_grads}
+    trainable_ids = {
+        id(parameter) for parameter in model.parameters() if parameter.requires_grad
+    }
+    assert protected_ids == trainable_ids
+    assert all(grad.shape[0] == 0 for _, grad in empty_grads)
+    wrapper.remove_hooks()

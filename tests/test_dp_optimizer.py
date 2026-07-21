@@ -146,3 +146,20 @@ class TestStep:
         )
         with pytest.raises(RuntimeError, match="no per-sample gradient"):
             dp_opt.step([(p1, torch.zeros(1, 2))])
+
+    def test_empty_poisson_draw_still_runs_noise_and_step_hook(self):
+        param = nn.Parameter(torch.zeros(4))
+        dp_opt = DPOptimizer(
+            torch.optim.SGD([param], lr=0.1),
+            noise_multiplier=1.0,
+            max_grad_norm=1.0,
+            expected_batch_size=10,
+            generator=torch.Generator().manual_seed(123),
+        )
+        hook_count = [0]
+        dp_opt.attach_step_hook(lambda: hook_count.__setitem__(0, hook_count[0] + 1))
+        stats = dp_opt.step([(param, torch.empty(0, 4))])
+        assert stats["sample_count"] == 0
+        assert stats["logical_step"] == 1
+        assert hook_count[0] == 1
+        assert not torch.equal(param, torch.zeros_like(param))

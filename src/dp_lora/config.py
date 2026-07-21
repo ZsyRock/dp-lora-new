@@ -14,6 +14,7 @@ class GradientObservationConfig:
     enabled: bool = False
     output_dir: str = "private_diagnostics"
     histogram_bins: int = 20
+    parameter_statistics: bool = True
     store_per_sample_norms: bool = False
     acknowledge_non_dp: bool = False
 
@@ -32,7 +33,10 @@ class SlaClipConfig:
     """Parameters for the main SlaClip threshold controller.
 
     ``num_slots=None`` selects K from the paper's batch-size/noise rule. This
-    project intentionally does not implement SlaClip-Q.
+    project intentionally does not implement SlaClip-Q. ``max_grad_norm`` in
+    the engine API is the shared fixed-C baseline threshold and SlaClip's
+    initial threshold C0. Main SlaClip has no fixed target C: it adapts C_t
+    using ``eta`` and ``beta`` and constrains it to ``[c_min, c_max]``.
     """
 
     num_slots: Optional[int] = None

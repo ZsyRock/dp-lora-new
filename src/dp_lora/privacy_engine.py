@@ -56,6 +56,7 @@ class DPLoRAEngine:
         ghost_clipping: bool = False,
         secure_mode: bool = False,
         generator: Optional[torch.Generator] = None,
+        slaclip_generator: Optional[torch.Generator] = None,
         gradient_observation: Optional[GradientObservationConfig] = None,
     ) -> tuple[nn.Module, DPOptimizer, DataLoader]:
         """Make the optimizer private using fixed-C or the main SlaClip method."""
@@ -108,6 +109,11 @@ class DPLoRAEngine:
             if observation_config.enabled
             else None
         )
+        parameter_names = {
+            id(parameter): name
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        }
 
         common: dict[str, Any] = {
             "noise_multiplier": noise_multiplier,
@@ -116,6 +122,7 @@ class DPLoRAEngine:
             "generator": generator,
             "secure_mode": secure_mode,
             "observer": self.observer,
+            "parameter_names": parameter_names,
         }
         if clipping_mode == "fixed":
             self._dp_optimizer = DPOptimizer(optimizer, **common)
@@ -129,6 +136,7 @@ class DPLoRAEngine:
                 beta=controller.beta,
                 c_min=controller.c_min,
                 c_max=controller.c_max,
+                auxiliary_generator=slaclip_generator,
             )
 
         if accounting_mode == "rdp_poisson":
@@ -172,6 +180,7 @@ class DPLoRAEngine:
         ghost_clipping: bool = False,
         secure_mode: bool = False,
         generator: Optional[torch.Generator] = None,
+        slaclip_generator: Optional[torch.Generator] = None,
         gradient_observation: Optional[GradientObservationConfig] = None,
     ) -> tuple[nn.Module, DPOptimizer, DataLoader]:
         """Calibrate sigma for the exact logical-step schedule, then make private."""
@@ -214,6 +223,7 @@ class DPLoRAEngine:
             ghost_clipping=ghost_clipping,
             secure_mode=secure_mode,
             generator=generator,
+            slaclip_generator=slaclip_generator,
             gradient_observation=gradient_observation,
         )
 

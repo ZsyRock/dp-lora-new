@@ -57,6 +57,7 @@ def test_main_update_uses_noised_slack_release():
 
 def test_checkpoint_restores_controller_and_rng_state():
     generator = torch.Generator().manual_seed(123)
+    auxiliary_generator = torch.Generator().manual_seed(456)
     p1 = torch.nn.Parameter(torch.zeros(1))
     first = SlaClipOptimizer(
         torch.optim.SGD([p1], lr=0.1),
@@ -65,6 +66,7 @@ def test_checkpoint_restores_controller_and_rng_state():
         expected_batch_size=1,
         num_slots=2,
         generator=generator,
+        auxiliary_generator=auxiliary_generator,
     )
     first.step([(p1, torch.tensor([[0.5]]))])
     state = first.state_dict()
@@ -77,7 +79,12 @@ def test_checkpoint_restores_controller_and_rng_state():
         expected_batch_size=1,
         num_slots=2,
         generator=torch.Generator(),
+        auxiliary_generator=torch.Generator(),
     )
     second.load_state_dict(state)
     assert second.current_clip == first.current_clip
     assert second._logical_steps == first._logical_steps
+    torch.testing.assert_close(
+        second.auxiliary_generator.get_state(),
+        first.auxiliary_generator.get_state(),
+    )

@@ -31,6 +31,7 @@ def test_observer_writes_exact_logical_step_record(tmp_path):
         max_grad_norm=1.0,
         expected_batch_size=2,
         observer=observer,
+        parameter_names={id(param): "classifier.weight"},
     )
     optimizer.step([(param, torch.tensor([[0.5], [2.0]]))])
 
@@ -40,7 +41,24 @@ def test_observer_writes_exact_logical_step_record(tmp_path):
     assert record["per_sample_norms"] == [0.5, 2.0]
     assert record["clipped_count"] == 1
     assert record["clipped_fraction"] == 0.5
+    assert record["norm_statistics"]["std"] == 0.75
+    assert "classifier.weight" in record["parameter_norm_statistics"]
+    assert record["optimizer_statistics"]["private_gradient_norm"] > 0
     assert observer.warning_path.exists()
+
+    observer.record_training_step(
+        {
+            "logical_step": 1,
+            "epoch": 1,
+            "mean_training_loss": 0.75,
+            "epsilon": 1.2,
+        }
+    )
+    training_record = json.loads(
+        observer.training_steps_path.read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert training_record["privacy_status"] == "NON_DP_PRIVATE_DIAGNOSTIC"
+    assert training_record["mean_training_loss"] == 0.75
 
 
 def test_observer_does_not_change_private_update(tmp_path):

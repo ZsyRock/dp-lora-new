@@ -22,6 +22,14 @@ def parse_args() -> argparse.Namespace:
         sub.add_argument("--epochs", type=int, default=3)
         sub.add_argument("--logical-batch-size", type=int, default=256)
         sub.add_argument("--physical-batch-size", type=int, default=32)
+        sub.add_argument("--initial-clip-norm", type=float, default=1.0)
+        sub.add_argument("--slaclip-eta", type=float, default=0.2)
+        sub.add_argument("--slaclip-beta", type=float, default=0.5)
+        sub.add_argument("--slaclip-c-min", type=float, default=0.1)
+        sub.add_argument("--slaclip-c-max", type=float, default=50.0)
+        sub.add_argument("--observe-private-gradients", action="store_true")
+        sub.add_argument("--acknowledge-non-dp-diagnostics", action="store_true")
+        sub.add_argument("--store-per-sample-norms", action="store_true")
     subparsers.choices["epsilon"].add_argument(
         "--values", type=float, nargs="+", default=[1.0, 2.0, 4.0, 8.0]
     )
@@ -35,6 +43,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.observe_private_gradients and not args.acknowledge_non_dp_diagnostics:
+        raise SystemExit(
+            "--observe-private-gradients requires " "--acknowledge-non-dp-diagnostics"
+        )
+    if args.store_per_sample_norms and not args.observe_private_gradients:
+        raise SystemExit(
+            "--store-per-sample-norms requires --observe-private-gradients"
+        )
     runner = Path(__file__).with_name("sst2_roberta.py")
     for seed in args.seed:
         for value in args.values:
@@ -56,9 +72,30 @@ def main() -> None:
                 str(args.logical_batch_size),
                 "--physical-batch-size",
                 str(args.physical_batch_size),
+                "--initial-clip-norm",
+                str(args.initial_clip_norm),
+                "--slaclip-eta",
+                str(args.slaclip_eta),
+                "--slaclip-beta",
+                str(args.slaclip_beta),
+                "--slaclip-c-min",
+                str(args.slaclip_c_min),
+                "--slaclip-c-max",
+                str(args.slaclip_c_max),
                 "--output-dir",
                 str(run_dir),
+                "--run-name",
+                "paired",
             ]
+            if args.observe_private_gradients:
+                command.extend(
+                    [
+                        "--observe-private-gradients",
+                        "--acknowledge-non-dp-diagnostics",
+                    ]
+                )
+            if args.store_per_sample_norms:
+                command.append("--store-per-sample-norms")
             if args.sweep == "epsilon":
                 command.extend(["--epsilon", str(value), "--rank", str(args.rank)])
             else:

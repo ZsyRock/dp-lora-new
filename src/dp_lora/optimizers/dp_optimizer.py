@@ -73,6 +73,7 @@ class DPOptimizer(Optimizer):
         generator: Optional[torch.Generator] = None,
         secure_mode: bool = False,
         observer: Optional[TrustedGradientObserver] = None,
+        parameter_names: Optional[dict[int, str]] = None,
     ):
         if noise_multiplier < 0:
             raise ValueError("noise_multiplier must be non-negative")
@@ -87,6 +88,11 @@ class DPOptimizer(Optimizer):
         self.generator = generator
         self.secure_mode = bool(secure_mode)
         self.observer = observer
+        supplied_names = parameter_names or {}
+        self._parameter_names = {
+            id(param): supplied_names.get(id(param), f"parameter_{index}")
+            for index, param in enumerate(self._trainable_params)
+        }
         self._step_hooks: list[Callable[[], None]] = []
 
         self._step_skip_queue: list[bool] = []
@@ -96,6 +102,7 @@ class DPOptimizer(Optimizer):
         self._pending_sample_count = 0
         self._pending_num_clipped = 0
         self._pending_clip_factor_sum = 0.0
+        self._pending_release_stats: dict[str, Any] = {}
         self._last_step_stats: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
@@ -169,9 +176,12 @@ class DPOptimizer(Optimizer):
         per_sample_norms: torch.Tensor,
         clip_factors: torch.Tensor,
         threshold: float,
+        per_parameter_norms: Optional[dict[str, torch.Tensor]] = None,
     ) -> None:
         if self.observer is not None:
-            self.observer.observe_microbatch(per_sample_norms)
+            self.observer.observe_microbatch(
+                per_sample_norms, per_parameter_norms=per_parameter_norms
+            )
 
     def clip_and_accumulate(
         self, per_sample_grads: list[tuple[nn.Parameter, torch.Tensor]]
@@ -188,15 +198,39 @@ class DPOptimizer(Optimizer):
         else:
             device = per_sample_grads[0][1].device
             norm_sq = torch.zeros(batch_size, device=device, dtype=torch.float32)
-            for _, grad in per_sample_grads:
+            per_parameter_norms: Optional[dict[str, torch.Tensor]] = (
+                {}
+                if self.observer is not None
+                and self.observer.config.parameter_statistics
+                else None
+            )
+            for param, grad in per_sample_grads:
                 flat = (
                     grad.detach()
                     .to(device=device, dtype=torch.float32)
                     .reshape(batch_size, -1)
                 )
-                norm_sq.add_((flat * flat).sum(dim=1))
+                parameter_norm_sq = (flat * flat).sum(dim=1)
+                norm_sq.add_(parameter_norm_sq)
+                if per_parameter_norms is not None:
+                    per_parameter_norms[self._parameter_names[id(param)]] = (
+                        parameter_norm_sq.sqrt()
+                    )
             per_sample_norms = norm_sq.sqrt()
             clip_factors = (threshold / (per_sample_norms + 1e-12)).clamp(max=1.0)
+
+        if batch_size == 0:
+            per_parameter_norms = (
+                {
+                    self._parameter_names[id(param)]: torch.empty(
+                        0, device=per_sample_norms.device, dtype=torch.float32
+                    )
+                    for param, _ in per_sample_grads
+                }
+                if self.observer is not None
+                and self.observer.config.parameter_statistics
+                else None
+            )
 
         for param, grad in per_sample_grads:
             factor = clip_factors.to(device=grad.device, dtype=grad.dtype).reshape(
@@ -214,7 +248,12 @@ class DPOptimizer(Optimizer):
         self._pending_sample_count += batch_size
         self._pending_num_clipped += num_clipped
         self._pending_clip_factor_sum += clip_factor_sum
-        self._after_clip(per_sample_norms, clip_factors, threshold)
+        self._after_clip(
+            per_sample_norms,
+            clip_factors,
+            threshold,
+            per_parameter_norms=per_parameter_norms,
+        )
 
         return {
             "privacy_status": "EXACT_INTERNAL_DIAGNOSTIC",
@@ -230,6 +269,10 @@ class DPOptimizer(Optimizer):
     def add_noise_and_finalize(self) -> dict[str, Any]:
         """Noise the clipped sum and replace every ordinary parameter gradient."""
         threshold = self._clip_threshold()
+        collect_release_stats = self.observer is not None
+        clipped_sum_sq = 0.0
+        noise_sum_sq = 0.0
+        private_gradient_sq = 0.0
         for param in self._trainable_params:
             summed = self._summed_grads.get(id(param))
             if summed is None:
@@ -243,6 +286,25 @@ class DPOptimizer(Optimizer):
                 secure_mode=self.secure_mode,
             )
             param.grad = (summed + noise).view_as(param) / self.expected_batch_size
+            if collect_release_stats:
+                clipped_sum_sq += float(summed.detach().float().square().sum().item())
+                noise_sum_sq += float(noise.detach().float().square().sum().item())
+                private_gradient_sq += float(
+                    param.grad.detach().float().square().sum().item()
+                )
+        if collect_release_stats:
+            clipped_sum_norm = clipped_sum_sq**0.5
+            noise_sum_norm = noise_sum_sq**0.5
+            self._pending_release_stats = {
+                "clipped_sum_norm": clipped_sum_norm,
+                "clipped_average_norm": (clipped_sum_norm / self.expected_batch_size),
+                "noise_sum_norm": noise_sum_norm,
+                "noise_average_norm": noise_sum_norm / self.expected_batch_size,
+                "private_gradient_norm": private_gradient_sq**0.5,
+                "noise_standard_deviation": self.noise_multiplier * threshold,
+                "noise_multiplier": self.noise_multiplier,
+                "expected_batch_size": self.expected_batch_size,
+            }
         return self._private_auxiliary_release(threshold)
 
     def _reset_pending(self) -> None:
@@ -250,6 +312,7 @@ class DPOptimizer(Optimizer):
         self._pending_sample_count = 0
         self._pending_num_clipped = 0
         self._pending_clip_factor_sum = 0.0
+        self._pending_release_stats = {}
 
     def step(
         self,
@@ -290,6 +353,7 @@ class DPOptimizer(Optimizer):
             "max_grad_norm_before": clip_before,
             "max_grad_norm_after": clip_after,
         }
+        stats.update(self._pending_release_stats)
         stats.update(private_aux)
         if self.observer is not None:
             self.observer.finalize_step(
@@ -298,6 +362,7 @@ class DPOptimizer(Optimizer):
                 clip_before=clip_before,
                 clip_after=clip_after,
                 private_aux=private_aux,
+                optimizer_stats=stats,
             )
 
         self._last_step_stats = stats
