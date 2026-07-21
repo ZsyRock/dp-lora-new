@@ -36,7 +36,9 @@ class TestClipAndAccumulate:
         param = nn.Parameter(torch.zeros(4, 3))
         optimizer = torch.optim.SGD([param], lr=1.0)
         dp_opt = DPOptimizer(
-            optimizer, noise_multiplier=0.0, max_grad_norm=1.0,
+            optimizer,
+            noise_multiplier=0.0,
+            max_grad_norm=1.0,
             expected_batch_size=2,
         )
 
@@ -55,7 +57,9 @@ class TestClipAndAccumulate:
         param = nn.Parameter(torch.zeros(4, 3))
         optimizer = torch.optim.SGD([param], lr=1.0)
         dp_opt = DPOptimizer(
-            optimizer, noise_multiplier=0.0, max_grad_norm=100.0,
+            optimizer,
+            noise_multiplier=0.0,
+            max_grad_norm=100.0,
             expected_batch_size=2,
         )
 
@@ -69,14 +73,20 @@ class TestClipAndAccumulate:
         param = nn.Parameter(torch.zeros(2, 2))
         optimizer = torch.optim.SGD([param], lr=1.0)
         dp_opt = DPOptimizer(
-            optimizer, noise_multiplier=0.0, max_grad_norm=100.0,
+            optimizer,
+            noise_multiplier=0.0,
+            max_grad_norm=100.0,
             expected_batch_size=3,
         )
 
         # Small grads that won't be clipped
-        psg = torch.tensor([[[1.0, 2.0], [3.0, 4.0]],
-                            [[5.0, 6.0], [7.0, 8.0]],
-                            [[9.0, 10.0], [11.0, 12.0]]])
+        psg = torch.tensor(
+            [
+                [[1.0, 2.0], [3.0, 4.0]],
+                [[5.0, 6.0], [7.0, 8.0]],
+                [[9.0, 10.0], [11.0, 12.0]],
+            ]
+        )
         dp_opt.clip_and_accumulate([(param, psg)])
 
         # clip_and_accumulate writes to _summed_grads dict (raw sum, not scaled)
@@ -95,7 +105,9 @@ class TestAddNoiseAndFinalize:
         param = nn.Parameter(torch.zeros(100))
         optimizer = torch.optim.SGD([param], lr=1.0)
         dp_opt = DPOptimizer(
-            optimizer, noise_multiplier=1.0, max_grad_norm=1.0,
+            optimizer,
+            noise_multiplier=1.0,
+            max_grad_norm=1.0,
             expected_batch_size=10,
         )
 
@@ -110,14 +122,44 @@ class TestAddNoiseAndFinalize:
 class TestStep:
     def test_step_calls_hooks(self):
         param = nn.Parameter(torch.zeros(4))
-        param.grad = torch.zeros(4)
         optimizer = torch.optim.SGD([param], lr=1.0)
         dp_opt = DPOptimizer(
-            optimizer, noise_multiplier=0.0, max_grad_norm=1.0,
+            optimizer,
+            noise_multiplier=0.0,
+            max_grad_norm=1.0,
             expected_batch_size=1,
         )
 
         hook_called = [False]
         dp_opt.attach_step_hook(lambda: hook_called.__setitem__(0, True))
-        dp_opt.step()
+        dp_opt.step([(param, torch.zeros(1, 4))])
         assert hook_called[0]
+
+    def test_missing_trainable_parameter_fails_closed(self):
+        p1 = nn.Parameter(torch.zeros(2))
+        p2 = nn.Parameter(torch.zeros(2))
+        dp_opt = DPOptimizer(
+            torch.optim.SGD([p1, p2], lr=0.1),
+            noise_multiplier=1.0,
+            max_grad_norm=1.0,
+            expected_batch_size=1,
+        )
+        with pytest.raises(RuntimeError, match="no per-sample gradient"):
+            dp_opt.step([(p1, torch.zeros(1, 2))])
+
+    def test_empty_poisson_draw_still_runs_noise_and_step_hook(self):
+        param = nn.Parameter(torch.zeros(4))
+        dp_opt = DPOptimizer(
+            torch.optim.SGD([param], lr=0.1),
+            noise_multiplier=1.0,
+            max_grad_norm=1.0,
+            expected_batch_size=10,
+            generator=torch.Generator().manual_seed(123),
+        )
+        hook_count = [0]
+        dp_opt.attach_step_hook(lambda: hook_count.__setitem__(0, hook_count[0] + 1))
+        stats = dp_opt.step([(param, torch.empty(0, 4))])
+        assert stats["sample_count"] == 0
+        assert stats["logical_step"] == 1
+        assert hook_count[0] == 1
+        assert not torch.equal(param, torch.zeros_like(param))

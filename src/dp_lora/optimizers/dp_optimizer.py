@@ -1,12 +1,14 @@
-"""Differentially private optimizer: per-sample clipping + Gaussian noise."""
+"""Fail-closed DP optimizer: flat per-sample clipping plus Gaussian noise."""
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import torch
 from torch import nn
 from torch.optim import Optimizer
+
+from dp_lora.diagnostics import TrustedGradientObserver
 
 
 def _generate_noise(
@@ -15,19 +17,13 @@ def _generate_noise(
     generator: Optional[torch.Generator] = None,
     secure_mode: bool = False,
 ) -> torch.Tensor:
-    """Generate Gaussian noise with mean 0 and given standard deviation.
-
-    Args:
-        std: Standard deviation of the noise.
-        reference: Reference tensor for shape and device.
-        generator: Optional PyTorch random number generator.
-        secure_mode: If True, generate noise resistant to floating point attacks
-                     (see https://arxiv.org/abs/2107.10138).
-    """
+    """Generate zero-mean Gaussian noise matching ``reference``."""
+    zeros = torch.zeros_like(reference)
     if std == 0:
-        return torch.zeros(reference.shape, device=reference.device)
-
+        return zeros
     if secure_mode:
+        # Discard one sample and average four independent draws, following the
+        # floating-point hardened construction used by Opacus.
         torch.normal(
             mean=0,
             std=std,
@@ -35,33 +31,37 @@ def _generate_noise(
             device=reference.device,
             generator=generator,
         )
-        total = torch.zeros(reference.shape, device=reference.device)
+        total = zeros
         for _ in range(4):
             total += torch.normal(
                 mean=0,
                 std=std,
                 size=reference.shape,
                 device=reference.device,
+                dtype=reference.dtype,
                 generator=generator,
             )
         return total / 2
-    else:
-        return torch.normal(
-            mean=0,
-            std=std,
-            size=reference.shape,
-            device=reference.device,
-            generator=generator,
-        )
+    return torch.normal(
+        mean=0,
+        std=std,
+        size=reference.shape,
+        device=reference.device,
+        dtype=reference.dtype,
+        generator=generator,
+    )
 
 
-class DPOptimizer:
-    """Wraps a PyTorch optimizer with DP-SGD: per-sample clipping and noise.
+class DPOptimizer(Optimizer):
+    """Wrap a PyTorch optimizer with record-level flat DP-SGD.
 
-    Supports virtual batching: when ``signal_skip_step(do_skip=True)`` is called
-    before ``step()``, the optimizer clips and accumulates gradients but defers
-    noise addition and the actual parameter update until a non-skipped step.
+    Every trainable optimizer parameter must appear exactly once in the supplied
+    per-sample gradients. This invariant prevents ordinary (unclipped, unnoised)
+    gradients from silently updating classification heads or other trainable
+    modules.
     """
+
+    clipping_mode = "fixed"
 
     def __init__(
         self,
@@ -72,32 +72,92 @@ class DPOptimizer:
         expected_batch_size: int,
         generator: Optional[torch.Generator] = None,
         secure_mode: bool = False,
+        observer: Optional[TrustedGradientObserver] = None,
+        parameter_names: Optional[dict[int, str]] = None,
     ):
+        if noise_multiplier < 0:
+            raise ValueError("noise_multiplier must be non-negative")
+        if max_grad_norm <= 0:
+            raise ValueError("max_grad_norm must be positive")
+        if expected_batch_size <= 0:
+            raise ValueError("expected_batch_size must be positive")
         self.optimizer = optimizer
-        self.noise_multiplier = noise_multiplier
-        self.max_grad_norm = max_grad_norm
-        self.expected_batch_size = expected_batch_size
+        self.noise_multiplier = float(noise_multiplier)
+        self.max_grad_norm = float(max_grad_norm)
+        self.expected_batch_size = int(expected_batch_size)
         self.generator = generator
-        self.secure_mode = secure_mode
+        self.secure_mode = bool(secure_mode)
+        self.observer = observer
+        supplied_names = parameter_names or {}
+        self._parameter_names = {
+            id(param): supplied_names.get(id(param), f"parameter_{index}")
+            for index, param in enumerate(self._trainable_params)
+        }
         self._step_hooks: list[Callable[[], None]] = []
 
-        # Virtual batching state
         self._step_skip_queue: list[bool] = []
-        self._is_last_step_skipped: bool = False
-        self._accumulated_iterations: int = 0
-
-        # Summed clipped gradients, keyed by id(param).
-        # Stored here (not on param objects) to avoid issues with
-        # serialization, model copying, or FSDP.
+        self._is_last_step_skipped = False
         self._summed_grads: dict[int, torch.Tensor] = {}
+        self._logical_steps = 0
+        self._pending_sample_count = 0
+        self._pending_num_clipped = 0
+        self._pending_clip_factor_sum = 0.0
+        self._pending_release_stats: dict[str, Any] = {}
+        self._last_step_stats: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
-    # Virtual batching signaling
+    # Parameter and virtual-batch invariants
     # ------------------------------------------------------------------
+
+    @property
+    def _trainable_params(self) -> list[nn.Parameter]:
+        return [
+            param
+            for group in self.optimizer.param_groups
+            for param in group["params"]
+            if param.requires_grad
+        ]
+
+    def _validate_per_sample_grads(
+        self, per_sample_grads: list[tuple[nn.Parameter, torch.Tensor]]
+    ) -> int:
+        expected = {id(param): param for param in self._trainable_params}
+        supplied: dict[int, nn.Parameter] = {}
+        batch_size: Optional[int] = None
+
+        for param, grad in per_sample_grads:
+            pid = id(param)
+            if pid in supplied:
+                raise ValueError(
+                    "A parameter appeared more than once in per_sample_grads"
+                )
+            if pid not in expected:
+                raise ValueError(
+                    "per_sample_grads contains a parameter not in optimizer"
+                )
+            if grad.ndim != param.ndim + 1 or tuple(grad.shape[1:]) != tuple(
+                param.shape
+            ):
+                raise ValueError(
+                    f"Invalid per-sample gradient shape {tuple(grad.shape)} for "
+                    f"parameter shape {tuple(param.shape)}"
+                )
+            if batch_size is None:
+                batch_size = int(grad.shape[0])
+            elif int(grad.shape[0]) != batch_size:
+                raise ValueError("Inconsistent batch dimension across parameters")
+            supplied[pid] = param
+
+        missing = set(expected) - set(supplied)
+        if missing:
+            raise RuntimeError(
+                f"Refusing a non-private update: {len(missing)} trainable optimizer "
+                "parameter(s) have no per-sample gradient"
+            )
+        return int(batch_size or 0)
 
     def signal_skip_step(self, do_skip: bool = True) -> None:
-        """Signal whether the next step() should skip noise+update."""
-        self._step_skip_queue.append(do_skip)
+        self._step_skip_queue.append(bool(do_skip))
 
     def _check_skip_next_step(self) -> bool:
         if self._step_skip_queue:
@@ -108,125 +168,293 @@ class DPOptimizer:
     # Core DP operations
     # ------------------------------------------------------------------
 
+    def _clip_threshold(self) -> float:
+        return float(self.max_grad_norm)
+
+    def _after_clip(
+        self,
+        per_sample_norms: torch.Tensor,
+        clip_factors: torch.Tensor,
+        threshold: float,
+        per_parameter_norms: Optional[dict[str, torch.Tensor]] = None,
+    ) -> None:
+        if self.observer is not None:
+            self.observer.observe_microbatch(
+                per_sample_norms, per_parameter_norms=per_parameter_norms
+            )
+
     def clip_and_accumulate(
         self, per_sample_grads: list[tuple[nn.Parameter, torch.Tensor]]
-    ) -> dict[str, float]:
-        """Clip per-sample gradients and accumulate into internal summed_grads.
+    ) -> dict[str, Any]:
+        """Jointly norm, clip and sum a physical batch of per-sample gradients."""
+        batch_size = self._validate_per_sample_grads(per_sample_grads)
+        threshold = self._clip_threshold()
 
-        Args:
-            per_sample_grads: List of (parameter, per_sample_grad_tensor) pairs.
-                Each per_sample_grad_tensor has shape [B, *param.shape].
+        if batch_size == 0:
+            # Poisson sampling can legitimately produce an empty batch.
+            device = self._trainable_params[0].device
+            per_sample_norms = torch.empty(0, device=device, dtype=torch.float32)
+            clip_factors = torch.empty(0, device=device, dtype=torch.float32)
+        else:
+            device = per_sample_grads[0][1].device
+            norm_sq = torch.zeros(batch_size, device=device, dtype=torch.float32)
+            per_parameter_norms: Optional[dict[str, torch.Tensor]] = (
+                {}
+                if self.observer is not None
+                and self.observer.config.parameter_statistics
+                else None
+            )
+            for param, grad in per_sample_grads:
+                flat = (
+                    grad.detach()
+                    .to(device=device, dtype=torch.float32)
+                    .reshape(batch_size, -1)
+                )
+                parameter_norm_sq = (flat * flat).sum(dim=1)
+                norm_sq.add_(parameter_norm_sq)
+                if per_parameter_norms is not None:
+                    per_parameter_norms[self._parameter_names[id(param)]] = (
+                        parameter_norm_sq.sqrt()
+                    )
+            per_sample_norms = norm_sq.sqrt()
+            clip_factors = (threshold / (per_sample_norms + 1e-12)).clamp(max=1.0)
 
-        Returns:
-            Dict with 'mean_clip_factor' and 'num_clipped' for diagnostics.
-        """
-        if not per_sample_grads:
-            return {"mean_clip_factor": 1.0, "num_clipped": 0}
+        if batch_size == 0:
+            per_parameter_norms = (
+                {
+                    self._parameter_names[id(param)]: torch.empty(
+                        0, device=per_sample_norms.device, dtype=torch.float32
+                    )
+                    for param, _ in per_sample_grads
+                }
+                if self.observer is not None
+                and self.observer.config.parameter_statistics
+                else None
+            )
 
-        batch_size = per_sample_grads[0][1].shape[0]
-        device = per_sample_grads[0][1].device
-
-        # 1. Compute per-sample global gradient norm
-        per_sample_norms_sq = torch.zeros(batch_size, device=device)
-        for _, psg in per_sample_grads:
-            flat = psg.reshape(batch_size, -1)
-            per_sample_norms_sq += flat.norm(2, dim=1).square()
-        per_sample_norms = per_sample_norms_sq.sqrt()
-
-        # 2. Compute clipping factors: min(1, C / ||g_i||)
-        clip_factors = (self.max_grad_norm / (per_sample_norms + 1e-8)).clamp(max=1.0)
-
-        # 3. Clip and accumulate into _summed_grads
-        for param, psg in per_sample_grads:
-            cf = clip_factors.reshape(-1, *([1] * (psg.dim() - 1)))
-            clipped_sum = (psg * cf).sum(dim=0)
-
+        for param, grad in per_sample_grads:
+            factor = clip_factors.to(device=grad.device, dtype=grad.dtype).reshape(
+                -1, *([1] * (grad.ndim - 1))
+            )
+            clipped_sum = (grad * factor).sum(dim=0).to(dtype=param.dtype)
             pid = id(param)
             if pid in self._summed_grads:
-                self._summed_grads[pid] = self._summed_grads[pid] + clipped_sum
+                self._summed_grads[pid].add_(clipped_sum)
             else:
                 self._summed_grads[pid] = clipped_sum
 
-        num_clipped = int((clip_factors < 1.0).sum().item())
+        num_clipped = int((per_sample_norms > threshold).sum().item())
+        clip_factor_sum = float(clip_factors.sum().item())
+        self._pending_sample_count += batch_size
+        self._pending_num_clipped += num_clipped
+        self._pending_clip_factor_sum += clip_factor_sum
+        self._after_clip(
+            per_sample_norms,
+            clip_factors,
+            threshold,
+            per_parameter_norms=per_parameter_norms,
+        )
+
         return {
-            "mean_clip_factor": clip_factors.mean().item(),
+            "privacy_status": "EXACT_INTERNAL_DIAGNOSTIC",
+            "sample_count": batch_size,
             "num_clipped": num_clipped,
+            "mean_clip_factor": (clip_factor_sum / batch_size if batch_size else 1.0),
+            "max_grad_norm": threshold,
         }
 
-    def add_noise_and_finalize(self) -> None:
-        """Add noise to accumulated clipped grads, scale, write to param.grad."""
-        for group in self.optimizer.param_groups:
-            for param in group["params"]:
-                if not param.requires_grad:
-                    continue
-                pid = id(param)
-                summed = self._summed_grads.get(pid)
-                if summed is None:
-                    continue
-                noise = _generate_noise(
-                    std=self.noise_multiplier * self.max_grad_norm,
-                    reference=summed,
-                    generator=self.generator,
-                    secure_mode=self.secure_mode,
-                )
-                param.grad = (summed + noise).view_as(param) / self.expected_batch_size
+    def _private_auxiliary_release(self, threshold: float) -> dict[str, Any]:
+        return {}
 
-    # ------------------------------------------------------------------
-    # Step / zero_grad
-    # ------------------------------------------------------------------
+    def add_noise_and_finalize(self) -> dict[str, Any]:
+        """Noise the clipped sum and replace every ordinary parameter gradient."""
+        threshold = self._clip_threshold()
+        collect_release_stats = self.observer is not None
+        clipped_sum_sq = 0.0
+        noise_sum_sq = 0.0
+        private_gradient_sq = 0.0
+        for param in self._trainable_params:
+            summed = self._summed_grads.get(id(param))
+            if summed is None:
+                raise RuntimeError(
+                    "Refusing a non-private update: missing clipped gradient sum"
+                )
+            noise = _generate_noise(
+                std=self.noise_multiplier * threshold,
+                reference=summed,
+                generator=self.generator,
+                secure_mode=self.secure_mode,
+            )
+            param.grad = (summed + noise).view_as(param) / self.expected_batch_size
+            if collect_release_stats:
+                clipped_sum_sq += float(summed.detach().float().square().sum().item())
+                noise_sum_sq += float(noise.detach().float().square().sum().item())
+                private_gradient_sq += float(
+                    param.grad.detach().float().square().sum().item()
+                )
+        if collect_release_stats:
+            clipped_sum_norm = clipped_sum_sq**0.5
+            noise_sum_norm = noise_sum_sq**0.5
+            self._pending_release_stats = {
+                "clipped_sum_norm": clipped_sum_norm,
+                "clipped_average_norm": (clipped_sum_norm / self.expected_batch_size),
+                "noise_sum_norm": noise_sum_norm,
+                "noise_average_norm": noise_sum_norm / self.expected_batch_size,
+                "private_gradient_norm": private_gradient_sq**0.5,
+                "noise_standard_deviation": self.noise_multiplier * threshold,
+                "noise_multiplier": self.noise_multiplier,
+                "expected_batch_size": self.expected_batch_size,
+            }
+        return self._private_auxiliary_release(threshold)
+
+    def _reset_pending(self) -> None:
+        self._summed_grads.clear()
+        self._pending_sample_count = 0
+        self._pending_num_clipped = 0
+        self._pending_clip_factor_sum = 0.0
+        self._pending_release_stats = {}
 
     def step(
         self,
         per_sample_grads: Optional[list[tuple[nn.Parameter, torch.Tensor]]] = None,
-    ) -> dict[str, float]:
-        """Full DP-SGD step with virtual batching support.
-
-        1. Clip per-sample grads and accumulate.
-        2. If skip signaled: return early (no noise, no update).
-        3. Otherwise: add noise, finalize grad, step, fire hooks.
-        """
-        stats = {"mean_clip_factor": 1.0, "num_clipped": 0}
+    ) -> dict[str, Any]:
         if per_sample_grads is not None:
-            stats = self.clip_and_accumulate(per_sample_grads)
-
-        self._accumulated_iterations += 1
+            self.clip_and_accumulate(per_sample_grads)
+        if not self._summed_grads:
+            raise RuntimeError(
+                "DPOptimizer.step() requires validated per-sample gradients before update"
+            )
 
         if self._check_skip_next_step():
             self._is_last_step_skipped = True
-            stats["skipped"] = True
-            return stats
+            return {
+                "skipped": True,
+                "sample_count": self._pending_sample_count,
+                "max_grad_norm": self._clip_threshold(),
+            }
 
-        self.add_noise_and_finalize()
+        clip_before = self._clip_threshold()
+        private_aux = self.add_noise_and_finalize()
         self.optimizer.step()
-
         for fn in self._step_hooks:
             fn()
 
+        self._logical_steps += 1
+        clip_after = self._clip_threshold()
+        sample_count = self._pending_sample_count
+        stats: dict[str, Any] = {
+            "skipped": False,
+            "logical_step": self._logical_steps,
+            "sample_count": sample_count,
+            "num_clipped": self._pending_num_clipped,
+            "mean_clip_factor": (
+                self._pending_clip_factor_sum / sample_count if sample_count else 1.0
+            ),
+            "max_grad_norm_before": clip_before,
+            "max_grad_norm_after": clip_after,
+        }
+        stats.update(self._pending_release_stats)
+        stats.update(private_aux)
+        if self.observer is not None:
+            self.observer.finalize_step(
+                logical_step=self._logical_steps,
+                clipping_mode=self.clipping_mode,
+                clip_before=clip_before,
+                clip_after=clip_after,
+                private_aux=private_aux,
+                optimizer_stats=stats,
+            )
+
+        self._last_step_stats = stats
         self._is_last_step_skipped = False
-        self._accumulated_iterations = 0
-        stats["skipped"] = False
+        self._reset_pending()
         return stats
 
-    def zero_grad(self) -> None:
-        """Clear gradients, respecting virtual batching state."""
+    def zero_grad(self, set_to_none: bool = True) -> None:
         if not self._is_last_step_skipped:
-            self._summed_grads.clear()
-        self.optimizer.zero_grad()
+            self._reset_pending()
+            if self.observer is not None:
+                self.observer.reset()
+        self.optimizer.zero_grad(set_to_none=set_to_none)
 
     # ------------------------------------------------------------------
-    # Hooks and utilities
+    # Hooks, compatibility and checkpoint state
     # ------------------------------------------------------------------
 
     def attach_step_hook(self, fn: Callable[[], None]) -> None:
-        """Register a function called after each real optimizer step."""
         self._step_hooks.append(fn)
 
     @property
     def param_groups(self):
         return self.optimizer.param_groups
 
-    def state_dict(self):
-        return self.optimizer.state_dict()
+    @param_groups.setter
+    def param_groups(self, value):
+        self.optimizer.param_groups = value
 
-    def load_state_dict(self, state_dict):
-        self.optimizer.load_state_dict(state_dict)
+    @property
+    def state(self):
+        return self.optimizer.state
+
+    @state.setter
+    def state(self, value):
+        self.optimizer.state = value
+
+    @property
+    def defaults(self):
+        return self.optimizer.defaults
+
+    @defaults.setter
+    def defaults(self, value):
+        self.optimizer.defaults = value
+
+    def _extra_state_dict(self) -> dict[str, Any]:
+        return {}
+
+    def _load_extra_state_dict(self, state: dict[str, Any]) -> None:
+        if state:
+            raise ValueError(f"Unexpected DP optimizer state keys: {sorted(state)}")
+
+    def state_dict(self) -> dict[str, Any]:
+        if self._summed_grads:
+            raise RuntimeError("Checkpoint only at logical-step boundaries")
+        generator_state = None
+        if self.generator is not None:
+            generator_state = self.generator.get_state()
+        return {
+            "optimizer": self.optimizer.state_dict(),
+            "dp": {
+                "noise_multiplier": self.noise_multiplier,
+                "max_grad_norm": self.max_grad_norm,
+                "expected_batch_size": self.expected_batch_size,
+                "secure_mode": self.secure_mode,
+                "logical_steps": self._logical_steps,
+                "generator_state": generator_state,
+                "extra": self._extra_state_dict(),
+            },
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        if "optimizer" not in state_dict or "dp" not in state_dict:
+            raise ValueError("Not a complete DPOptimizer checkpoint")
+        dp_state = state_dict["dp"]
+        for key, expected in (
+            ("noise_multiplier", self.noise_multiplier),
+            ("expected_batch_size", self.expected_batch_size),
+            ("secure_mode", self.secure_mode),
+        ):
+            if dp_state[key] != expected:
+                raise ValueError(
+                    f"Checkpoint {key}={dp_state[key]!r} does not match {expected!r}"
+                )
+        self.optimizer.load_state_dict(state_dict["optimizer"])
+        self.max_grad_norm = float(dp_state["max_grad_norm"])
+        self._logical_steps = int(dp_state["logical_steps"])
+        if dp_state.get("generator_state") is not None:
+            if self.generator is None:
+                raise ValueError(
+                    "Checkpoint has DP RNG state but optimizer has no generator"
+                )
+            self.generator.set_state(dp_state["generator_state"])
+        self._load_extra_state_dict(dp_state.get("extra", {}))
+        self._reset_pending()

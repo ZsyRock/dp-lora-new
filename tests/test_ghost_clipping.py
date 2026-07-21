@@ -25,9 +25,11 @@ def _make_peft_model():
     torch.manual_seed(42)
     base = SimpleModel()
     config = LoraConfig(
-        r=4, lora_alpha=8,
+        r=4,
+        lora_alpha=8,
         target_modules=["linear1", "linear2"],
-        lora_dropout=0.0, bias="none",
+        lora_dropout=0.0,
+        bias="none",
     )
     return get_peft_model(base, config)
 
@@ -107,6 +109,7 @@ class TestGhostNorms3D:
 
         # --- Materialized per-sample grad norms ---
         from dp_lora.grad_sample.hooks import linear_forward_hook, linear_backward_hook
+
         h1 = layer.register_forward_hook(linear_forward_hook)
         h2 = layer.register_full_backward_hook(linear_backward_hook)
 
@@ -118,7 +121,11 @@ class TestGhostNorms3D:
         h2.remove()
 
         # --- Ghost norms ---
-        from dp_lora.grad_sample.ghost_clipping import ghost_forward_hook, ghost_backward_hook
+        from dp_lora.grad_sample.ghost_clipping import (
+            ghost_forward_hook,
+            ghost_backward_hook,
+        )
+
         h3 = layer.register_forward_hook(ghost_forward_hook)
         h4 = layer.register_full_backward_hook(ghost_backward_hook)
 

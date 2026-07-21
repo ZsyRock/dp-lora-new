@@ -47,6 +47,8 @@ def ghost_backward_hook(
 ) -> None:
     """Compute per-sample gradient norm^2 from norms of activations and grad_output."""
     grad_out = grad_output[0]
+    if getattr(module, "_dp_loss_reduction", "sum") == "mean":
+        grad_out = grad_out * grad_out.shape[0]
 
     if hasattr(module, "_dp_act_norms_sq"):
         # 2D case: exact formula ||dL/dW_i||^2 = ||g_i||^2 * ||a_i||^2
@@ -104,10 +106,14 @@ class GhostClippingModule:
         *,
         method: str = "ffa",
         adapter_name: str = "default",
+        loss_reduction: str = "mean",
     ):
         self.model = model
         self.method = method
         self.adapter_name = adapter_name
+        if loss_reduction not in ("mean", "sum"):
+            raise ValueError("loss_reduction must be 'mean' or 'sum'")
+        self.loss_reduction = loss_reduction
         self._hooks: list[torch.utils.hooks.RemovableHook] = []
         self._hooked_modules: list[tuple[str, nn.Linear]] = []
 
@@ -148,6 +154,7 @@ class GhostClippingModule:
             raise ValueError(f"No LoRA layers found for adapter '{self.adapter_name}'.")
 
     def _register_hooks(self, linear_module: nn.Linear, name: str) -> None:
+        linear_module._dp_loss_reduction = self.loss_reduction
         h_fwd = linear_module.register_forward_hook(ghost_forward_hook)
         h_bwd = linear_module.register_full_backward_hook(ghost_backward_hook)
         self._hooks.extend([h_fwd, h_bwd])
@@ -206,6 +213,10 @@ class GhostClippingModule:
         for h in self._hooks:
             h.remove()
         self._hooks.clear()
+        for _, module in self._hooked_modules:
+            if hasattr(module, "_dp_loss_reduction"):
+                del module._dp_loss_reduction
+        self._hooked_modules.clear()
 
     def __del__(self):
         self.remove_hooks()

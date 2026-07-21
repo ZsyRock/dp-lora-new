@@ -1,0 +1,11 @@
+name: dp-lora
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip>=25
+  - setuptools>=68
+  - wheel
+
+# PyTorch is intentionally installed separately. Its CUDA build must match the
+# driver and software modules on the target cluster; see scripts/bootstrap_hpc.sh.

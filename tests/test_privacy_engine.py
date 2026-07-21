@@ -24,6 +24,7 @@ def _make_tiny_model():
 
 class SimpleModel(nn.Module):
     """Simple model compatible with PEFT LoRA."""
+
     def __init__(self):
         super().__init__()
         self.linear1 = nn.Linear(16, 32)
@@ -69,6 +70,7 @@ class TestMakePrivate:
         )
         assert engine.grad_sample_module is not None
         assert engine.accountant is not None
+        assert engine.sample_rate == pytest.approx(1 / len(train_loader))
 
     def test_ffa_freezes_lora_a(self, peft_model, train_loader):
         engine = DPLoRAEngine()
@@ -113,6 +115,7 @@ class TestTrainOneStep:
             max_grad_norm=1.0,
             method="vanilla",
             poisson_sampling=False,  # Use regular loader for deterministic test
+            accounting_mode="disabled",
         )
 
         batch = next(iter(dp_loader))
@@ -129,7 +132,8 @@ class TestTrainOneStep:
         stats = dp_opt.step(grads)
         engine.grad_sample_module.clear_per_sample_grads()
 
-        assert engine.get_epsilon() > 0, "Epsilon should be positive after one step"
+        with pytest.raises(RuntimeError, match="must not report epsilon"):
+            engine.get_epsilon()
 
     def test_one_step_ffa(self, peft_model, train_loader):
         engine = DPLoRAEngine()
@@ -143,6 +147,7 @@ class TestTrainOneStep:
             max_grad_norm=1.0,
             method="ffa",
             poisson_sampling=False,
+            accounting_mode="disabled",
         )
 
         batch = next(iter(dp_loader))
@@ -159,7 +164,20 @@ class TestTrainOneStep:
         stats = dp_opt.step(grads)
         engine.grad_sample_module.clear_per_sample_grads()
 
-        assert engine.get_epsilon() > 0
+        with pytest.raises(RuntimeError, match="must not report epsilon"):
+            engine.get_epsilon()
+
+    def test_non_poisson_accounting_is_rejected(self, peft_model, train_loader):
+        engine = DPLoRAEngine()
+        with pytest.raises(ValueError, match="Poisson sampling only"):
+            engine.make_private(
+                model=peft_model,
+                optimizer=torch.optim.Adam(peft_model.parameters(), lr=1e-3),
+                data_loader=train_loader,
+                noise_multiplier=1.0,
+                max_grad_norm=1.0,
+                poisson_sampling=False,
+            )
 
 
 class TestMakePrivateWithEpsilon:

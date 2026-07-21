@@ -12,6 +12,7 @@ build/
 .venv/
 venv/
 env/
+.tools/
 
 # IDE
 .idea/
@@ -38,5 +39,12 @@ _reference/
 
 
 results/
+
+# Exact data-dependent gradient diagnostics (never commit or publish)
+private_diagnostics/
+**/private_diagnostics/
+
+# HPC scheduler output
+slurm-*.out
 
 empirical_lora_evaluation.md

@@ -40,6 +40,37 @@ class PrivacyAccountant:
         )
         self._steps += 1
 
+    def state_dict(self) -> dict:
+        """Return reconstructable accountant state for exact resume semantics."""
+        return {
+            "noise_multiplier": self.noise_multiplier,
+            "sample_rate": self.sample_rate,
+            "delta": self.delta,
+            "steps": self._steps,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore a checkpoint after validating the privacy configuration."""
+        for key in ("noise_multiplier", "sample_rate"):
+            if state[key] != getattr(self, key):
+                raise ValueError(
+                    f"Accountant checkpoint {key}={state[key]!r} does not match "
+                    f"the configured value {getattr(self, key)!r}"
+                )
+        self.delta = float(state["delta"])
+        self._steps = int(state["steps"])
+        self._accountant = rdp.RdpAccountant(RDP_ORDERS)
+        if self._steps:
+            self._accountant.compose(
+                event.SelfComposedDpEvent(
+                    event.PoissonSampledDpEvent(
+                        self.sample_rate,
+                        event.GaussianDpEvent(self.noise_multiplier),
+                    ),
+                    self._steps,
+                )
+            )
+
     def get_epsilon(self, delta: Optional[float] = None) -> float:
         """Compute current (epsilon, delta)-DP guarantee.
 
@@ -85,7 +116,8 @@ def get_noise_multiplier(
         The noise multiplier (sigma) to use in DP-SGD.
     """
     if steps_per_epoch is None:
-        steps_per_epoch = int(1 / sample_rate)
+        # Match the number of logical Poisson draws used by DPDataLoader.
+        steps_per_epoch = int(round(1 / sample_rate))
 
     total_steps = steps_per_epoch * epochs
 
