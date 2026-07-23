@@ -25,6 +25,82 @@ implemented in `scripts/stage_paper_inputs.py`.  Cluster-specific launch files
 are intentionally kept outside this Git worktree under
 `$HOME/hpc/projects/dp-lora-paper/`.
 
+## What a completed run proves
+
+A completed run is **Level 1: algorithm-execution reconstruction**.  It proves
+that the pinned implementation completed its declared client/round schedule
+and produced internally consistent adapter and diagnostic artifacts.  It does
+not prove reproduction of a paper table: the six downstream benchmark
+protocols are not sufficiently specified in the paper and are not staged by
+this repository.  See `docs/REPRODUCIBILITY.md` for the Level 1/2/3 gates.
+
+The runner exposes three auditable training arms:
+
+- `no_dp_lora_control`: neither clipping nor Gaussian noise; still records
+  whether each A/B aggregate gradient *would* exceed `C`;
+- `clip_only_control`: clipping without Gaussian noise; and
+- `paper_dp_lora`: the literal reconstructed clipping-plus-noise mechanism.
+
+The same private HMAC run key and `--rng-domain` give all arms identical client
+partitions, sampled examples, and BERT supervision masks without writing the
+raw key or derived seeds to logs.  Control adapters and all exact diagnostics
+remain non-private artifacts.
+
+## Analysis and recovery artifacts
+
+Each model writes one atomic diagnostic shard per completed round, periodic
+pickle-free `safetensors` checkpoints, attempt/progress state, consolidated
+JSONL records, adapter integrity checks, and a final behavior summary.  The
+statistics include actual and counterfactual clipping rates, raw/clipped/noisy
+gradient norms, signal/noise ratios and cosine, parameter/update norms,
+effective `B @ A` norms, sample coverage/repetition, token counts, per-phase
+timings, peak host/GPU memory, and a FedAvg reconstruction residual.  A
+configuration fingerprint prevents a checkpoint from being resumed under a
+different code/data/method or numerical-backend contract.  The runner hashes
+every staged input byte and requires all dataset/model references to close
+exactly over that inventory.  It also enforces deterministic Torch algorithms,
+disables TF32/cuDNN benchmarking, and records the CUDA driver, CPU, BLAS and
+thread settings.
+
+`--resume` is the only mode that accepts an existing output directory.
+`--stop-file PATH` requests a checkpointed stop at the next completed round;
+the runner exits with status 75 after recording `CHECKPOINTED_STOP`.  Private
+key files must be exactly 32 bytes, mode `0600`, in a user-owned mode `0700`
+directory.  `sigma` is never relabelled as `epsilon`; accounting output is
+explicitly `NOT_CERTIFIED` until the missing sensitivity/composition contract
+is independently resolved.  Resume and completed-run reuse fail closed unless
+the private round shards, checkpoint prefix, trainer state, consolidated logs,
+final adapter and final summaries all reconcile.
+
+## Iridis Slurm entry points
+
+The cluster wrapper is
+`$HOME/hpc/projects/dp-lora-paper/submit.sh`.  It pins the formal paper-literal
+settings (`K=5`, `T=50`, `B=8`, `sigma=2`, `lr=5e-4`, `C=10`, `r=512`) and
+supports:
+
+```text
+submit.sh smoke [--test-only]
+submit.sh formal [--test-only]
+submit.sh paired-smoke [--test-only]
+submit.sh paired-formal [--test-only]
+```
+
+`paired-formal` is the recommended behavior-analysis run: one allocation
+executes no-DP, clip-only, and paper DP-LoRA in fixed order and validates their
+sample, supervision, and client-partition schedules before creating
+`pair_summary.json`.  Set `DPLORA_PAPER_SEED` for an independent repetition;
+all other formal mechanism parameters remain fixed.  A partial or
+completed-but-unarchived run is resumed only with both an explicit existing
+`DPLORA_PAPER_RUN_ID` and `--resume`.  Completed arms are deeply revalidated
+without retraining and their authoritative summaries are preserved byte for
+byte; an already archived output remains immutable and is refused.
+`--test-only` performs byte/runtime preflight and asks Slurm to validate the
+request without creating a job.
+
+See `docs/CURRENT_RESULT_ASSESSMENT.md` for the evidence-based interpretation
+of legacy job `1298681` and its 7-minute-31-second wall time.
+
 # Upstream project description
 
 The financial industry has experienced significant strides in Natural Language Processing (NLP) facilitated by Language Model (LM) technologies. However, the escalating concerns regarding data privacy present a formidable barrier to the ongoing enhancement of these models. A notable challenge involves potential adversarial attackers exploiting the weight of Language Models trained by individual banks, thereby jeopardizing user data confidentiality.

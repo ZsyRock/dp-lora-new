@@ -1,0 +1,11 @@
+# Runtime versions verified on the Iridis DP-LoRA environment.
+# The submission manifest also records these versions for every allocation.
+python==3.10.20
+torch==2.10.0+cu128
+transformers==5.1.0
+peft==0.19.1
+datasets==4.5.0
+pyarrow==25.0.0
+safetensors==0.8.0
+numpy==2.2.6
+opacus==1.6.0
