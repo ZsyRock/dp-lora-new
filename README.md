@@ -1,4 +1,31 @@
-# LLM-Data-Privacy
+# Executable DP-LoRA paper reconstruction
+
+The upstream `main` branch is an incomplete prototype.  The
+`hpc/paper-repro` branch adds a fail-closed, single-GPU simulation of the five
+logical clients in Algorithm 1 of
+“Differentially Private Low-Rank Adaptation of Large Language Model Using
+Federated Learning” (arXiv:2312.17493).
+
+The formal runner uses BERT-base and GPT-2 small sequentially on the English
+MedDialog HealthcareMagic+iCliniq data.  It fixes the values explicitly stated
+by the paper: `K=5`, `T=50`, `B=8`, `sigma=2`, `lr=5e-4`, `C=10`, and LoRA
+rank `512`.  It updates both LoRA A and B, clips their aggregate batch-gradient
+groups separately, adds Gaussian noise, and equally averages the five local
+adapter states after every round.  It contains no SlaClip code path.
+
+The paper omits model revisions, exact LoRA targets/alpha/dropout, optimizer,
+sequence length, seed, and enough privacy-accounting constants to reproduce its
+epsilon claims.  This branch records the chosen assumptions in every
+`run_config.json`; it is an algorithm-level reconstruction, not a claim of
+bit-for-bit reproduction.  Exact client batch losses and gradient statistics
+are labelled `NON_DP_PRIVATE_DIAGNOSTIC`.
+
+The executable is `paper_repro/train_federated.py`; immutable input staging is
+implemented in `scripts/stage_paper_inputs.py`.  Cluster-specific launch files
+are intentionally kept outside this Git worktree under
+`$HOME/hpc/projects/dp-lora-paper/`.
+
+# Upstream project description
 
 The financial industry has experienced significant strides in Natural Language Processing (NLP) facilitated by Language Model (LM) technologies. However, the escalating concerns regarding data privacy present a formidable barrier to the ongoing enhancement of these models. A notable challenge involves potential adversarial attackers exploiting the weight of Language Models trained by individual banks, thereby jeopardizing user data confidentiality.
 
