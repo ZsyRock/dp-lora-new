@@ -6,7 +6,7 @@ import json
 import os
 import tempfile
 import unittest
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +35,7 @@ from paper_repro.train_federated import (
     validate_private_directory,
     read_round_shards,
     save_final_adapter_atomically,
+    slaclip_round_controller_summary,
     validate_completed_root_summary,
 )
 from paper_repro.reproducibility import METHOD_SPECS, canonical_json_fingerprint
@@ -397,6 +398,87 @@ class PaperReproTests(unittest.TestCase):
             torch.allclose(groups["A"][0][1], torch.tensor([[-1.5, -2.0]]))
         )
 
+    def test_slaclip_joint_release_preserves_baseline_gradient_noise_direction(self) -> None:
+        baseline = TinyLoRA()
+        adaptive = TinyLoRA()
+        adaptive.load_state_dict(baseline.state_dict())
+        baseline_groups = parameter_groups(baseline)
+        adaptive_groups = parameter_groups(adaptive)
+        for groups in (baseline_groups, adaptive_groups):
+            with torch.no_grad():
+                groups["A"][0][1].grad = torch.tensor([[3.0, 4.0]])
+                groups["B"][0][1].grad = torch.tensor([[1.0], [2.0]])
+        baseline_stats = clip_noise_and_step(
+            baseline_groups,
+            clip_norm=2.0,
+            noise_multiplier=0.5,
+            learning_rate=0.1,
+            generator=torch.Generator().manual_seed(123),
+        )
+        adaptive_stats = clip_noise_and_step(
+            adaptive_groups,
+            clip_norm_by_group={"A": 2.0, "B": 2.0},
+            noise_multiplier=0.5,
+            learning_rate=0.1,
+            generator=torch.Generator().manual_seed(123),
+            slaclip_num_slots=1,
+            slack_noise_generators={
+                "A": torch.Generator().manual_seed(400),
+                "B": torch.Generator().manual_seed(500),
+            },
+        )
+        for group in ("A", "B"):
+            for (_, baseline_parameter), (_, adaptive_parameter) in zip(
+                baseline_groups[group], adaptive_groups[group]
+            ):
+                self.assertTrue(torch.equal(baseline_parameter, adaptive_parameter))
+            baseline_core = dict(baseline_stats[group])
+            adaptive_core = dict(adaptive_stats[group])
+            adaptive_core.pop("slaclip")
+            self.assertEqual(baseline_core, adaptive_core)
+            self.assertTrue(
+                adaptive_stats[group]["slaclip"][
+                    "joint_sensitivity_bound_passed"
+                ]
+            )
+
+    def test_slaclip_round_updates_A_and_B_only_after_shared_round_threshold(self) -> None:
+        records = []
+        for client in range(2):
+            model = TinyLoRA()
+            groups = parameter_groups(model)
+            with torch.no_grad():
+                groups["A"][0][1].grad = torch.tensor([[3.0, 4.0]])
+                groups["B"][0][1].grad = torch.tensor([[0.1], [0.2]])
+            statistics = clip_noise_and_step(
+                groups,
+                clip_norm_by_group={"A": 2.0, "B": 1.0},
+                noise_multiplier=0.5,
+                learning_rate=0.1,
+                generator=torch.Generator().manual_seed(10 + client),
+                slaclip_num_slots=1,
+                slack_noise_generators={
+                    "A": torch.Generator().manual_seed(20 + client),
+                    "B": torch.Generator().manual_seed(30 + client),
+                },
+            )
+            records.append({"gradient_groups": statistics})
+        summary = slaclip_round_controller_summary(
+            records,
+            clip_thresholds={"A": 2.0, "B": 1.0},
+            target_clip_fractions={"A": 0.5, "B": 0.0},
+            num_slots=1,
+            eta=0.2,
+            c_min=0.1,
+            c_max=50.0,
+        )
+        self.assertEqual(summary["A"]["clip_threshold_used"], 2.0)
+        self.assertEqual(summary["B"]["clip_threshold_used"], 1.0)
+        self.assertEqual(summary["A"]["actual_clip_fraction"], 1.0)
+        self.assertEqual(summary["B"]["actual_clip_fraction"], 0.0)
+        self.assertGreater(summary["A"]["next_clip_threshold"], 0.0)
+        self.assertGreater(summary["B"]["next_clip_threshold"], 0.0)
+
     def test_recorded_signal_and_noise_reconstruct_fedavg_update(self) -> None:
         model = TinyLoRA()
         groups = parameter_groups(model)
@@ -466,6 +548,54 @@ class PaperReproTests(unittest.TestCase):
                 private_key_commitment="key-commitment",
                 rng_domain="rng-domain",
                 clients=[np.array([0]), np.array([1])],
+            )
+
+    def test_checkpoint_binds_slaclip_calibration_and_next_thresholds(self) -> None:
+        config = replace(paper_config(rounds=2), method="slaclip_q_dp_lora")
+        state = valid_checkpoint_state(config, completed_round=2)
+        state["last_round_summary"]["slaclip_controller"] = {
+            "A": {"next_clip_threshold": 11.0},
+            "B": {"next_clip_threshold": 12.0},
+        }
+        state["slaclip_controller_state"] = {
+            "calibration_fingerprint": "c" * 64,
+            "updates_completed": 2,
+            "target_clip_fraction_by_group": {"A": 0.1, "B": 0.2},
+            "next_clip_threshold_by_group": {"A": 11.0, "B": 12.0},
+        }
+        contract = {
+            "controller": {"c_min": 0.1, "c_max": 50.0},
+            "calibration": {
+                "calibration_fingerprint": "c" * 64,
+                "targets": {"bert": {"A": 0.1, "B": 0.2}},
+            },
+        }
+        validate_checkpoint_trainer_state(
+            state,
+            completed_round=2,
+            model_kind="bert",
+            config=config,
+            run_config_fingerprint="run-fingerprint",
+            private_key_commitment="key-commitment",
+            rng_domain="rng-domain",
+            clients=[np.array([0]), np.array([1])],
+            slaclip_contract=contract,
+        )
+        corrupted = copy.deepcopy(state)
+        corrupted["slaclip_controller_state"][
+            "calibration_fingerprint"
+        ] = "d" * 64
+        with self.assertRaisesRegex(RuntimeError, "calibration_fingerprint"):
+            validate_checkpoint_trainer_state(
+                corrupted,
+                completed_round=2,
+                model_kind="bert",
+                config=config,
+                run_config_fingerprint="run-fingerprint",
+                private_key_commitment="key-commitment",
+                rng_domain="rng-domain",
+                clients=[np.array([0]), np.array([1])],
+                slaclip_contract=contract,
             )
 
     def test_checkpoint_rejects_wrong_evaluation_round_sequence(self) -> None:

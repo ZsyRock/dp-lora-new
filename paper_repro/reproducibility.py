@@ -71,6 +71,14 @@ METHOD_SPECS: Mapping[str, MethodSpec] = MappingProxyType(
             independently_accounted=False,
             release_class="paper_literal_dp_reconstruction",
         ),
+        "slaclip_q_dp_lora": MethodSpec(
+            name="slaclip_q_dp_lora",
+            clipping_enabled=True,
+            gaussian_noise_enabled=True,
+            is_control=False,
+            independently_accounted=False,
+            release_class="uncertified_federated_slaclip_q_adaptation",
+        ),
     }
 )
 

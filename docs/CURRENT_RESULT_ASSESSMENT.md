@@ -50,3 +50,11 @@ The correct label is **legacy Level-1 algorithm execution, with an invalid
 internal holdout for utility inference**.  Its statistics motivated the new
 matched-arm, content-isolated, checkpoint-bound instrumentation; they must not
 be mixed with results from the new schema.
+
+For planning the SlaClip-Q extension only, a retrospective recomputation over
+the 50 legacy round summaries found per-round clipping-fraction medians of zero
+for BERT A, BERT B, GPT-2 A, and GPT-2 B. BERT's across-all-client means were
+still 6.4% for A and 16.0% for B, illustrating why a median-of-rounds target is
+not interchangeable with an overall mean. These legacy zeros are an
+expectation, not a valid calibration: the new campaign must first create a
+matched baseline from the same clean commit and bind its own medians by hash.

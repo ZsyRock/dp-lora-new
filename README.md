@@ -11,7 +11,9 @@ MedDialog HealthcareMagic+iCliniq data.  It fixes the values explicitly stated
 by the paper: `K=5`, `T=50`, `B=8`, `sigma=2`, `lr=5e-4`, `C=10`, and LoRA
 rank `512`.  It updates both LoRA A and B, clips their aggregate batch-gradient
 groups separately, adds Gaussian noise, and equally averages the five local
-adapter states after every round.  It contains no SlaClip code path.
+adapter states after every round.  An extension arm, `slaclip_q_dp_lora`, adds
+the fixed-target SlaClip-Q controller without changing that federated update
+unit.
 
 The paper omits model revisions, exact LoRA targets/alpha/dropout, optimizer,
 sequence length, seed, and enough privacy-accounting constants to reproduce its
@@ -34,12 +36,24 @@ not prove reproduction of a paper table: the six downstream benchmark
 protocols are not sufficiently specified in the paper and are not staged by
 this repository.  See `docs/REPRODUCIBILITY.md` for the Level 1/2/3 gates.
 
-The runner exposes three auditable training arms:
+The runner exposes four auditable training arms:
 
 - `no_dp_lora_control`: neither clipping nor Gaussian noise; still records
   whether each A/B aggregate gradient *would* exceed `C`;
 - `clip_only_control`: clipping without Gaussian noise; and
 - `paper_dp_lora`: the literal reconstructed clipping-plus-noise mechanism.
+- `slaclip_q_dp_lora`: a federated SlaClip-Q adaptation with independent A/B
+  thresholds.  Its required target file is derived from a completed matched
+  `paper_dp_lora` baseline by taking, for each model and A/B group, the median
+  of its per-round actual clipping fractions.
+
+The fixed-target arm is SlaClip-Q, not the camera-ready full SlaClip controller
+whose target changes dynamically.  Each client/group jointly releases its
+clipped gradient and slack coordinates with the same `sigma*C_t` coordinate
+scale; all clients in a round use the same `C_t`, and `C_{t+1}` takes effect
+only in the following round.  The target calibration is derived from exact
+private diagnostics, so this exploratory path remains
+`NON_DP_PRIVATE_DIAGNOSTIC`, with `epsilon=null` and no end-to-end DP claim.
 
 The same private HMAC run key and `--rng-domain` give all arms identical client
 partitions, sampled examples, and BERT supervision masks without writing the
@@ -84,12 +98,18 @@ submit.sh smoke [--test-only]
 submit.sh formal [--test-only]
 submit.sh paired-smoke [--test-only]
 submit.sh paired-formal [--test-only]
+submit.sh slaclip-smoke [--test-only]
+submit.sh slaclip-formal [--test-only]
 ```
 
 `paired-formal` is the recommended behavior-analysis run: one allocation
 executes no-DP, clip-only, and paper DP-LoRA in fixed order and validates their
 sample, supervision, and client-partition schedules before creating
 `pair_summary.json`.  Set `DPLORA_PAPER_SEED` for an independent repetition;
+`slaclip-formal` first runs the matched fixed-threshold baseline, atomically
+derives its four median targets, and then runs SlaClip-Q in the same allocation
+before producing a target-bound comparison.  It also retains the no-DP and
+clip-only controls for mechanism diagnosis.
 all other formal mechanism parameters remain fixed.  A partial or
 completed-but-unarchived run is resumed only with both an explicit existing
 `DPLORA_PAPER_RUN_ID` and `--resume`.  Completed arms are deeply revalidated

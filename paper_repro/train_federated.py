@@ -53,6 +53,13 @@ try:
         safe_ratio,
         safe_quantiles,
     )
+    from paper_repro.calibrate_slaclip import load_and_validate_calibration
+    from paper_repro.slaclip import (
+        automatic_num_slots,
+        build_slack_vector,
+        normalize_noisy_slack,
+        slaclip_q_update,
+    )
 except ModuleNotFoundError:  # Support direct ``python paper_repro/...py`` use.
     from checkpointing import (  # type: ignore[no-redef]
         archive_round_shards_after,
@@ -69,6 +76,13 @@ except ModuleNotFoundError:  # Support direct ``python paper_repro/...py`` use.
         private_key_fingerprint,
         safe_ratio,
         safe_quantiles,
+    )
+    from calibrate_slaclip import load_and_validate_calibration  # type: ignore[no-redef]
+    from slaclip import (  # type: ignore[no-redef]
+        automatic_num_slots,
+        build_slack_vector,
+        normalize_noisy_slack,
+        slaclip_q_update,
     )
 
 
@@ -91,6 +105,9 @@ EXPECTED_LORA_TARGETS = {
     "bert": ["query", "key", "value"],
     "gpt2": ["c_attn"],
 }
+SLACLIP_METHOD = "slaclip_q_dp_lora"
+SLACLIP_REFERENCE_REPOSITORY = "https://github.com/ZsyRock/SlaClip"
+SLACLIP_REFERENCE_REVISION = "d48b8e07aef33c58a3595ee18b4dccf9c75fa1f3"
 
 
 @dataclass(frozen=True)
@@ -1211,18 +1228,41 @@ def squared_norm(tensors: Iterable[torch.Tensor]) -> torch.Tensor:
 def clip_noise_and_step(
     groups: dict[str, list[tuple[str, torch.nn.Parameter]]],
     *,
-    clip_norm: float,
+    clip_norm: float | None = None,
+    clip_norm_by_group: dict[str, float] | None = None,
     noise_multiplier: float,
     learning_rate: float,
     generator: torch.Generator,
     apply_clipping: bool = True,
+    slaclip_num_slots: int | None = None,
+    slack_noise_generators: dict[str, torch.Generator] | None = None,
     component_accumulators: dict[str, dict[str, torch.Tensor]] | None = None,
     component_weight: float = 1.0,
 ) -> dict[str, dict[str, Any]]:
     """Apply the paper's separate A/B batch-gradient mechanism in place."""
 
+    if (clip_norm is None) == (clip_norm_by_group is None):
+        raise ValueError("provide exactly one of clip_norm or clip_norm_by_group")
+    if clip_norm_by_group is not None and set(clip_norm_by_group) != {"A", "B"}:
+        raise ValueError("clip_norm_by_group must contain exactly A and B")
+    adaptive = slaclip_num_slots is not None or slack_noise_generators is not None
+    if adaptive:
+        if slaclip_num_slots is None or slaclip_num_slots <= 0:
+            raise ValueError("adaptive clipping requires a positive slaclip_num_slots")
+        if slack_noise_generators is None or set(slack_noise_generators) != {"A", "B"}:
+            raise ValueError("adaptive clipping requires A/B slack noise generators")
+        if not apply_clipping or noise_multiplier <= 0:
+            raise ValueError("SlaClip-Q requires clipping and positive Gaussian noise")
+
     statistics: dict[str, dict[str, Any]] = {}
     for group_name in ("A", "B"):
+        group_clip_norm = float(
+            clip_norm_by_group[group_name]
+            if clip_norm_by_group is not None
+            else clip_norm
+        )
+        if not math.isfinite(group_clip_norm) or group_clip_norm <= 0:
+            raise ValueError(f"invalid LoRA {group_name} clipping threshold")
         entries = groups[group_name]
         missing = [name for name, parameter in entries if parameter.grad is None]
         if missing:
@@ -1233,7 +1273,7 @@ def clip_noise_and_step(
         if not math.isfinite(raw_norm):
             raise FloatingPointError(f"non-finite raw LoRA {group_name} gradient norm")
         counterfactual_factor = min(
-            1.0, clip_norm / max(raw_norm, torch.finfo(torch.float32).tiny)
+            1.0, group_clip_norm / max(raw_norm, torch.finfo(torch.float32).tiny)
         )
         factor = counterfactual_factor if apply_clipping else 1.0
         signal_sq: torch.Tensor | None = None
@@ -1272,7 +1312,7 @@ def clip_noise_and_step(
                     generator=generator,
                     device=gradient.device,
                     dtype=torch.float32,
-                ).mul_(noise_multiplier * clip_norm)
+                ).mul_(noise_multiplier * group_clip_norm)
                 noise_sq_value = noise.square().sum()
                 dot_value = (gradient.detach().float() * noise).sum()
                 noise_sq = (
@@ -1333,10 +1373,12 @@ def clip_noise_and_step(
         )
         expected_noise_norm = (
             noise_multiplier
-            * clip_norm
+            * group_clip_norm
             * math.sqrt(sum(parameter.numel() for _, parameter in entries))
         )
         statistics[group_name] = {
+            "clip_threshold": group_clip_norm,
+            "noise_std_per_coordinate": noise_multiplier * group_clip_norm,
             "raw_norm": raw_norm,
             "clip_factor": factor,
             "counterfactual_clip_factor": counterfactual_factor,
@@ -1363,6 +1405,47 @@ def clip_noise_and_step(
             "parameter_elements": sum(parameter.numel() for _, parameter in entries),
             "tensor_statistics": tensor_statistics,
         }
+        if adaptive:
+            assert slaclip_num_slots is not None
+            assert slack_noise_generators is not None
+            slack_signal = build_slack_vector(
+                raw_norm,
+                group_clip_norm,
+                slaclip_num_slots,
+            )
+            slack_tensor = torch.tensor(
+                slack_signal,
+                dtype=torch.float32,
+                device=gradients[0].device,
+            )
+            slack_noise = torch.randn(
+                slack_tensor.shape,
+                generator=slack_noise_generators[group_name],
+                device=slack_tensor.device,
+                dtype=torch.float32,
+            ).mul_(noise_multiplier * group_clip_norm)
+            noisy_slack = slack_tensor + slack_noise
+            joint_signal_l2 = math.sqrt(
+                clipped_norm * clipped_norm + float(slack_tensor.square().sum().item())
+            )
+            bound_ratio = joint_signal_l2 / group_clip_norm
+            if bound_ratio > 1.0 + 1e-6:
+                raise RuntimeError(
+                    f"LoRA {group_name} SlaClip joint sensitivity bound failed: "
+                    f"ratio={bound_ratio}"
+                )
+            statistics[group_name]["slaclip"] = {
+                "variant": "SlaClip-Q",
+                "num_slots": slaclip_num_slots,
+                "slack_lambda": group_clip_norm / math.sqrt(slaclip_num_slots),
+                "slack_signal": [float(value) for value in slack_tensor.cpu().tolist()],
+                "slack_noise": [float(value) for value in slack_noise.cpu().tolist()],
+                "noisy_slack": [float(value) for value in noisy_slack.cpu().tolist()],
+                "joint_signal_l2": joint_signal_l2,
+                "joint_sensitivity_bound_ratio": bound_ratio,
+                "joint_sensitivity_bound_passed": True,
+                "slack_noise_std_per_coordinate": noise_multiplier * group_clip_norm,
+            }
     with torch.no_grad():
         for entries in groups.values():
             for _, parameter in entries:
@@ -1884,6 +1967,130 @@ def aggregate_round_statistics(records: Sequence[dict[str, Any]]) -> dict[str, A
     return summary
 
 
+def slaclip_round_controller_summary(
+    records: Sequence[dict[str, Any]],
+    *,
+    clip_thresholds: dict[str, float],
+    target_clip_fractions: dict[str, float],
+    num_slots: int,
+    eta: float,
+    c_min: float,
+    c_max: float,
+) -> dict[str, Any]:
+    """Reconcile one federated SlaClip-Q update from its joint releases."""
+
+    if not records:
+        raise ValueError("cannot update SlaClip-Q without client releases")
+    result: dict[str, Any] = {
+        "variant": "SlaClip-Q",
+        "update_timing": "once_after_all_clients_for_use_in_next_round",
+        "clients": len(records),
+        "num_slots": num_slots,
+        "eta": eta,
+        "c_min": c_min,
+        "c_max": c_max,
+    }
+    for group in ("A", "B"):
+        threshold = float(clip_thresholds[group])
+        releases = []
+        signals = []
+        for record in records:
+            group_statistics = record["gradient_groups"][group]
+            if group_statistics.get("clip_threshold") != threshold:
+                raise RuntimeError(
+                    f"SlaClip-Q {group} threshold changed within a federated round"
+                )
+            telemetry = group_statistics.get("slaclip")
+            if (
+                not isinstance(telemetry, dict)
+                or telemetry.get("num_slots") != num_slots
+                or telemetry.get("joint_sensitivity_bound_passed") is not True
+            ):
+                raise RuntimeError(f"invalid SlaClip-Q {group} client release")
+            noisy_slack = telemetry.get("noisy_slack")
+            slack_signal = telemetry.get("slack_signal")
+            if (
+                not isinstance(noisy_slack, list)
+                or len(noisy_slack) != num_slots
+                or not isinstance(slack_signal, list)
+                or len(slack_signal) != num_slots
+            ):
+                raise RuntimeError(f"invalid SlaClip-Q {group} slack vector")
+            releases.append([float(value) for value in noisy_slack])
+            signals.append([float(value) for value in slack_signal])
+        noisy_sum = [
+            math.fsum(release[slot] for release in releases)
+            for slot in range(num_slots)
+        ]
+        signal_sum = [
+            math.fsum(signal[slot] for signal in signals)
+            for slot in range(num_slots)
+        ]
+        noisy_indicator = normalize_noisy_slack(
+            noisy_sum,
+            threshold,
+            num_slots,
+            len(records),
+        )
+        exact_indicator = normalize_noisy_slack(
+            signal_sum,
+            threshold,
+            num_slots,
+            len(records),
+        )
+        slack_lambda = threshold / math.sqrt(num_slots)
+        per_client_slack_noise_std = float(
+            records[0]["gradient_groups"][group]["slaclip"][
+                "slack_noise_std_per_coordinate"
+            ]
+        )
+        normalized_proxy_noise_std = (
+            per_client_slack_noise_std
+            * math.sqrt(len(records))
+            / (slack_lambda * len(records))
+        )
+        target = float(target_clip_fractions[group])
+        update = slaclip_q_update(
+            threshold,
+            target,
+            float(noisy_indicator[0]),
+            eta,
+            c_min,
+            c_max,
+        )
+        update_fields = asdict(update) if hasattr(update, "__dataclass_fields__") else dict(update)
+        update_fields["unbounded_next_clip_threshold"] = update_fields.pop(
+            "unbounded_next_clip_norm"
+        )
+        update_fields["next_clip_threshold"] = update_fields.pop("next_clip_norm")
+        update_fields["c_min"] = update_fields.pop("min_clip_norm")
+        update_fields["c_max"] = update_fields.pop("max_clip_norm")
+        update_fields.pop("current_clip_norm", None)
+        actual_fraction = safe_ratio(
+            sum(bool(record["gradient_groups"][group]["clipped"]) for record in records),
+            len(records),
+        )
+        result[group] = {
+            "clip_threshold_used": threshold,
+            "target_clip_fraction": target,
+            "target_unclipped_proxy": 1.0 - target,
+            "noisy_unclipped_proxy_by_slot": [
+                float(value) for value in noisy_indicator
+            ],
+            "exact_unclipped_proxy_by_slot": [
+                float(value) for value in exact_indicator
+            ],
+            "normalized_proxy_noise_std_per_slot": normalized_proxy_noise_std,
+            "controller_error": (1.0 - target) - float(noisy_indicator[0]),
+            "actual_clip_fraction": actual_fraction,
+            "actual_minus_target_clip_fraction": (
+                None if actual_fraction is None else actual_fraction - target
+            ),
+            **update_fields,
+        }
+    return result
+
+
 def read_round_shards(
     rounds_directory: Path,
     *,
@@ -1892,8 +2099,25 @@ def read_round_shards(
     expected_method: str,
     expected_clients: int,
     expected_batch_size: int,
+    slaclip_contract: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     validate_private_directory(rounds_directory, "round diagnostics directory")
+    adaptive = expected_method == SLACLIP_METHOD
+    if adaptive != (slaclip_contract is not None):
+        raise RuntimeError("SlaClip-Q round validation contract mismatch")
+    current_thresholds: dict[str, float] | None = None
+    controller: dict[str, Any] | None = None
+    target_clip_fractions: dict[str, float] | None = None
+    if slaclip_contract is not None:
+        controller = slaclip_contract["controller"]
+        current_thresholds = {
+            "A": float(controller["initial_clip_threshold"]),
+            "B": float(controller["initial_clip_threshold"]),
+        }
+        target_clip_fractions = {
+            group: float(slaclip_contract["calibration"]["targets"][expected_model][group])
+            for group in ("A", "B")
+        }
     shards: list[dict[str, Any]] = []
     expected_paths = {
         rounds_directory / f"round-{round_index:05d}.json"
@@ -1963,6 +2187,29 @@ def read_round_shards(
         for key, expected in recomputed_summary.items():
             if round_summary.get(key) != expected:
                 raise RuntimeError(f"round summary does not reconcile for {key}: {path}")
+        if adaptive:
+            assert controller is not None
+            assert current_thresholds is not None
+            assert target_clip_fractions is not None
+            recomputed_controller = slaclip_round_controller_summary(
+                client_records,
+                clip_thresholds=current_thresholds,
+                target_clip_fractions=target_clip_fractions,
+                num_slots=int(controller["num_slots"]),
+                eta=float(controller["eta"]),
+                c_min=float(controller["c_min"]),
+                c_max=float(controller["c_max"]),
+            )
+            if round_summary.get("slaclip_controller") != recomputed_controller:
+                raise RuntimeError(
+                    f"SlaClip-Q controller summary does not reconcile: {path}"
+                )
+            current_thresholds = {
+                group: float(recomputed_controller[group]["next_clip_threshold"])
+                for group in ("A", "B")
+            }
+        elif "slaclip_controller" in round_summary:
+            raise RuntimeError(f"fixed-threshold arm contains SlaClip telemetry: {path}")
         federated_update = round_summary.get("federated_update")
         if not isinstance(federated_update, dict):
             raise RuntimeError(f"round summary has no federated update: {path}")
@@ -2098,7 +2345,7 @@ def behavior_summary(shards: Sequence[dict[str, Any]]) -> dict[str, Any]:
         or bool(record["gradient_groups"]["B"]["would_clip"])
         for record in clients
     )
-    return {
+    result = {
         "client_steps": len(clients),
         "rounds": len(rounds),
         "sample_draws": sum(record["batch_size"] for record in clients),
@@ -2119,6 +2366,53 @@ def behavior_summary(shards: Sequence[dict[str, Any]]) -> dict[str, Any]:
             record["batch_telemetry"]["supervised_tokens"] for record in clients
         ),
     }
+    controller_rounds = [
+        round_record.get("slaclip_controller") for round_record in rounds
+    ]
+    if any(value is not None for value in controller_rounds):
+        if not all(isinstance(value, dict) for value in controller_rounds):
+            raise RuntimeError("SlaClip-Q controller telemetry is incomplete")
+        result["slaclip_controller"] = {
+            "variant": "SlaClip-Q",
+            "rounds": len(controller_rounds),
+            "trajectory_sha256": canonical_json_fingerprint(controller_rounds),
+            "groups": {
+                group: {
+                    "clip_threshold_used": safe_quantiles(
+                        value[group]["clip_threshold_used"]
+                        for value in controller_rounds
+                    ),
+                    "next_clip_threshold": safe_quantiles(
+                        value[group]["next_clip_threshold"]
+                        for value in controller_rounds
+                    ),
+                    "noisy_unclipped_proxy": safe_quantiles(
+                        value[group]["noisy_unclipped_proxy_by_slot"][0]
+                        for value in controller_rounds
+                    ),
+                    "actual_minus_target_clip_fraction": safe_quantiles(
+                        value[group]["actual_minus_target_clip_fraction"]
+                        for value in controller_rounds
+                    ),
+                    "lower_bound_hits": sum(
+                        bool(value[group]["hit_lower_bound"])
+                        for value in controller_rounds
+                    ),
+                    "upper_bound_hits": sum(
+                        bool(value[group]["hit_upper_bound"])
+                        for value in controller_rounds
+                    ),
+                    "final_next_clip_threshold": controller_rounds[-1][group][
+                        "next_clip_threshold"
+                    ],
+                    "target_clip_fraction": controller_rounds[0][group][
+                        "target_clip_fraction"
+                    ],
+                }
+                for group in ("A", "B")
+            },
+        }
+    return result
 
 
 def illustrative_accounting_diagnostic(
@@ -2128,9 +2422,23 @@ def illustrative_accounting_diagnostic(
     rounds: int,
     noise_multiplier: float,
     delta: float,
+    contains_slaclip: bool = False,
 ) -> dict[str, Any]:
     """Record why standard DP-SGD accounting cannot certify this mechanism."""
 
+    reasons = [
+        "The paper-literal mechanism clips one aggregate batch gradient, not per-example gradients.",
+        "A and B are clipped separately and jointly released, so sensitivity is not established as C.",
+        "Sampling is fixed-size without replacement, not the Poisson sampling assumed by common accountants.",
+        "Publishing multiple models or paired arms requires an explicit composition analysis.",
+    ]
+    if contains_slaclip:
+        reasons.extend(
+            [
+                "This is a federated per-client adaptation of SlaClip-Q, not the paper's audited per-sample DP-SGD implementation.",
+                "The fixed target is selected from exact baseline clipping diagnostics without a separate private calibration mechanism.",
+            ]
+        )
     return {
         "status": "NOT_CERTIFIED",
         "epsilon": None,
@@ -2140,12 +2448,7 @@ def illustrative_accounting_diagnostic(
         "fixed_batch_sampling_rates": [
             batch_size / size for size in client_partition_sizes
         ],
-        "reasons": [
-            "The paper-literal mechanism clips one aggregate batch gradient, not per-example gradients.",
-            "A and B are clipped separately and jointly released, so sensitivity is not established as C.",
-            "Sampling is fixed-size without replacement, not the Poisson sampling assumed by common accountants.",
-            "Publishing multiple models or paired arms requires an explicit composition analysis.",
-        ],
+        "reasons": reasons,
         "sigma_is_not_epsilon": True,
     }
 
@@ -2160,6 +2463,7 @@ def validate_checkpoint_trainer_state(
     private_key_commitment: str,
     rng_domain: str,
     clients: Sequence[np.ndarray],
+    slaclip_contract: dict[str, Any] | None = None,
 ) -> None:
     if not 0 < completed_round <= config.rounds:
         raise RuntimeError("checkpoint round is outside the configured run")
@@ -2250,6 +2554,48 @@ def validate_checkpoint_trainer_state(
         or any(character not in "0123456789abcdef" for character in shard_digest)
     ):
         raise RuntimeError("checkpoint round-shard digest is invalid")
+    controller_state = state.get("slaclip_controller_state")
+    if config.method == SLACLIP_METHOD:
+        if slaclip_contract is None or not isinstance(controller_state, dict):
+            raise RuntimeError("checkpoint SlaClip-Q controller state is missing")
+        expected_controller_identity = {
+            "calibration_fingerprint": slaclip_contract["calibration"][
+                "calibration_fingerprint"
+            ],
+            "updates_completed": completed_round,
+            "target_clip_fraction_by_group": {
+                group: slaclip_contract["calibration"]["targets"][model_kind][group]
+                for group in ("A", "B")
+            },
+        }
+        for key, expected in expected_controller_identity.items():
+            if controller_state.get(key) != expected:
+                raise RuntimeError(f"checkpoint SlaClip-Q state mismatch: {key}")
+        thresholds = controller_state.get("next_clip_threshold_by_group")
+        controller = slaclip_contract["controller"]
+        if not isinstance(thresholds, dict) or set(thresholds) != {"A", "B"}:
+            raise RuntimeError("checkpoint SlaClip-Q thresholds are invalid")
+        for group in ("A", "B"):
+            value = thresholds[group]
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+                or not float(controller["c_min"])
+                <= float(value)
+                <= float(controller["c_max"])
+            ):
+                raise RuntimeError("checkpoint SlaClip-Q threshold is out of bounds")
+            last_controller = last_round.get("slaclip_controller")
+            if (
+                not isinstance(last_controller, dict)
+                or last_controller.get(group, {}).get("next_clip_threshold") != value
+            ):
+                raise RuntimeError(
+                    "checkpoint SlaClip-Q threshold does not match the last shard"
+                )
+    elif controller_state is not None:
+        raise RuntimeError("fixed-threshold checkpoint contains SlaClip-Q state")
 
 
 def train_one_model(
@@ -2264,9 +2610,22 @@ def train_one_model(
     private_key_commitment: str,
     rng_domain: str,
     run_config_fingerprint: str,
+    slaclip_contract: dict[str, Any] | None,
     resume: bool,
     stop_file: Path | None,
 ) -> dict[str, Any]:
+    adaptive = config.method == SLACLIP_METHOD
+    if adaptive != (slaclip_contract is not None):
+        raise RuntimeError("SlaClip-Q model contract mismatch")
+    controller = slaclip_contract["controller"] if slaclip_contract else None
+    target_clip_fractions = (
+        {
+            group: float(slaclip_contract["calibration"]["targets"][model_kind][group])
+            for group in ("A", "B")
+        }
+        if slaclip_contract
+        else None
+    )
     model_seed = config.seed + (0 if model_kind == "bert" else 1_000_000)
     snapshot = model_snapshot(manifest, model_kind)
     target_modules = EXPECTED_LORA_TARGETS[model_kind]
@@ -2337,6 +2696,7 @@ def train_one_model(
                 expected_method=config.method,
                 expected_clients=config.num_clients,
                 expected_batch_size=config.batch_size,
+                slaclip_contract=slaclip_contract,
             )
             final_shard_digest = round_shard_prefix_sha256(
                 rounds_directory, completed_round=config.rounds
@@ -2375,6 +2735,7 @@ def train_one_model(
                 private_key_commitment=private_key_commitment,
                 rng_domain=rng_domain,
                 clients=clients,
+                slaclip_contract=slaclip_contract,
             )
             if state.get("round_shard_prefix_sha256") != final_shard_digest:
                 raise RuntimeError("completed checkpoint diagnostics checksum mismatch")
@@ -2483,6 +2844,28 @@ def train_one_model(
             }
             if completed.get("clipping") != expected_clipping:
                 raise RuntimeError("completed clipping summary does not reconcile")
+            if adaptive:
+                assert target_clip_fractions is not None
+                controller_behavior = recomputed_behavior.get("slaclip_controller")
+                if not isinstance(controller_behavior, dict):
+                    raise RuntimeError("completed SlaClip-Q controller summary is missing")
+                expected_slaclip_summary = {
+                    "contract": slaclip_contract,
+                    "target_clip_fraction_by_group": dict(target_clip_fractions),
+                    "final_next_clip_threshold_by_group": {
+                        group: controller_behavior["groups"][group][
+                            "final_next_clip_threshold"
+                        ]
+                        for group in ("A", "B")
+                    },
+                    "controller_summary": controller_behavior,
+                }
+                if completed.get("slaclip_q") != expected_slaclip_summary:
+                    raise RuntimeError(
+                        "completed SlaClip-Q summary does not reconcile"
+                    )
+            elif "slaclip_q" in completed:
+                raise RuntimeError("fixed-threshold summary contains SlaClip-Q data")
             if completed.get("adapter_integrity") != adapter_integrity:
                 raise RuntimeError("completed adapter integrity summary mismatch")
             return completed
@@ -2560,6 +2943,7 @@ def train_one_model(
         previous_active_seconds = 0.0
         checkpointed_shard_digest: str | None = None
         last_round_summary: dict[str, Any] | None = None
+        current_clip_thresholds = {"A": config.clip_norm, "B": config.clip_norm}
     else:
         if set(checkpoint.tensors) != set(global_state):
             raise RuntimeError("checkpoint LoRA tensor names do not match the model")
@@ -2581,6 +2965,7 @@ def train_one_model(
             private_key_commitment=private_key_commitment,
             rng_domain=rng_domain,
             clients=clients,
+            slaclip_contract=slaclip_contract,
         )
         evaluations = list(state["evaluations"])
         clipped_counts = dict(state["clipped_counts"])
@@ -2599,6 +2984,19 @@ def train_one_model(
         if actual_shard_digest != checkpointed_shard_digest:
             raise RuntimeError("checkpointed round diagnostics checksum mismatch")
         last_round_summary = state.get("last_round_summary")
+        if adaptive:
+            saved_controller_state = state["slaclip_controller_state"]
+            current_clip_thresholds = {
+                group: float(
+                    saved_controller_state["next_clip_threshold_by_group"][group]
+                )
+                for group in ("A", "B")
+            }
+        else:
+            current_clip_thresholds = {
+                "A": config.clip_norm,
+                "B": config.clip_norm,
+            }
         last_shard_path = rounds_directory / f"round-{completed_round:05d}.json"
         validate_private_regular_file(last_shard_path, "round diagnostic shard")
         last_shard = load_json_object(last_shard_path, "round diagnostic shard")
@@ -2701,13 +3099,33 @@ def train_one_model(
             noise_generator = torch.Generator(device=device.type).manual_seed(
                 noise_seed
             )
+            slack_noise_generators: dict[str, torch.Generator] | None = None
+            if adaptive:
+                slack_noise_generators = {
+                    group: torch.Generator(device=device.type).manual_seed(
+                        derive_seed(
+                            private_key,
+                            rng_domain,
+                            f"slaclip_slack_noise_{group}",
+                            model_kind,
+                            round_index,
+                            client_id,
+                            method_scope=SLACLIP_METHOD,
+                        )
+                    )
+                    for group in ("A", "B")
+                }
             group_stats = clip_noise_and_step(
                 groups,
-                clip_norm=config.clip_norm,
+                clip_norm_by_group=current_clip_thresholds,
                 noise_multiplier=effective_noise_multiplier,
                 learning_rate=config.learning_rate,
                 generator=noise_generator,
                 apply_clipping=method_spec.clipping_enabled,
+                slaclip_num_slots=(
+                    int(controller["num_slots"]) if controller is not None else None
+                ),
+                slack_noise_generators=slack_noise_generators,
                 component_accumulators=components,
                 component_weight=1.0 / config.num_clients,
             )
@@ -2795,6 +3213,23 @@ def train_one_model(
                 for client_id in range(config.num_clients)
             ],
         }
+        if adaptive:
+            assert controller is not None
+            assert target_clip_fractions is not None
+            controller_summary = slaclip_round_controller_summary(
+                records,
+                clip_thresholds=current_clip_thresholds,
+                target_clip_fractions=target_clip_fractions,
+                num_slots=int(controller["num_slots"]),
+                eta=float(controller["eta"]),
+                c_min=float(controller["c_min"]),
+                c_max=float(controller["c_max"]),
+            )
+            last_round_summary["slaclip_controller"] = controller_summary
+            current_clip_thresholds = {
+                group: float(controller_summary[group]["next_clip_threshold"])
+                for group in ("A", "B")
+            }
         if round_index % config.eval_every == 0 or round_index == config.rounds:
             evaluation_started = synchronized_time(device)
             evaluation = evaluate(
@@ -2862,6 +3297,24 @@ def train_one_model(
                     "round_shard_prefix_sha256": checkpointed_shard_digest,
                     "active_elapsed_seconds": previous_active_seconds
                     + (time.monotonic() - started),
+                    **(
+                        {
+                            "slaclip_controller_state": {
+                                "calibration_fingerprint": slaclip_contract[
+                                    "calibration"
+                                ]["calibration_fingerprint"],
+                                "updates_completed": round_index,
+                                "target_clip_fraction_by_group": dict(
+                                    target_clip_fractions
+                                ),
+                                "next_clip_threshold_by_group": dict(
+                                    current_clip_thresholds
+                                ),
+                            }
+                        }
+                        if adaptive
+                        else {}
+                    ),
                 },
             )
         atomic_json(
@@ -2882,6 +3335,22 @@ def train_one_model(
                     group: last_round_summary[group]["would_clip_fraction"]
                     for group in ("A", "B")
                 },
+                **(
+                    {
+                        "slaclip_q": {
+                            group: {
+                                "clip_threshold_used": last_round_summary[
+                                    "slaclip_controller"
+                                ][group]["clip_threshold_used"],
+                                "next_clip_threshold": current_clip_thresholds[group],
+                                "target_clip_fraction": target_clip_fractions[group],
+                            }
+                            for group in ("A", "B")
+                        }
+                    }
+                    if adaptive
+                    else {}
+                ),
                 "updated_at_utc": utc_now(),
             },
         )
@@ -2895,6 +3364,14 @@ def train_one_model(
                     "mean_loss": last_round_summary["mean_training_loss"],
                     "A_clip_fraction": last_round_summary["A"]["clipped_fraction"],
                     "B_clip_fraction": last_round_summary["B"]["clipped_fraction"],
+                    **(
+                        {
+                            "A_clip_threshold_next": current_clip_thresholds["A"],
+                            "B_clip_threshold_next": current_clip_thresholds["B"],
+                        }
+                        if adaptive
+                        else {}
+                    ),
                     "elapsed_seconds": last_round_summary["total_elapsed_seconds"],
                 },
                 sort_keys=True,
@@ -2927,6 +3404,7 @@ def train_one_model(
         expected_method=config.method,
         expected_clients=config.num_clients,
         expected_batch_size=config.batch_size,
+        slaclip_contract=slaclip_contract,
     )
     final_shard_digest = round_shard_prefix_sha256(
         rounds_directory, completed_round=config.rounds
@@ -3002,6 +3480,22 @@ def train_one_model(
             },
         },
         "behavior_summary": behavior,
+        **(
+            {
+                "slaclip_q": {
+                    "contract": slaclip_contract,
+                    "target_clip_fraction_by_group": dict(
+                        target_clip_fractions
+                    ),
+                    "final_next_clip_threshold_by_group": dict(
+                        current_clip_thresholds
+                    ),
+                    "controller_summary": behavior["slaclip_controller"],
+                }
+            }
+            if adaptive
+            else {}
+        ),
         "round_shard_prefix_sha256": final_shard_digest,
         "evaluations": evaluations,
         "final_evaluation": final_evaluation,
@@ -3018,7 +3512,12 @@ def train_one_model(
                 "supervision_mask",
                 "model_stochasticity",
                 "gaussian_noise",
-            ],
+            ]
+            + (
+                ["slaclip_slack_noise_A", "slaclip_slack_noise_B"]
+                if adaptive
+                else []
+            ),
             "private_key_commitment": private_key_commitment,
             "rng_domain": rng_domain,
             "pair_noise_across_methods": config.pair_noise_across_methods,
@@ -3030,6 +3529,7 @@ def train_one_model(
             rounds=config.rounds,
             noise_multiplier=effective_noise_multiplier,
             delta=config.delta,
+            contains_slaclip=adaptive,
         ),
         "elapsed_seconds": elapsed,
         "completed_at_utc": utc_now(),
@@ -3065,7 +3565,7 @@ def validate_completed_root_summary(
         "schema_version": 2,
         "status": "COMPLETED",
         "privacy_label": PRIVACY_LABEL,
-        "contains_slaclip": False,
+        "contains_slaclip": config.method == SLACLIP_METHOD,
         "method": config.method,
         "method_spec": asdict(METHOD_SPECS[config.method]),
         "run_config_fingerprint": run_config_fingerprint,
@@ -3097,7 +3597,7 @@ def validate_completed_root_summary(
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Federated DP-LoRA paper reconstruction (no SlaClip)"
+        description="Federated DP-LoRA reconstruction with optional SlaClip-Q"
     )
     parser.add_argument("--input-manifest", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path)
@@ -3133,6 +3633,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="paper_union_minus_fixed_holdout",
     )
     parser.add_argument("--delta", type=float, default=1e-5)
+    parser.add_argument("--slaclip-calibration", type=Path)
+    parser.add_argument("--slaclip-eta", type=float, default=0.2)
+    parser.add_argument("--slaclip-num-slots", type=int, default=0)
+    parser.add_argument("--slaclip-c-min", type=float, default=0.1)
+    parser.add_argument("--slaclip-c-max", type=float, default=50.0)
     parser.add_argument("--private-rng-key", type=Path)
     parser.add_argument("--rng-domain")
     parser.add_argument("--pair-noise-across-methods", action="store_true")
@@ -3207,8 +3712,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit(f"refusing to overwrite existing output: {output_dir}")
     config = make_effective_config(args)
     validate_config(config)
-    if config.method == "paper_dp_lora" and config.noise_multiplier <= 0:
-        raise SystemExit("paper_dp_lora requires --noise-multiplier > 0")
+    if config.method in {"paper_dp_lora", SLACLIP_METHOD} and config.noise_multiplier <= 0:
+        raise SystemExit(f"{config.method} requires --noise-multiplier > 0")
+    if config.method == SLACLIP_METHOD and args.slaclip_calibration is None:
+        raise SystemExit("slaclip_q_dp_lora requires --slaclip-calibration")
+    if config.method != SLACLIP_METHOD and args.slaclip_calibration is not None:
+        raise SystemExit("--slaclip-calibration is only valid for slaclip_q_dp_lora")
     if args.device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("CUDA was requested but torch.cuda.is_available() is false")
     try:
@@ -3224,6 +3733,92 @@ def main(argv: Sequence[str] | None = None) -> None:
     repository_root = Path(str(repo.get("root"))).resolve()
     if output_dir == repository_root or repository_root in output_dir.parents:
         raise SystemExit("output directory must be outside the Git worktree")
+
+    slaclip_contract: dict[str, Any] | None = None
+    if config.method == SLACLIP_METHOD:
+        assert args.slaclip_calibration is not None
+        if args.models != ["bert", "gpt2"]:
+            raise SystemExit(
+                "slaclip_q_dp_lora calibration requires ordered models: bert gpt2"
+            )
+        args.slaclip_calibration = args.slaclip_calibration.expanduser().resolve()
+        calibration = load_and_validate_calibration(
+            args.slaclip_calibration,
+            expected_models=args.models,
+        )
+        if calibration["source"].get("repository_sha") != repo.get("sha"):
+            raise SystemExit(
+                "SlaClip calibration baseline repository SHA differs from this run"
+            )
+        for model_kind in args.models:
+            model_calibration = calibration["models"][model_kind]
+            if (
+                model_calibration["rounds"] != config.rounds
+                or model_calibration["clients_per_round"] != config.num_clients
+            ):
+                raise SystemExit(
+                    f"SlaClip calibration schedule mismatch for {model_kind}"
+                )
+        if args.slaclip_num_slots < 0:
+            raise SystemExit("--slaclip-num-slots must be zero (auto) or positive")
+        num_slots = (
+            args.slaclip_num_slots
+            if args.slaclip_num_slots > 0
+            else automatic_num_slots(config.num_clients, config.noise_multiplier)
+        )
+        if (
+            not math.isfinite(args.slaclip_eta)
+            or args.slaclip_eta < 0
+            or not math.isfinite(args.slaclip_c_min)
+            or not math.isfinite(args.slaclip_c_max)
+            or args.slaclip_c_min <= 0
+            or args.slaclip_c_max < args.slaclip_c_min
+            or not args.slaclip_c_min <= config.clip_norm <= args.slaclip_c_max
+        ):
+            raise SystemExit("invalid SlaClip-Q eta or threshold bounds")
+        slaclip_contract = {
+            "variant": "SlaClip-Q_fixed_target",
+            "federated_adaptation": (
+                "per_client_joint_gradient_slack_release_then_equal_fedavg_"
+                "and_one_controller_update_per_round"
+            ),
+            "reference": {
+                "paper": "https://openreview.net/pdf?id=48suUeYKdb",
+                "repository": SLACLIP_REFERENCE_REPOSITORY,
+                "revision": SLACLIP_REFERENCE_REVISION,
+            },
+            "controller": {
+                "eta": float(args.slaclip_eta),
+                "num_slots": int(num_slots),
+                "num_slots_selection": (
+                    "automatic_monotonicity_rule"
+                    if args.slaclip_num_slots == 0
+                    else "explicit"
+                ),
+                "expected_release_records": config.num_clients,
+                "c_min": float(args.slaclip_c_min),
+                "c_max": float(args.slaclip_c_max),
+                "initial_clip_threshold": config.clip_norm,
+                "target_semantics": "clipped_fraction_complemented_to_unclipped_proxy",
+            },
+            "calibration": {
+                "privacy_class": calibration["privacy_class"],
+                "calibration_fingerprint": calibration["calibration_fingerprint"],
+                "file_sha256": sha256_file(args.slaclip_calibration),
+                "source": calibration["source"],
+                "reducer": calibration["reducer"],
+                "targets": {
+                    model_kind: {
+                        group: calibration["models"][model_kind]["groups"][group][
+                            "target_clip_fraction"
+                        ]
+                        for group in ("A", "B")
+                    }
+                    for model_kind in args.models
+                },
+            },
+            "independently_privacy_certified": False,
+        }
 
     private_key = (
         load_private_key(args.private_rng_key)
@@ -3250,6 +3845,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         "The internal LM loss is not any of the six paper benchmark scores and cannot establish paper metric reproduction.",
         "No independent epsilon is reported because the paper does not provide the constants/calibration needed to map sigma=2 to its epsilon sweep.",
     ]
+    if slaclip_contract is not None:
+        assumptions.extend(
+            [
+                "The requested fixed baseline-median clipping target is the SlaClip-Q ablation, not full SlaClip with a dynamic target.",
+                "SlaClip-Q is adapted to the paper-literal federated mechanism by releasing one joint gradient/slack vector per client and LoRA group, then updating each A/B threshold once after FedAvg.",
+                "The exact baseline-derived target is a data-dependent non-DP calibration artifact, so this exploratory comparison is not end-to-end DP certified.",
+            ]
+        )
     dependency_versions = package_versions()
     backend_contract = execution_backend_contract(device)
     scientific_contract = {
@@ -3277,7 +3880,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             "local_optimizer": "one_manual_sgd_step",
             "record_weighting": "equal_records_after_within_record_token_mean",
             "dropout_rng": "stateless_private_hmac_per_model_round_client",
-            "contains_slaclip": False,
+            "contains_slaclip": slaclip_contract is not None,
+            "slaclip_q": slaclip_contract,
         },
     }
     run_config_fingerprint = canonical_json_fingerprint(scientific_contract)
@@ -3289,7 +3893,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "privacy_label": PRIVACY_LABEL,
         "method": config.method,
         "method_spec": asdict(METHOD_SPECS[config.method]),
-        "contains_slaclip": False,
+        "contains_slaclip": slaclip_contract is not None,
         "run_config_fingerprint": run_config_fingerprint,
         "scientific_contract": scientific_contract,
         "reproduction_claim": {
@@ -3304,6 +3908,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "epsilon": None,
             "sigma_is_not_epsilon": True,
             "diagnostics_are_private_non_dp_data": True,
+            "baseline_derived_calibration_is_non_dp": slaclip_contract is not None,
         },
         "repository": repo,
         "environment": {
@@ -3473,6 +4078,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 private_key_commitment=private_key_commitment,
                 rng_domain=args.rng_domain,
                 run_config_fingerprint=run_config_fingerprint,
+                slaclip_contract=slaclip_contract,
                 resume=args.resume,
                 stop_file=args.stop_file,
             )
@@ -3496,7 +4102,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "schema_version": 2,
                 "status": "COMPLETED",
                 "privacy_label": PRIVACY_LABEL,
-                "contains_slaclip": False,
+                "contains_slaclip": slaclip_contract is not None,
                 "method": config.method,
                 "method_spec": asdict(METHOD_SPECS[config.method]),
                 "run_config_fingerprint": run_config_fingerprint,

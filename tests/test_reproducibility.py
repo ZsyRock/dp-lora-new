@@ -23,7 +23,12 @@ class MethodContractTests(unittest.TestCase):
     def test_method_specs_make_controls_and_paper_arm_explicit(self) -> None:
         self.assertEqual(
             set(METHOD_SPECS),
-            {"no_dp_lora_control", "clip_only_control", "paper_dp_lora"},
+            {
+                "no_dp_lora_control",
+                "clip_only_control",
+                "paper_dp_lora",
+                "slaclip_q_dp_lora",
+            },
         )
         self.assertFalse(METHOD_SPECS["no_dp_lora_control"].clipping_enabled)
         self.assertTrue(METHOD_SPECS["clip_only_control"].clipping_enabled)
@@ -31,6 +36,11 @@ class MethodContractTests(unittest.TestCase):
         self.assertTrue(METHOD_SPECS["paper_dp_lora"].gaussian_noise_enabled)
         self.assertTrue(METHOD_SPECS["no_dp_lora_control"].is_control)
         self.assertFalse(METHOD_SPECS["paper_dp_lora"].independently_accounted)
+        self.assertTrue(METHOD_SPECS["slaclip_q_dp_lora"].clipping_enabled)
+        self.assertTrue(METHOD_SPECS["slaclip_q_dp_lora"].gaussian_noise_enabled)
+        self.assertFalse(
+            METHOD_SPECS["slaclip_q_dp_lora"].independently_accounted
+        )
 
 
 class PrivateKeyTests(unittest.TestCase):

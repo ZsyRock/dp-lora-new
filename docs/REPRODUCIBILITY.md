@@ -208,6 +208,27 @@ information to establish equivalence, the computed budget must be labelled as
 the repository's reconstructed privacy accounting rather than the authors'
 budget.
 
+### SlaClip-Q extension boundary
+
+The repository's fixed-target adaptive arm is `slaclip_q_dp_lora`. It is the
+SlaClip-Q ablation, not full SlaClip: for every model and LoRA A/B group it
+uses `gamma = 1 - q_target` and updates the clipping threshold only after all
+clients in a round have completed. Its target is the median of the matched
+fixed-threshold baseline's per-round actual clipping fractions for that same
+model/group. The calibration manifest binds the baseline configuration,
+summaries, complete round-shard prefix, reducer, targets, and hashes.
+
+The slack coordinates and clipped gradient form one bounded vector per client
+and group and receive independent Gaussian coordinates at scale `sigma*C_t`.
+This preserves the intended joint-release construction inside the declared
+federated adaptation, but it does not supply the missing end-to-end accountant.
+Moreover, selecting `q_target` from exact baseline diagnostics is itself a
+data-dependent non-DP calibration step. Therefore the current SlaClip-Q study
+must retain `NON_DP_PRIVATE_DIAGNOSTIC`, `epsilon=null`, and
+`end_to_end_dp_certified=false`. A privacy claim would require a public or
+independent calibration set, or a separately private target release and full
+composition analysis.
+
 ## Minimum result package
 
 A Level 2 result package must contain immutable references to the code and
