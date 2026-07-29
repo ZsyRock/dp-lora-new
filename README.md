@@ -45,7 +45,11 @@ The runner exposes four auditable training arms:
 - `slaclip_q_dp_lora`: a federated SlaClip-Q adaptation with independent A/B
   thresholds.  Its required target file is derived from a completed matched
   `paper_dp_lora` baseline by taking, for each model and A/B group, the median
-  of its per-round actual clipping fractions.
+  of its per-round actual clipping fractions.  A complete set of four
+  repeated `--slaclip-target MODEL:GROUP=FRACTION` arguments can instead
+  precommit explicit controller targets while retaining the matched baseline
+  calibration as separate evidence; partial, duplicate, non-finite, and
+  out-of-range target maps fail closed.
 
 The fixed-target arm is SlaClip-Q, not the camera-ready full SlaClip controller
 whose target changes dynamically.  Each client/group jointly releases its
@@ -100,6 +104,8 @@ submit.sh paired-smoke [--test-only]
 submit.sh paired-formal [--test-only]
 submit.sh slaclip-smoke [--test-only]
 submit.sh slaclip-formal [--test-only]
+submit.sh slaclip-target-pilot [--test-only]
+submit.sh slaclip-target-formal [--test-only]
 ```
 
 `paired-formal` is the recommended behavior-analysis run: one allocation
@@ -110,7 +116,15 @@ sample, supervision, and client-partition schedules before creating
 derives its four median targets, and then runs SlaClip-Q in the same allocation
 before producing a target-bound comparison.  It also retains the no-DP and
 clip-only controls for mechanism diagnosis.
-all other formal mechanism parameters remain fixed.  A partial or
+`slaclip-target-pilot` is a 20-round diagnostic with precommitted group targets
+`BERT A/B=0.066/0.146` and `GPT-2 A/B=0.01/0.01`, explicit `K_slots=15`,
+`eta=0.025`, and `C_t` constrained to `[0.1, 10]`.  `K_clients` remains 5.
+The K override is a user-defined small-batch journal policy that exceeds the
+five-release automatic SNR bound; both the theoretical normalized proxy-noise
+scale and this override are recorded in the controller contract.  The target
+values were selected from prior exact non-DP diagnostics, so the comparison is
+exploratory rather than end-to-end DP certified.
+All other formal mechanism parameters remain fixed.  A partial or
 completed-but-unarchived run is resumed only with both an explicit existing
 `DPLORA_PAPER_RUN_ID` and `--resume`.  Completed arms are deeply revalidated
 without retraining and their authoritative summaries are preserved byte for

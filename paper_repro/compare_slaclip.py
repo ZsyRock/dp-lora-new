@@ -36,7 +36,7 @@ try:
         METHOD_SPECS,
         canonical_json_fingerprint,
     )
-    from paper_repro.slaclip import slaclip_q_update
+    from paper_repro.slaclip import automatic_num_slots, slaclip_q_update
 except ModuleNotFoundError:  # Support direct execution.
     from calibrate_slaclip import (  # type: ignore[no-redef]
         CALIBRATION_PRIVACY_CLASS,
@@ -50,7 +50,10 @@ except ModuleNotFoundError:  # Support direct execution.
         METHOD_SPECS,
         canonical_json_fingerprint,
     )
-    from slaclip import slaclip_q_update  # type: ignore[no-redef]
+    from slaclip import (  # type: ignore[no-redef]
+        automatic_num_slots,
+        slaclip_q_update,
+    )
 
 
 BASELINE_METHOD = "paper_dp_lora"
@@ -58,6 +61,16 @@ ADAPTIVE_METHOD = "slaclip_q_dp_lora"
 EXPECTED_METHODS = (BASELINE_METHOD, ADAPTIVE_METHOD)
 COMPARISON_SCHEMA_VERSION = 1
 COMPARISON_STATUS = "VALID_MATCHED_DP_LORA_SLACLIP_Q_LEVEL1_COMPARISON"
+TARGET_SPEC_SCHEMA_VERSION = 1
+TARGET_MODE_BASELINE_MEDIAN = "baseline_median"
+TARGET_MODE_EXPLICIT = "explicit_precommitted"
+TARGET_LABEL_BASELINE_MEDIAN = (
+    "current_run_baseline_median_non_dp_private_diagnostic_derived_target"
+)
+TARGET_LABEL_EXPLICIT = (
+    "prior_non_dp_diagnostic_derived_precommitted_hyperparameter"
+)
+TARGET_PRIVACY_CLASS = "NON_DP_DIAGNOSTIC_DERIVED_HYPERPARAMETER"
 
 
 def utc_now() -> str:
@@ -462,12 +475,81 @@ def _calibration_targets(calibration: Mapping[str, Any]) -> dict[str, dict[str, 
     }
 
 
+def _validated_target_map(
+    value: Any, description: str
+) -> dict[str, dict[str, float]]:
+    if not isinstance(value, dict) or tuple(value) != DEFAULT_MODELS:
+        raise RuntimeError(f"{description} model set/order mismatch")
+    result: dict[str, dict[str, float]] = {}
+    for model in DEFAULT_MODELS:
+        groups = value.get(model)
+        if not isinstance(groups, dict) or tuple(groups) != LORA_GROUPS:
+            raise RuntimeError(f"{description} {model} group set/order mismatch")
+        result[model] = {
+            group: _fraction(
+                groups.get(group), f"{description} {model}/{group} fraction"
+            )
+            for group in LORA_GROUPS
+        }
+    return result
+
+
+def _active_target_spec(
+    slaclip_contract: Mapping[str, Any],
+    calibration_targets: dict[str, dict[str, float]],
+) -> tuple[dict[str, dict[str, float]], dict[str, Any] | None]:
+    """Validate current target metadata, or accept the historical schema."""
+
+    raw_spec = slaclip_contract.get("target_spec")
+    if raw_spec is None:
+        # Historical contracts used calibration.targets directly.
+        return calibration_targets, None
+    expected_keys = {
+        "schema_version",
+        "mode",
+        "label",
+        "privacy_class",
+        "precommitted_before_adaptive_training",
+        "targets",
+    }
+    if not isinstance(raw_spec, dict) or set(raw_spec) != expected_keys:
+        raise RuntimeError("adaptive SlaClip-Q target-spec schema mismatch")
+    if raw_spec.get("schema_version") != TARGET_SPEC_SCHEMA_VERSION:
+        raise RuntimeError("adaptive SlaClip-Q target-spec version mismatch")
+    mode = raw_spec.get("mode")
+    expected_labels = {
+        TARGET_MODE_BASELINE_MEDIAN: TARGET_LABEL_BASELINE_MEDIAN,
+        TARGET_MODE_EXPLICIT: TARGET_LABEL_EXPLICIT,
+    }
+    if mode not in expected_labels:
+        raise RuntimeError("adaptive SlaClip-Q target-spec mode mismatch")
+    if raw_spec.get("label") != expected_labels[mode]:
+        raise RuntimeError("adaptive SlaClip-Q target-spec label mismatch")
+    if raw_spec.get("privacy_class") != TARGET_PRIVACY_CLASS:
+        raise RuntimeError("adaptive SlaClip-Q target-spec privacy class mismatch")
+    if raw_spec.get("precommitted_before_adaptive_training") is not True:
+        raise RuntimeError("adaptive SlaClip-Q targets were not precommitted")
+    targets = _validated_target_map(
+        raw_spec.get("targets"), "adaptive SlaClip-Q target spec"
+    )
+    if mode == TARGET_MODE_BASELINE_MEDIAN and targets != calibration_targets:
+        raise RuntimeError(
+            "adaptive baseline-median target spec differs from calibration"
+        )
+    return targets, copy.deepcopy(raw_spec)
+
+
 def _validate_calibration_binding(
     calibration_path: Path,
     calibration: Mapping[str, Any],
     baseline: Mapping[str, Any],
     adaptive: Mapping[str, Any],
-) -> tuple[str, dict[str, dict[str, float]]]:
+) -> tuple[
+    str,
+    dict[str, dict[str, float]],
+    dict[str, dict[str, float]],
+    dict[str, Any] | None,
+]:
     calibration_bytes = _read_private_bytes(
         calibration_path, "SlaClip calibration"
     )
@@ -510,7 +592,7 @@ def _validate_calibration_binding(
         ):
             raise RuntimeError(f"calibration {model} schedule evidence mismatch")
 
-    targets = _calibration_targets(calibration)
+    calibration_targets = _calibration_targets(calibration)
     slaclip_contract = adaptive["slaclip_contract"]
     assert isinstance(slaclip_contract, dict)
     expected_contract_calibration = {
@@ -519,13 +601,16 @@ def _validate_calibration_binding(
         "file_sha256": calibration_sha,
         "source": source,
         "reducer": CALIBRATION_REDUCER,
-        "targets": targets,
+        "targets": calibration_targets,
     }
     if slaclip_contract.get("calibration") != expected_contract_calibration:
         raise RuntimeError("adaptive calibration contract does not match its file")
     if slaclip_contract.get("independently_privacy_certified") is not False:
         raise RuntimeError("adaptive SlaClip-Q contract makes an unsafe privacy claim")
-    return calibration_sha, targets
+    active_targets, target_spec = _active_target_spec(
+        slaclip_contract, calibration_targets
+    )
+    return calibration_sha, calibration_targets, active_targets, target_spec
 
 
 def _validate_controller_trajectory(
@@ -557,6 +642,64 @@ def _validate_controller_trajectory(
         raise RuntimeError("adaptive initial threshold differs from baseline C")
     if controller.get("expected_release_records") != adaptive["clients"]:
         raise RuntimeError("adaptive controller release count mismatch")
+    audit_fields = {
+        "local_batch_size",
+        "num_clients",
+        "automatic_release_num_slots",
+        "explicit_num_slots_exceeds_automatic_release_bound",
+        "normalized_proxy_noise_std_per_slot_theoretical",
+        "normalized_proxy_noise_std_formula",
+        "controlled_slot_index",
+    }
+    present_audit_fields = audit_fields.intersection(controller)
+    if present_audit_fields and present_audit_fields != audit_fields:
+        raise RuntimeError("adaptive controller K/noise audit fields are incomplete")
+    if present_audit_fields:
+        effective = adaptive["effective_config"]
+        local_batch_size = _positive_integer(
+            effective.get("batch_size"), "adaptive local batch size"
+        )
+        noise_multiplier = _finite_number(
+            effective.get("noise_multiplier"), "adaptive noise multiplier"
+        )
+        automatic_slots = automatic_num_slots(
+            adaptive["clients"], noise_multiplier
+        )
+        theoretical_proxy_std = noise_multiplier * math.sqrt(
+            num_slots / adaptive["clients"]
+        )
+        expected_exceeds = bool(
+            controller.get("num_slots_selection") == "explicit"
+            and num_slots > automatic_slots
+        )
+        expected_audit_values = {
+            "local_batch_size": local_batch_size,
+            "num_clients": adaptive["clients"],
+            "automatic_release_num_slots": automatic_slots,
+            "explicit_num_slots_exceeds_automatic_release_bound": expected_exceeds,
+            "normalized_proxy_noise_std_formula": (
+                "noise_multiplier*sqrt(num_slots/num_clients)"
+            ),
+            "controlled_slot_index": 0,
+        }
+        for key, expected in expected_audit_values.items():
+            if controller.get(key) != expected:
+                raise RuntimeError(
+                    f"adaptive controller K/noise audit mismatch: {key}"
+                )
+        recorded_proxy_std = _finite_number(
+            controller.get("normalized_proxy_noise_std_per_slot_theoretical"),
+            "adaptive theoretical proxy noise",
+        )
+        if not math.isclose(
+            recorded_proxy_std,
+            theoretical_proxy_std,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise RuntimeError(
+                "adaptive controller K/noise audit mismatch: theoretical proxy noise"
+            )
 
     rounds_dir = (
         adaptive["directory"] / model / "private_diagnostics" / "rounds"
@@ -797,7 +940,12 @@ def build_comparison(
         expected_models=DEFAULT_MODELS,
         expected_source_dir=baseline_path,
     )
-    calibration_sha, target_map = _validate_calibration_binding(
+    (
+        calibration_sha,
+        calibration_target_map,
+        active_target_map,
+        active_target_spec,
+    ) = _validate_calibration_binding(
         calibration_file, calibration, baseline, adaptive
     )
     baseline_clip_norm = _finite_number(
@@ -827,7 +975,7 @@ def build_comparison(
         controller = _validate_controller_trajectory(
             adaptive,
             model=model,
-            targets=target_map[model],
+            targets=active_target_map[model],
             baseline_clip_norm=baseline_clip_norm,
         )
         model_comparisons[model] = {
@@ -840,7 +988,7 @@ def build_comparison(
             "matched_client_partition_sha256": baseline_model[
                 "client_partition_sha256"
             ],
-            "target_clip_fraction_by_group": target_map[model],
+            "target_clip_fraction_by_group": active_target_map[model],
             "controller": controller,
             "arms": {
                 BASELINE_METHOD: {
@@ -878,7 +1026,7 @@ def build_comparison(
             "privacy_class": CALIBRATION_PRIVACY_CLASS,
             "reducer": CALIBRATION_REDUCER,
             "source": calibration["source"],
-            "target_clip_fraction_by_model_and_group": target_map,
+            "target_clip_fraction_by_model_and_group": calibration_target_map,
         },
         "arm_evidence": {
             BASELINE_METHOD: {
@@ -904,6 +1052,8 @@ def build_comparison(
             "adaptive_arm_independently_privacy_certified": False,
         },
     }
+    if active_target_spec is not None:
+        core["active_target_spec"] = active_target_spec
     core["comparison_fingerprint"] = canonical_json_fingerprint(core)
     return core
 

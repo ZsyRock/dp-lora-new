@@ -297,7 +297,12 @@ def write_baseline(parent: Path) -> Path:
     return baseline
 
 
-def calibration_contract(calibration: dict, calibration_path: Path) -> dict:
+def calibration_contract(
+    calibration: dict,
+    calibration_path: Path,
+    *,
+    explicit_targets: dict[str, dict[str, float]] | None = None,
+) -> dict:
     targets = {
         model: {
             group: calibration["models"][model]["groups"][group][
@@ -307,7 +312,7 @@ def calibration_contract(calibration: dict, calibration_path: Path) -> dict:
         }
         for model in MODELS
     }
-    return {
+    result = {
         "variant": "SlaClip-Q_fixed_target",
         "federated_adaptation": (
             "per_client_joint_gradient_slack_release_then_equal_fedavg_"
@@ -338,6 +343,18 @@ def calibration_contract(calibration: dict, calibration_path: Path) -> dict:
         },
         "independently_privacy_certified": False,
     }
+    if explicit_targets is not None:
+        result["target_spec"] = {
+            "schema_version": 1,
+            "mode": "explicit_precommitted",
+            "label": (
+                "prior_non_dp_diagnostic_derived_precommitted_hyperparameter"
+            ),
+            "privacy_class": "NON_DP_DIAGNOSTIC_DERIVED_HYPERPARAMETER",
+            "precommitted_before_adaptive_training": True,
+            "targets": copy.deepcopy(explicit_targets),
+        }
+    return result
 
 
 def controller_round(targets: dict[str, float]) -> dict:
@@ -378,11 +395,20 @@ def controller_round(targets: dict[str, float]) -> dict:
 
 
 def write_adaptive(
-    parent: Path, baseline: Path, calibration_path: Path, calibration: dict
+    parent: Path,
+    baseline: Path,
+    calibration_path: Path,
+    calibration: dict,
+    *,
+    explicit_targets: dict[str, dict[str, float]] | None = None,
 ) -> Path:
     del baseline  # Source binding is carried by the immutable calibration contract.
     adaptive = private_directory(parent / "adaptive")
-    slaclip = calibration_contract(calibration, calibration_path)
+    slaclip = calibration_contract(
+        calibration,
+        calibration_path,
+        explicit_targets=explicit_targets,
+    )
     contract = scientific_contract(ADAPTIVE_METHOD, slaclip)
     config = run_config(ADAPTIVE_METHOD, contract, adaptive=True)
     private_json(adaptive / "run_config.json", config)
@@ -393,7 +419,11 @@ def write_adaptive(
         model_dir = private_directory(adaptive / model)
         diagnostics = private_directory(model_dir / "private_diagnostics")
         rounds_dir = private_directory(diagnostics / "rounds")
-        targets = slaclip["calibration"]["targets"][model]
+        targets = (
+            slaclip["target_spec"]["targets"][model]
+            if "target_spec" in slaclip
+            else slaclip["calibration"]["targets"][model]
+        )
         trajectory = []
         for round_index in range(1, ROUNDS + 1):
             controller = controller_round(targets)
@@ -472,13 +502,23 @@ def write_adaptive(
     return adaptive
 
 
-def build_fixture(parent: Path) -> tuple[Path, Path, Path]:
+def build_fixture(
+    parent: Path,
+    *,
+    explicit_targets: dict[str, dict[str, float]] | None = None,
+) -> tuple[Path, Path, Path]:
     baseline = write_baseline(parent)
     calibration_dir = private_directory(parent / "calibration")
     calibration_path = calibration_dir / "median.json"
     calibration = build_calibration(baseline)
     atomic_create_calibration(calibration_path, calibration)
-    adaptive = write_adaptive(parent, baseline, calibration_path, calibration)
+    adaptive = write_adaptive(
+        parent,
+        baseline,
+        calibration_path,
+        calibration,
+        explicit_targets=explicit_targets,
+    )
     return baseline, adaptive, calibration_path
 
 
@@ -519,6 +559,39 @@ class CompareSlaClipTests(unittest.TestCase):
                     "initial_clip_threshold"
                 ],
                 10.0,
+            )
+            self.assertNotIn("active_target_spec", result)
+
+    def test_explicit_precommitted_targets_are_separate_from_calibration(self) -> None:
+        explicit_targets = {
+            "bert": {"A": 0.066, "B": 0.146},
+            "gpt2": {"A": 0.01, "B": 0.01},
+        }
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            baseline, adaptive, calibration = build_fixture(
+                root, explicit_targets=explicit_targets
+            )
+            result = build_comparison(baseline, adaptive, calibration)
+            self.assertEqual(
+                result["active_target_spec"]["mode"], "explicit_precommitted"
+            )
+            self.assertEqual(
+                result["active_target_spec"]["label"],
+                "prior_non_dp_diagnostic_derived_precommitted_hyperparameter",
+            )
+            self.assertEqual(
+                result["active_target_spec"]["targets"], explicit_targets
+            )
+            self.assertEqual(
+                result["models"]["bert"]["target_clip_fraction_by_group"],
+                explicit_targets["bert"],
+            )
+            self.assertNotEqual(
+                result["calibration_evidence"][
+                    "target_clip_fraction_by_model_and_group"
+                ],
+                explicit_targets,
             )
 
     def test_cli_create_and_verify_existing(self) -> None:

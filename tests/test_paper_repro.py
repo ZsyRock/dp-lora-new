@@ -23,6 +23,7 @@ from paper_repro.train_federated import (
     empty_mechanism_components,
     empty_state_like,
     parameter_groups,
+    parse_slaclip_target_overrides,
     partition_indices,
     load_data_protocol,
     round_update_statistics,
@@ -36,6 +37,7 @@ from paper_repro.train_federated import (
     read_round_shards,
     save_final_adapter_atomically,
     slaclip_round_controller_summary,
+    slaclip_contract_targets,
     validate_completed_root_summary,
 )
 from paper_repro.reproducibility import METHOD_SPECS, canonical_json_fingerprint
@@ -185,6 +187,69 @@ def minimal_valid_input_manifest(root: Path) -> dict:
 
 
 class PaperReproTests(unittest.TestCase):
+    def test_explicit_slaclip_targets_require_one_complete_four_group_map(self) -> None:
+        values = [
+            "gpt2:B=0.01",
+            "bert:A=0.066",
+            "gpt2:A=1e-2",
+            "bert:B=0.146",
+        ]
+        self.assertEqual(
+            parse_slaclip_target_overrides(
+                values, method="slaclip_q_dp_lora"
+            ),
+            {
+                "bert": {"A": 0.066, "B": 0.146},
+                "gpt2": {"A": 0.01, "B": 0.01},
+            },
+        )
+        self.assertIsNone(
+            parse_slaclip_target_overrides([], method="paper_dp_lora")
+        )
+
+    def test_explicit_slaclip_target_errors_fail_closed(self) -> None:
+        complete = [
+            "bert:A=0.066",
+            "bert:B=0.146",
+            "gpt2:A=0.01",
+            "gpt2:B=0.01",
+        ]
+        invalid_cases = (
+            (complete[:-1], "all four"),
+            ([*complete, "bert:A=0.2"], "duplicate"),
+            ([*complete[:-1], "GPT2:B=0.01"], "key must be"),
+            ([*complete[:-1], "gpt2:B=nan"], "finite"),
+            ([*complete[:-1], "gpt2:B=1.01"], "in \[0, 1\]"),
+            ([*complete[:-1], "gpt2:B"], "MODEL:GROUP=FRACTION"),
+        )
+        for values, expected in invalid_cases:
+            with self.subTest(values=values):
+                with self.assertRaisesRegex(ValueError, expected):
+                    parse_slaclip_target_overrides(
+                        values, method="slaclip_q_dp_lora"
+                    )
+        with self.assertRaisesRegex(ValueError, "only valid"):
+            parse_slaclip_target_overrides(
+                complete, method="paper_dp_lora"
+            )
+
+    def test_slaclip_contract_targets_support_current_and_historical_schema(self) -> None:
+        medians = {
+            "bert": {"A": 0.0, "B": 0.2},
+            "gpt2": {"A": 0.0, "B": 0.0},
+        }
+        explicit = {
+            "bert": {"A": 0.066, "B": 0.146},
+            "gpt2": {"A": 0.01, "B": 0.01},
+        }
+        legacy = {"calibration": {"targets": medians}}
+        current = {
+            "calibration": {"targets": medians},
+            "target_spec": {"targets": explicit},
+        }
+        self.assertEqual(slaclip_contract_targets(legacy), medians)
+        self.assertEqual(slaclip_contract_targets(current), explicit)
+
     def test_completed_root_summary_validation_rejects_derived_mismatch(self) -> None:
         config = paper_config()
         results = {

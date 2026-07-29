@@ -108,6 +108,98 @@ EXPECTED_LORA_TARGETS = {
 SLACLIP_METHOD = "slaclip_q_dp_lora"
 SLACLIP_REFERENCE_REPOSITORY = "https://github.com/ZsyRock/SlaClip"
 SLACLIP_REFERENCE_REVISION = "d48b8e07aef33c58a3595ee18b4dccf9c75fa1f3"
+SLACLIP_TARGET_SPEC_SCHEMA_VERSION = 1
+SLACLIP_TARGET_MODE_EXPLICIT = "explicit_precommitted"
+SLACLIP_TARGET_LABEL_EXPLICIT = (
+    "prior_non_dp_diagnostic_derived_precommitted_hyperparameter"
+)
+SLACLIP_TARGET_PRIVACY_CLASS = "NON_DP_DIAGNOSTIC_DERIVED_HYPERPARAMETER"
+SLACLIP_TARGET_KEYS = tuple(
+    (model, group) for model in ("bert", "gpt2") for group in ("A", "B")
+)
+
+
+def parse_slaclip_target_overrides(
+    values: Sequence[str], *, method: str
+) -> dict[str, dict[str, float]] | None:
+    """Parse a complete, explicit four-group SlaClip-Q target map.
+
+    The repeated CLI spelling is ``MODEL:GROUP=FRACTION``.  A partial map is
+    deliberately rejected: silently mixing explicit targets with calibration
+    medians would make the scientific contract ambiguous.
+    """
+
+    if not values:
+        return None
+    if method != SLACLIP_METHOD:
+        raise ValueError(
+            "--slaclip-target is only valid for slaclip_q_dp_lora"
+        )
+
+    expected = set(SLACLIP_TARGET_KEYS)
+    parsed: dict[tuple[str, str], float] = {}
+    for raw_value in values:
+        if not isinstance(raw_value, str) or raw_value.count("=") != 1:
+            raise ValueError(
+                "--slaclip-target must use MODEL:GROUP=FRACTION"
+            )
+        raw_key, raw_fraction = raw_value.split("=", 1)
+        if raw_key.count(":") != 1 or not raw_fraction:
+            raise ValueError(
+                "--slaclip-target must use MODEL:GROUP=FRACTION"
+            )
+        model, group = raw_key.split(":", 1)
+        key = (model, group)
+        if key not in expected:
+            raise ValueError(
+                "--slaclip-target key must be one of "
+                "bert:A, bert:B, gpt2:A, gpt2:B"
+            )
+        if key in parsed:
+            raise ValueError(
+                f"duplicate --slaclip-target for {model}:{group}"
+            )
+        try:
+            fraction = float(raw_fraction)
+        except ValueError as error:
+            raise ValueError(
+                f"--slaclip-target for {model}:{group} must be a number in [0, 1]"
+            ) from error
+        if not math.isfinite(fraction) or not 0.0 <= fraction <= 1.0:
+            raise ValueError(
+                f"--slaclip-target for {model}:{group} must be finite and in [0, 1]"
+            )
+        parsed[key] = fraction
+
+    missing = [f"{model}:{group}" for model, group in SLACLIP_TARGET_KEYS if (model, group) not in parsed]
+    if missing:
+        raise ValueError(
+            "explicit --slaclip-target requires all four model/group values; "
+            f"missing: {', '.join(missing)}"
+        )
+    return {
+        model: {group: parsed[(model, group)] for group in ("A", "B")}
+        for model in ("bert", "gpt2")
+    }
+
+
+def slaclip_contract_targets(
+    contract: dict[str, Any],
+) -> dict[str, dict[str, float]]:
+    """Return active controller targets from current or legacy contracts."""
+
+    target_spec = contract.get("target_spec")
+    if target_spec is None:
+        # Historical schema: calibration medians were also the active targets.
+        raw_targets = contract["calibration"]["targets"]
+    else:
+        raw_targets = target_spec["targets"]
+    return {
+        model: {
+            group: float(raw_targets[model][group]) for group in ("A", "B")
+        }
+        for model in raw_targets
+    }
 
 
 @dataclass(frozen=True)
@@ -2114,8 +2206,9 @@ def read_round_shards(
             "A": float(controller["initial_clip_threshold"]),
             "B": float(controller["initial_clip_threshold"]),
         }
+        active_targets = slaclip_contract_targets(slaclip_contract)
         target_clip_fractions = {
-            group: float(slaclip_contract["calibration"]["targets"][expected_model][group])
+            group: active_targets[expected_model][group]
             for group in ("A", "B")
         }
     shards: list[dict[str, Any]] = []
@@ -2558,13 +2651,14 @@ def validate_checkpoint_trainer_state(
     if config.method == SLACLIP_METHOD:
         if slaclip_contract is None or not isinstance(controller_state, dict):
             raise RuntimeError("checkpoint SlaClip-Q controller state is missing")
+        active_targets = slaclip_contract_targets(slaclip_contract)
         expected_controller_identity = {
             "calibration_fingerprint": slaclip_contract["calibration"][
                 "calibration_fingerprint"
             ],
             "updates_completed": completed_round,
             "target_clip_fraction_by_group": {
-                group: slaclip_contract["calibration"]["targets"][model_kind][group]
+                group: active_targets[model_kind][group]
                 for group in ("A", "B")
             },
         }
@@ -2620,7 +2714,7 @@ def train_one_model(
     controller = slaclip_contract["controller"] if slaclip_contract else None
     target_clip_fractions = (
         {
-            group: float(slaclip_contract["calibration"]["targets"][model_kind][group])
+            group: slaclip_contract_targets(slaclip_contract)[model_kind][group]
             for group in ("A", "B")
         }
         if slaclip_contract
@@ -3634,6 +3728,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--delta", type=float, default=1e-5)
     parser.add_argument("--slaclip-calibration", type=Path)
+    parser.add_argument(
+        "--slaclip-target",
+        action="append",
+        default=[],
+        metavar="MODEL:GROUP=FRACTION",
+        help=(
+            "explicit fixed SlaClip-Q target; repeat exactly once for each of "
+            "bert:A, bert:B, gpt2:A, and gpt2:B"
+        ),
+    )
     parser.add_argument("--slaclip-eta", type=float, default=0.2)
     parser.add_argument("--slaclip-num-slots", type=int, default=0)
     parser.add_argument("--slaclip-c-min", type=float, default=0.1)
@@ -3712,6 +3816,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit(f"refusing to overwrite existing output: {output_dir}")
     config = make_effective_config(args)
     validate_config(config)
+    try:
+        explicit_slaclip_targets = parse_slaclip_target_overrides(
+            args.slaclip_target,
+            method=config.method,
+        )
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     if config.method in {"paper_dp_lora", SLACLIP_METHOD} and config.noise_multiplier <= 0:
         raise SystemExit(f"{config.method} requires --noise-multiplier > 0")
     if config.method == SLACLIP_METHOD and args.slaclip_calibration is None:
@@ -3766,6 +3877,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             if args.slaclip_num_slots > 0
             else automatic_num_slots(config.num_clients, config.noise_multiplier)
         )
+        automatic_release_num_slots = automatic_num_slots(
+            config.num_clients, config.noise_multiplier
+        )
         if (
             not math.isfinite(args.slaclip_eta)
             or args.slaclip_eta < 0
@@ -3776,6 +3890,20 @@ def main(argv: Sequence[str] | None = None) -> None:
             or not args.slaclip_c_min <= config.clip_norm <= args.slaclip_c_max
         ):
             raise SystemExit("invalid SlaClip-Q eta or threshold bounds")
+        calibration_targets = {
+            model_kind: {
+                group: calibration["models"][model_kind]["groups"][group][
+                    "target_clip_fraction"
+                ]
+                for group in ("A", "B")
+            }
+            for model_kind in args.models
+        }
+        active_targets = (
+            explicit_slaclip_targets
+            if explicit_slaclip_targets is not None
+            else calibration_targets
+        )
         slaclip_contract = {
             "variant": "SlaClip-Q_fixed_target",
             "federated_adaptation": (
@@ -3795,7 +3923,22 @@ def main(argv: Sequence[str] | None = None) -> None:
                     if args.slaclip_num_slots == 0
                     else "explicit"
                 ),
+                "local_batch_size": config.batch_size,
+                "num_clients": config.num_clients,
                 "expected_release_records": config.num_clients,
+                "automatic_release_num_slots": automatic_release_num_slots,
+                "explicit_num_slots_exceeds_automatic_release_bound": bool(
+                    args.slaclip_num_slots > 0
+                    and num_slots > automatic_release_num_slots
+                ),
+                "normalized_proxy_noise_std_per_slot_theoretical": float(
+                    config.noise_multiplier
+                    * math.sqrt(num_slots / config.num_clients)
+                ),
+                "normalized_proxy_noise_std_formula": (
+                    "noise_multiplier*sqrt(num_slots/num_clients)"
+                ),
+                "controlled_slot_index": 0,
                 "c_min": float(args.slaclip_c_min),
                 "c_max": float(args.slaclip_c_max),
                 "initial_clip_threshold": config.clip_norm,
@@ -3807,16 +3950,22 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "file_sha256": sha256_file(args.slaclip_calibration),
                 "source": calibration["source"],
                 "reducer": calibration["reducer"],
-                "targets": {
-                    model_kind: {
-                        group: calibration["models"][model_kind]["groups"][group][
-                            "target_clip_fraction"
-                        ]
-                        for group in ("A", "B")
-                    }
-                    for model_kind in args.models
-                },
+                "targets": calibration_targets,
             },
+            **(
+                {
+                    "target_spec": {
+                        "schema_version": SLACLIP_TARGET_SPEC_SCHEMA_VERSION,
+                        "mode": SLACLIP_TARGET_MODE_EXPLICIT,
+                        "label": SLACLIP_TARGET_LABEL_EXPLICIT,
+                        "privacy_class": SLACLIP_TARGET_PRIVACY_CLASS,
+                        "precommitted_before_adaptive_training": True,
+                        "targets": active_targets,
+                    }
+                }
+                if explicit_slaclip_targets is not None
+                else {}
+            ),
             "independently_privacy_certified": False,
         }
 
@@ -3846,11 +3995,23 @@ def main(argv: Sequence[str] | None = None) -> None:
         "No independent epsilon is reported because the paper does not provide the constants/calibration needed to map sigma=2 to its epsilon sweep.",
     ]
     if slaclip_contract is not None:
+        if explicit_slaclip_targets is None:
+            target_assumption = (
+                "The active fixed targets are the current matched baseline's "
+                "per-model/per-group median clipping diagnostics."
+            )
+        else:
+            target_assumption = (
+                "The active fixed targets are prior non-DP diagnostic-derived "
+                "hyperparameters precommitted before adaptive training; the current "
+                "baseline calibration is retained separately as evidence."
+            )
         assumptions.extend(
             [
-                "The requested fixed baseline-median clipping target is the SlaClip-Q ablation, not full SlaClip with a dynamic target.",
+                "The fixed-target controller is the SlaClip-Q ablation, not full SlaClip with a dynamic target.",
+                target_assumption,
                 "SlaClip-Q is adapted to the paper-literal federated mechanism by releasing one joint gradient/slack vector per client and LoRA group, then updating each A/B threshold once after FedAvg.",
-                "The exact baseline-derived target is a data-dependent non-DP calibration artifact, so this exploratory comparison is not end-to-end DP certified.",
+                "The calibration evidence and diagnostic-derived target selection are non-DP, so this exploratory comparison is not end-to-end DP certified.",
             ]
         )
     dependency_versions = package_versions()
