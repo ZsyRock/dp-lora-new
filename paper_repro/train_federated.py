@@ -53,12 +53,12 @@ try:
         safe_ratio,
         safe_quantiles,
     )
-    from paper_repro.calibrate_slaclip import load_and_validate_calibration
     from paper_repro.slaclip import (
+        MAX_ABS_LOG_STEP,
         automatic_num_slots,
         build_slack_vector,
+        full_slaclip_update,
         normalize_noisy_slack,
-        slaclip_q_update,
     )
 except ModuleNotFoundError:  # Support direct ``python paper_repro/...py`` use.
     from checkpointing import (  # type: ignore[no-redef]
@@ -77,12 +77,12 @@ except ModuleNotFoundError:  # Support direct ``python paper_repro/...py`` use.
         safe_ratio,
         safe_quantiles,
     )
-    from calibrate_slaclip import load_and_validate_calibration  # type: ignore[no-redef]
     from slaclip import (  # type: ignore[no-redef]
+        MAX_ABS_LOG_STEP,
         automatic_num_slots,
         build_slack_vector,
+        full_slaclip_update,
         normalize_noisy_slack,
-        slaclip_q_update,
     )
 
 
@@ -105,101 +105,9 @@ EXPECTED_LORA_TARGETS = {
     "bert": ["query", "key", "value"],
     "gpt2": ["c_attn"],
 }
-SLACLIP_METHOD = "slaclip_q_dp_lora"
+SLACLIP_METHOD = "slaclip_dp_lora"
 SLACLIP_REFERENCE_REPOSITORY = "https://github.com/ZsyRock/SlaClip"
 SLACLIP_REFERENCE_REVISION = "d48b8e07aef33c58a3595ee18b4dccf9c75fa1f3"
-SLACLIP_TARGET_SPEC_SCHEMA_VERSION = 1
-SLACLIP_TARGET_MODE_EXPLICIT = "explicit_precommitted"
-SLACLIP_TARGET_LABEL_EXPLICIT = (
-    "prior_non_dp_diagnostic_derived_precommitted_hyperparameter"
-)
-SLACLIP_TARGET_PRIVACY_CLASS = "NON_DP_DIAGNOSTIC_DERIVED_HYPERPARAMETER"
-SLACLIP_TARGET_KEYS = tuple(
-    (model, group) for model in ("bert", "gpt2") for group in ("A", "B")
-)
-
-
-def parse_slaclip_target_overrides(
-    values: Sequence[str], *, method: str
-) -> dict[str, dict[str, float]] | None:
-    """Parse a complete, explicit four-group SlaClip-Q target map.
-
-    The repeated CLI spelling is ``MODEL:GROUP=FRACTION``.  A partial map is
-    deliberately rejected: silently mixing explicit targets with calibration
-    medians would make the scientific contract ambiguous.
-    """
-
-    if not values:
-        return None
-    if method != SLACLIP_METHOD:
-        raise ValueError(
-            "--slaclip-target is only valid for slaclip_q_dp_lora"
-        )
-
-    expected = set(SLACLIP_TARGET_KEYS)
-    parsed: dict[tuple[str, str], float] = {}
-    for raw_value in values:
-        if not isinstance(raw_value, str) or raw_value.count("=") != 1:
-            raise ValueError(
-                "--slaclip-target must use MODEL:GROUP=FRACTION"
-            )
-        raw_key, raw_fraction = raw_value.split("=", 1)
-        if raw_key.count(":") != 1 or not raw_fraction:
-            raise ValueError(
-                "--slaclip-target must use MODEL:GROUP=FRACTION"
-            )
-        model, group = raw_key.split(":", 1)
-        key = (model, group)
-        if key not in expected:
-            raise ValueError(
-                "--slaclip-target key must be one of "
-                "bert:A, bert:B, gpt2:A, gpt2:B"
-            )
-        if key in parsed:
-            raise ValueError(
-                f"duplicate --slaclip-target for {model}:{group}"
-            )
-        try:
-            fraction = float(raw_fraction)
-        except ValueError as error:
-            raise ValueError(
-                f"--slaclip-target for {model}:{group} must be a number in [0, 1]"
-            ) from error
-        if not math.isfinite(fraction) or not 0.0 <= fraction <= 1.0:
-            raise ValueError(
-                f"--slaclip-target for {model}:{group} must be finite and in [0, 1]"
-            )
-        parsed[key] = fraction
-
-    missing = [f"{model}:{group}" for model, group in SLACLIP_TARGET_KEYS if (model, group) not in parsed]
-    if missing:
-        raise ValueError(
-            "explicit --slaclip-target requires all four model/group values; "
-            f"missing: {', '.join(missing)}"
-        )
-    return {
-        model: {group: parsed[(model, group)] for group in ("A", "B")}
-        for model in ("bert", "gpt2")
-    }
-
-
-def slaclip_contract_targets(
-    contract: dict[str, Any],
-) -> dict[str, dict[str, float]]:
-    """Return active controller targets from current or legacy contracts."""
-
-    target_spec = contract.get("target_spec")
-    if target_spec is None:
-        # Historical schema: calibration medians were also the active targets.
-        raw_targets = contract["calibration"]["targets"]
-    else:
-        raw_targets = target_spec["targets"]
-    return {
-        model: {
-            group: float(raw_targets[model][group]) for group in ("A", "B")
-        }
-        for model in raw_targets
-    }
 
 
 @dataclass(frozen=True)
@@ -1344,7 +1252,7 @@ def clip_noise_and_step(
         if slack_noise_generators is None or set(slack_noise_generators) != {"A", "B"}:
             raise ValueError("adaptive clipping requires A/B slack noise generators")
         if not apply_clipping or noise_multiplier <= 0:
-            raise ValueError("SlaClip-Q requires clipping and positive Gaussian noise")
+            raise ValueError("SlaClip requires clipping and positive Gaussian noise")
 
     statistics: dict[str, dict[str, Any]] = {}
     for group_name in ("A", "B"):
@@ -1527,7 +1435,7 @@ def clip_noise_and_step(
                     f"ratio={bound_ratio}"
                 )
             statistics[group_name]["slaclip"] = {
-                "variant": "SlaClip-Q",
+                "variant": "full_slaclip_cdf_endpoints",
                 "num_slots": slaclip_num_slots,
                 "slack_lambda": group_clip_norm / math.sqrt(slaclip_num_slots),
                 "slack_signal": [float(value) for value in slack_tensor.cpu().tolist()],
@@ -2063,22 +1971,29 @@ def slaclip_round_controller_summary(
     records: Sequence[dict[str, Any]],
     *,
     clip_thresholds: dict[str, float],
-    target_clip_fractions: dict[str, float],
     num_slots: int,
     eta: float,
+    beta: float,
     c_min: float,
     c_max: float,
+    epsilon: float = 1e-6,
 ) -> dict[str, Any]:
-    """Reconcile one federated SlaClip-Q update from its joint releases."""
+    """Reconcile one full-SlaClip update from its joint noisy releases."""
 
     if not records:
-        raise ValueError("cannot update SlaClip-Q without client releases")
+        raise ValueError("cannot update SlaClip without client releases")
+    if num_slots < 2:
+        raise ValueError("full SlaClip requires at least two CDF slots")
     result: dict[str, Any] = {
-        "variant": "SlaClip-Q",
+        "variant": "full_slaclip_cdf_endpoints",
         "update_timing": "once_after_all_clients_for_use_in_next_round",
         "clients": len(records),
         "num_slots": num_slots,
         "eta": eta,
+        "beta": beta,
+        "epsilon": epsilon,
+        "near_threshold_index": 0,
+        "near_zero_index": num_slots - 1,
         "c_min": c_min,
         "c_max": c_max,
     }
@@ -2090,7 +2005,7 @@ def slaclip_round_controller_summary(
             group_statistics = record["gradient_groups"][group]
             if group_statistics.get("clip_threshold") != threshold:
                 raise RuntimeError(
-                    f"SlaClip-Q {group} threshold changed within a federated round"
+                    f"SlaClip {group} threshold changed within a federated round"
                 )
             telemetry = group_statistics.get("slaclip")
             if (
@@ -2098,7 +2013,7 @@ def slaclip_round_controller_summary(
                 or telemetry.get("num_slots") != num_slots
                 or telemetry.get("joint_sensitivity_bound_passed") is not True
             ):
-                raise RuntimeError(f"invalid SlaClip-Q {group} client release")
+                raise RuntimeError(f"invalid SlaClip {group} client release")
             noisy_slack = telemetry.get("noisy_slack")
             slack_signal = telemetry.get("slack_signal")
             if (
@@ -2107,7 +2022,7 @@ def slaclip_round_controller_summary(
                 or not isinstance(slack_signal, list)
                 or len(slack_signal) != num_slots
             ):
-                raise RuntimeError(f"invalid SlaClip-Q {group} slack vector")
+                raise RuntimeError(f"invalid SlaClip {group} slack vector")
             releases.append([float(value) for value in noisy_slack])
             signals.append([float(value) for value in slack_signal])
         noisy_sum = [
@@ -2141,14 +2056,15 @@ def slaclip_round_controller_summary(
             * math.sqrt(len(records))
             / (slack_lambda * len(records))
         )
-        target = float(target_clip_fractions[group])
-        update = slaclip_q_update(
+        update = full_slaclip_update(
             threshold,
-            target,
             float(noisy_indicator[0]),
-            eta,
-            c_min,
-            c_max,
+            float(noisy_indicator[-1]),
+            beta=beta,
+            eta=eta,
+            min_clip_norm=c_min,
+            max_clip_norm=c_max,
+            epsilon=epsilon,
         )
         update_fields = asdict(update) if hasattr(update, "__dataclass_fields__") else dict(update)
         update_fields["unbounded_next_clip_threshold"] = update_fields.pop(
@@ -2164,19 +2080,32 @@ def slaclip_round_controller_summary(
         )
         result[group] = {
             "clip_threshold_used": threshold,
-            "target_clip_fraction": target,
-            "target_unclipped_proxy": 1.0 - target,
-            "noisy_unclipped_proxy_by_slot": [
+            "noisy_cdf_proxy_by_slot": [
                 float(value) for value in noisy_indicator
             ],
-            "exact_unclipped_proxy_by_slot": [
+            "exact_cdf_proxy_by_slot": [
                 float(value) for value in exact_indicator
             ],
             "normalized_proxy_noise_std_per_slot": normalized_proxy_noise_std,
-            "controller_error": (1.0 - target) - float(noisy_indicator[0]),
+            "noisy_near_threshold_minus_exact": float(
+                noisy_indicator[0] - exact_indicator[0]
+            ),
+            "noisy_near_zero_minus_exact": float(
+                noisy_indicator[-1] - exact_indicator[-1]
+            ),
+            "noisy_adjacent_monotonicity_violations": sum(
+                noisy_indicator[index + 1] > noisy_indicator[index]
+                for index in range(num_slots - 1)
+            ),
+            "exact_adjacent_monotonicity_violations": sum(
+                exact_indicator[index + 1] > exact_indicator[index]
+                for index in range(num_slots - 1)
+            ),
             "actual_clip_fraction": actual_fraction,
-            "actual_minus_target_clip_fraction": (
-                None if actual_fraction is None else actual_fraction - target
+            "actual_minus_dynamic_target_clipped": (
+                None
+                if actual_fraction is None
+                else actual_fraction - float(update_fields["dynamic_target_clipped"])
             ),
             **update_fields,
         }
@@ -2196,20 +2125,14 @@ def read_round_shards(
     validate_private_directory(rounds_directory, "round diagnostics directory")
     adaptive = expected_method == SLACLIP_METHOD
     if adaptive != (slaclip_contract is not None):
-        raise RuntimeError("SlaClip-Q round validation contract mismatch")
+        raise RuntimeError("SlaClip round validation contract mismatch")
     current_thresholds: dict[str, float] | None = None
     controller: dict[str, Any] | None = None
-    target_clip_fractions: dict[str, float] | None = None
     if slaclip_contract is not None:
         controller = slaclip_contract["controller"]
         current_thresholds = {
             "A": float(controller["initial_clip_threshold"]),
             "B": float(controller["initial_clip_threshold"]),
-        }
-        active_targets = slaclip_contract_targets(slaclip_contract)
-        target_clip_fractions = {
-            group: active_targets[expected_model][group]
-            for group in ("A", "B")
         }
     shards: list[dict[str, Any]] = []
     expected_paths = {
@@ -2283,19 +2206,19 @@ def read_round_shards(
         if adaptive:
             assert controller is not None
             assert current_thresholds is not None
-            assert target_clip_fractions is not None
             recomputed_controller = slaclip_round_controller_summary(
                 client_records,
                 clip_thresholds=current_thresholds,
-                target_clip_fractions=target_clip_fractions,
                 num_slots=int(controller["num_slots"]),
                 eta=float(controller["eta"]),
+                beta=float(controller["beta"]),
                 c_min=float(controller["c_min"]),
                 c_max=float(controller["c_max"]),
+                epsilon=float(controller["epsilon"]),
             )
             if round_summary.get("slaclip_controller") != recomputed_controller:
                 raise RuntimeError(
-                    f"SlaClip-Q controller summary does not reconcile: {path}"
+                    f"SlaClip controller summary does not reconcile: {path}"
                 )
             current_thresholds = {
                 group: float(recomputed_controller[group]["next_clip_threshold"])
@@ -2464,9 +2387,9 @@ def behavior_summary(shards: Sequence[dict[str, Any]]) -> dict[str, Any]:
     ]
     if any(value is not None for value in controller_rounds):
         if not all(isinstance(value, dict) for value in controller_rounds):
-            raise RuntimeError("SlaClip-Q controller telemetry is incomplete")
+            raise RuntimeError("SlaClip controller telemetry is incomplete")
         result["slaclip_controller"] = {
-            "variant": "SlaClip-Q",
+            "variant": "full_slaclip_cdf_endpoints",
             "rounds": len(controller_rounds),
             "trajectory_sha256": canonical_json_fingerprint(controller_rounds),
             "groups": {
@@ -2479,27 +2402,80 @@ def behavior_summary(shards: Sequence[dict[str, Any]]) -> dict[str, Any]:
                         value[group]["next_clip_threshold"]
                         for value in controller_rounds
                     ),
-                    "noisy_unclipped_proxy": safe_quantiles(
-                        value[group]["noisy_unclipped_proxy_by_slot"][0]
+                    "near_threshold_proxy": safe_quantiles(
+                        value[group]["near_threshold_proxy"]
                         for value in controller_rounds
                     ),
-                    "actual_minus_target_clip_fraction": safe_quantiles(
-                        value[group]["actual_minus_target_clip_fraction"]
+                    "near_zero_proxy": safe_quantiles(
+                        value[group]["near_zero_proxy"]
+                        for value in controller_rounds
+                    ),
+                    "near_zero_adjusted": safe_quantiles(
+                        value[group]["near_zero_adjusted"]
+                        for value in controller_rounds
+                    ),
+                    "dynamic_target_unclipped": safe_quantiles(
+                        value[group]["dynamic_target_unclipped"]
+                        for value in controller_rounds
+                    ),
+                    "dynamic_target_clipped": safe_quantiles(
+                        value[group]["dynamic_target_clipped"]
+                        for value in controller_rounds
+                    ),
+                    "controller_error": safe_quantiles(
+                        value[group]["controller_error"]
+                        for value in controller_rounds
+                    ),
+                    "actual_clip_fraction": safe_quantiles(
+                        value[group]["actual_clip_fraction"]
+                        for value in controller_rounds
+                    ),
+                    "actual_minus_dynamic_target_clipped": safe_quantiles(
+                        value[group]["actual_minus_dynamic_target_clipped"]
+                        for value in controller_rounds
+                    ),
+                    "near_threshold_proxy_error": safe_quantiles(
+                        value[group]["noisy_near_threshold_minus_exact"]
+                        for value in controller_rounds
+                    ),
+                    "near_zero_proxy_error": safe_quantiles(
+                        value[group]["noisy_near_zero_minus_exact"]
+                        for value in controller_rounds
+                    ),
+                    "raw_log_step": safe_quantiles(
+                        value[group]["raw_log_step"]
+                        for value in controller_rounds
+                    ),
+                    "gamma_clamped_low_count": sum(
+                        bool(value[group]["gamma_clamped_low"])
+                        for value in controller_rounds
+                    ),
+                    "gamma_clamped_high_count": sum(
+                        bool(value[group]["gamma_clamped_high"])
+                        for value in controller_rounds
+                    ),
+                    "log_step_bounded_count": sum(
+                        bool(value[group]["log_step_was_bounded"])
                         for value in controller_rounds
                     ),
                     "lower_bound_hits": sum(
-                        bool(value[group]["hit_lower_bound"])
+                        bool(value[group]["hit_min_clip_norm"])
                         for value in controller_rounds
                     ),
                     "upper_bound_hits": sum(
-                        bool(value[group]["hit_upper_bound"])
+                        bool(value[group]["hit_max_clip_norm"])
+                        for value in controller_rounds
+                    ),
+                    "noisy_adjacent_monotonicity_violations": sum(
+                        int(value[group]["noisy_adjacent_monotonicity_violations"])
+                        for value in controller_rounds
+                    ),
+                    "exact_adjacent_monotonicity_violations": sum(
+                        int(value[group]["exact_adjacent_monotonicity_violations"])
                         for value in controller_rounds
                     ),
                     "final_next_clip_threshold": controller_rounds[-1][group][
                         "next_clip_threshold"
-                    ],
-                    "target_clip_fraction": controller_rounds[0][group][
-                        "target_clip_fraction"
                     ],
                 }
                 for group in ("A", "B")
@@ -2528,8 +2504,9 @@ def illustrative_accounting_diagnostic(
     if contains_slaclip:
         reasons.extend(
             [
-                "This is a federated per-client adaptation of SlaClip-Q, not the paper's audited per-sample DP-SGD implementation.",
-                "The fixed target is selected from exact baseline clipping diagnostics without a separate private calibration mechanism.",
+                "This is a federated per-client adaptation of full SlaClip, not the paper's audited per-sample DP-SGD implementation.",
+                "The controller uses noisy CDF endpoints, but exact CDF and clipping telemetry are retained only as non-DP private diagnostics and are not controller inputs.",
+                "K=15 with five client releases at sigma=2 exceeds the paper's automatic monotonicity-rule slot choice and has no independently reviewed composition analysis here.",
             ]
         )
     return {
@@ -2650,25 +2627,20 @@ def validate_checkpoint_trainer_state(
     controller_state = state.get("slaclip_controller_state")
     if config.method == SLACLIP_METHOD:
         if slaclip_contract is None or not isinstance(controller_state, dict):
-            raise RuntimeError("checkpoint SlaClip-Q controller state is missing")
-        active_targets = slaclip_contract_targets(slaclip_contract)
+            raise RuntimeError("checkpoint SlaClip controller state is missing")
         expected_controller_identity = {
-            "calibration_fingerprint": slaclip_contract["calibration"][
-                "calibration_fingerprint"
-            ],
+            "controller_contract_sha256": canonical_json_fingerprint(
+                slaclip_contract
+            ),
             "updates_completed": completed_round,
-            "target_clip_fraction_by_group": {
-                group: active_targets[model_kind][group]
-                for group in ("A", "B")
-            },
         }
         for key, expected in expected_controller_identity.items():
             if controller_state.get(key) != expected:
-                raise RuntimeError(f"checkpoint SlaClip-Q state mismatch: {key}")
+                raise RuntimeError(f"checkpoint SlaClip state mismatch: {key}")
         thresholds = controller_state.get("next_clip_threshold_by_group")
         controller = slaclip_contract["controller"]
         if not isinstance(thresholds, dict) or set(thresholds) != {"A", "B"}:
-            raise RuntimeError("checkpoint SlaClip-Q thresholds are invalid")
+            raise RuntimeError("checkpoint SlaClip thresholds are invalid")
         for group in ("A", "B"):
             value = thresholds[group]
             if (
@@ -2679,17 +2651,17 @@ def validate_checkpoint_trainer_state(
                 <= float(value)
                 <= float(controller["c_max"])
             ):
-                raise RuntimeError("checkpoint SlaClip-Q threshold is out of bounds")
+                raise RuntimeError("checkpoint SlaClip threshold is out of bounds")
             last_controller = last_round.get("slaclip_controller")
             if (
                 not isinstance(last_controller, dict)
                 or last_controller.get(group, {}).get("next_clip_threshold") != value
             ):
                 raise RuntimeError(
-                    "checkpoint SlaClip-Q threshold does not match the last shard"
+                    "checkpoint SlaClip threshold does not match the last shard"
                 )
     elif controller_state is not None:
-        raise RuntimeError("fixed-threshold checkpoint contains SlaClip-Q state")
+        raise RuntimeError("fixed-threshold checkpoint contains SlaClip state")
 
 
 def train_one_model(
@@ -2710,16 +2682,8 @@ def train_one_model(
 ) -> dict[str, Any]:
     adaptive = config.method == SLACLIP_METHOD
     if adaptive != (slaclip_contract is not None):
-        raise RuntimeError("SlaClip-Q model contract mismatch")
+        raise RuntimeError("SlaClip model contract mismatch")
     controller = slaclip_contract["controller"] if slaclip_contract else None
-    target_clip_fractions = (
-        {
-            group: slaclip_contract_targets(slaclip_contract)[model_kind][group]
-            for group in ("A", "B")
-        }
-        if slaclip_contract
-        else None
-    )
     model_seed = config.seed + (0 if model_kind == "bert" else 1_000_000)
     snapshot = model_snapshot(manifest, model_kind)
     target_modules = EXPECTED_LORA_TARGETS[model_kind]
@@ -2939,13 +2903,11 @@ def train_one_model(
             if completed.get("clipping") != expected_clipping:
                 raise RuntimeError("completed clipping summary does not reconcile")
             if adaptive:
-                assert target_clip_fractions is not None
                 controller_behavior = recomputed_behavior.get("slaclip_controller")
                 if not isinstance(controller_behavior, dict):
-                    raise RuntimeError("completed SlaClip-Q controller summary is missing")
+                    raise RuntimeError("completed SlaClip controller summary is missing")
                 expected_slaclip_summary = {
                     "contract": slaclip_contract,
-                    "target_clip_fraction_by_group": dict(target_clip_fractions),
                     "final_next_clip_threshold_by_group": {
                         group: controller_behavior["groups"][group][
                             "final_next_clip_threshold"
@@ -2954,12 +2916,12 @@ def train_one_model(
                     },
                     "controller_summary": controller_behavior,
                 }
-                if completed.get("slaclip_q") != expected_slaclip_summary:
+                if completed.get("slaclip") != expected_slaclip_summary:
                     raise RuntimeError(
-                        "completed SlaClip-Q summary does not reconcile"
+                        "completed SlaClip summary does not reconcile"
                     )
-            elif "slaclip_q" in completed:
-                raise RuntimeError("fixed-threshold summary contains SlaClip-Q data")
+            elif "slaclip" in completed:
+                raise RuntimeError("fixed-threshold summary contains SlaClip data")
             if completed.get("adapter_integrity") != adapter_integrity:
                 raise RuntimeError("completed adapter integrity summary mismatch")
             return completed
@@ -3309,15 +3271,15 @@ def train_one_model(
         }
         if adaptive:
             assert controller is not None
-            assert target_clip_fractions is not None
             controller_summary = slaclip_round_controller_summary(
                 records,
                 clip_thresholds=current_clip_thresholds,
-                target_clip_fractions=target_clip_fractions,
                 num_slots=int(controller["num_slots"]),
                 eta=float(controller["eta"]),
+                beta=float(controller["beta"]),
                 c_min=float(controller["c_min"]),
                 c_max=float(controller["c_max"]),
+                epsilon=float(controller["epsilon"]),
             )
             last_round_summary["slaclip_controller"] = controller_summary
             current_clip_thresholds = {
@@ -3394,13 +3356,10 @@ def train_one_model(
                     **(
                         {
                             "slaclip_controller_state": {
-                                "calibration_fingerprint": slaclip_contract[
-                                    "calibration"
-                                ]["calibration_fingerprint"],
-                                "updates_completed": round_index,
-                                "target_clip_fraction_by_group": dict(
-                                    target_clip_fractions
+                                "controller_contract_sha256": (
+                                    canonical_json_fingerprint(slaclip_contract)
                                 ),
+                                "updates_completed": round_index,
                                 "next_clip_threshold_by_group": dict(
                                     current_clip_thresholds
                                 ),
@@ -3431,13 +3390,24 @@ def train_one_model(
                 },
                 **(
                     {
-                        "slaclip_q": {
+                        "slaclip": {
                             group: {
                                 "clip_threshold_used": last_round_summary[
                                     "slaclip_controller"
                                 ][group]["clip_threshold_used"],
                                 "next_clip_threshold": current_clip_thresholds[group],
-                                "target_clip_fraction": target_clip_fractions[group],
+                                "near_threshold_proxy": last_round_summary[
+                                    "slaclip_controller"
+                                ][group]["near_threshold_proxy"],
+                                "near_zero_proxy": last_round_summary[
+                                    "slaclip_controller"
+                                ][group]["near_zero_proxy"],
+                                "dynamic_target_unclipped": last_round_summary[
+                                    "slaclip_controller"
+                                ][group]["dynamic_target_unclipped"],
+                                "dynamic_target_clipped": last_round_summary[
+                                    "slaclip_controller"
+                                ][group]["dynamic_target_clipped"],
                             }
                             for group in ("A", "B")
                         }
@@ -3576,11 +3546,8 @@ def train_one_model(
         "behavior_summary": behavior,
         **(
             {
-                "slaclip_q": {
+                "slaclip": {
                     "contract": slaclip_contract,
-                    "target_clip_fraction_by_group": dict(
-                        target_clip_fractions
-                    ),
                     "final_next_clip_threshold_by_group": dict(
                         current_clip_thresholds
                     ),
@@ -3691,7 +3658,7 @@ def validate_completed_root_summary(
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Federated DP-LoRA reconstruction with optional SlaClip-Q"
+        description="Federated DP-LoRA reconstruction with optional full SlaClip"
     )
     parser.add_argument("--input-manifest", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path)
@@ -3703,7 +3670,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
     parser.add_argument(
-        "--method", choices=sorted(METHOD_SPECS), default="paper_dp_lora"
+        "--method",
+        choices=sorted(METHOD_SPECS),
+        default="paper_dp_lora",
     )
     parser.add_argument("--bert-model", default=EXPECTED_MODELS["bert"]["repo_id"])
     parser.add_argument("--bert-revision", default=EXPECTED_MODELS["bert"]["revision"])
@@ -3727,19 +3696,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="paper_union_minus_fixed_holdout",
     )
     parser.add_argument("--delta", type=float, default=1e-5)
-    parser.add_argument("--slaclip-calibration", type=Path)
-    parser.add_argument(
-        "--slaclip-target",
-        action="append",
-        default=[],
-        metavar="MODEL:GROUP=FRACTION",
-        help=(
-            "explicit fixed SlaClip-Q target; repeat exactly once for each of "
-            "bert:A, bert:B, gpt2:A, and gpt2:B"
-        ),
-    )
     parser.add_argument("--slaclip-eta", type=float, default=0.2)
-    parser.add_argument("--slaclip-num-slots", type=int, default=0)
+    parser.add_argument("--slaclip-beta", type=float, default=0.5)
+    parser.add_argument("--slaclip-num-slots", type=int, default=15)
     parser.add_argument("--slaclip-c-min", type=float, default=0.1)
     parser.add_argument("--slaclip-c-max", type=float, default=50.0)
     parser.add_argument("--private-rng-key", type=Path)
@@ -3816,19 +3775,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit(f"refusing to overwrite existing output: {output_dir}")
     config = make_effective_config(args)
     validate_config(config)
-    try:
-        explicit_slaclip_targets = parse_slaclip_target_overrides(
-            args.slaclip_target,
-            method=config.method,
-        )
-    except ValueError as error:
-        raise SystemExit(str(error)) from error
     if config.method in {"paper_dp_lora", SLACLIP_METHOD} and config.noise_multiplier <= 0:
         raise SystemExit(f"{config.method} requires --noise-multiplier > 0")
-    if config.method == SLACLIP_METHOD and args.slaclip_calibration is None:
-        raise SystemExit("slaclip_q_dp_lora requires --slaclip-calibration")
-    if config.method != SLACLIP_METHOD and args.slaclip_calibration is not None:
-        raise SystemExit("--slaclip-calibration is only valid for slaclip_q_dp_lora")
     if args.device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("CUDA was requested but torch.cuda.is_available() is false")
     try:
@@ -3847,65 +3795,30 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     slaclip_contract: dict[str, Any] | None = None
     if config.method == SLACLIP_METHOD:
-        assert args.slaclip_calibration is not None
-        if args.models != ["bert", "gpt2"]:
+        if args.slaclip_num_slots < 2:
             raise SystemExit(
-                "slaclip_q_dp_lora calibration requires ordered models: bert gpt2"
+                "--slaclip-num-slots must be at least two for the full "
+                "two-endpoint controller"
             )
-        args.slaclip_calibration = args.slaclip_calibration.expanduser().resolve()
-        calibration = load_and_validate_calibration(
-            args.slaclip_calibration,
-            expected_models=args.models,
-        )
-        if calibration["source"].get("repository_sha") != repo.get("sha"):
-            raise SystemExit(
-                "SlaClip calibration baseline repository SHA differs from this run"
-            )
-        for model_kind in args.models:
-            model_calibration = calibration["models"][model_kind]
-            if (
-                model_calibration["rounds"] != config.rounds
-                or model_calibration["clients_per_round"] != config.num_clients
-            ):
-                raise SystemExit(
-                    f"SlaClip calibration schedule mismatch for {model_kind}"
-                )
-        if args.slaclip_num_slots < 0:
-            raise SystemExit("--slaclip-num-slots must be zero (auto) or positive")
-        num_slots = (
-            args.slaclip_num_slots
-            if args.slaclip_num_slots > 0
-            else automatic_num_slots(config.num_clients, config.noise_multiplier)
-        )
+        num_slots = args.slaclip_num_slots
         automatic_release_num_slots = automatic_num_slots(
             config.num_clients, config.noise_multiplier
         )
         if (
             not math.isfinite(args.slaclip_eta)
             or args.slaclip_eta < 0
+            or not math.isfinite(args.slaclip_beta)
+            or not 0.0 <= args.slaclip_beta <= 1.0
             or not math.isfinite(args.slaclip_c_min)
             or not math.isfinite(args.slaclip_c_max)
             or args.slaclip_c_min <= 0
             or args.slaclip_c_max < args.slaclip_c_min
             or not args.slaclip_c_min <= config.clip_norm <= args.slaclip_c_max
         ):
-            raise SystemExit("invalid SlaClip-Q eta or threshold bounds")
-        calibration_targets = {
-            model_kind: {
-                group: calibration["models"][model_kind]["groups"][group][
-                    "target_clip_fraction"
-                ]
-                for group in ("A", "B")
-            }
-            for model_kind in args.models
-        }
-        active_targets = (
-            explicit_slaclip_targets
-            if explicit_slaclip_targets is not None
-            else calibration_targets
-        )
+            raise SystemExit("invalid full-SlaClip beta, eta, or threshold bounds")
         slaclip_contract = {
-            "variant": "SlaClip-Q_fixed_target",
+            "schema_version": "full_slaclip_contract_v1",
+            "variant": "full_slaclip_cdf_endpoints",
             "federated_adaptation": (
                 "per_client_joint_gradient_slack_release_then_equal_fedavg_"
                 "and_one_controller_update_per_round"
@@ -3917,11 +3830,16 @@ def main(argv: Sequence[str] | None = None) -> None:
             },
             "controller": {
                 "eta": float(args.slaclip_eta),
+                "beta": float(args.slaclip_beta),
+                "epsilon": 1e-6,
                 "num_slots": int(num_slots),
                 "num_slots_selection": (
-                    "automatic_monotonicity_rule"
-                    if args.slaclip_num_slots == 0
+                    "user_journal_small_batch_k15"
+                    if config.batch_size < 128 and num_slots == 15
                     else "explicit"
+                ),
+                "user_small_batch_policy": (
+                    "K=15 when local batch size is below 128"
                 ),
                 "local_batch_size": config.batch_size,
                 "num_clients": config.num_clients,
@@ -3938,33 +3856,31 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "normalized_proxy_noise_std_formula": (
                     "noise_multiplier*sqrt(num_slots/num_clients)"
                 ),
-                "controlled_slot_index": 0,
+                "near_threshold_index": 0,
+                "near_zero_index": int(num_slots - 1),
                 "c_min": float(args.slaclip_c_min),
                 "c_max": float(args.slaclip_c_max),
                 "initial_clip_threshold": config.clip_norm,
-                "target_semantics": "clipped_fraction_complemented_to_unclipped_proxy",
+                "update_formula": (
+                    "q=s_hat[0];r=s_hat[K-1];z=r/(C+1e-6);"
+                    "gamma=clip(1-beta*(1-z),0,1);"
+                    "C_next=clip(C*exp(eta*(gamma-q)),C_min,C_max)"
+                ),
+                "numerical_log_step_bounds": [
+                    -MAX_ABS_LOG_STEP,
+                    MAX_ABS_LOG_STEP,
+                ],
+                "numerical_safeguard": (
+                    "eta*(gamma-q) is bounded before exp only to avoid "
+                    "floating-point overflow; every activation is logged"
+                ),
+                "controller_inputs": "noisy_joint_release_endpoints_only",
             },
-            "calibration": {
-                "privacy_class": calibration["privacy_class"],
-                "calibration_fingerprint": calibration["calibration_fingerprint"],
-                "file_sha256": sha256_file(args.slaclip_calibration),
-                "source": calibration["source"],
-                "reducer": calibration["reducer"],
-                "targets": calibration_targets,
-            },
-            **(
-                {
-                    "target_spec": {
-                        "schema_version": SLACLIP_TARGET_SPEC_SCHEMA_VERSION,
-                        "mode": SLACLIP_TARGET_MODE_EXPLICIT,
-                        "label": SLACLIP_TARGET_LABEL_EXPLICIT,
-                        "privacy_class": SLACLIP_TARGET_PRIVACY_CLASS,
-                        "precommitted_before_adaptive_training": True,
-                        "targets": active_targets,
-                    }
-                }
-                if explicit_slaclip_targets is not None
-                else {}
+            "exact_cdf_and_clipping_diagnostics": PRIVACY_LABEL,
+            "k15_release_noise_warning": (
+                "With five client contributions and sigma=2, K=15 gives "
+                "normalized endpoint noise sd sqrt(12); this exceeds the "
+                "paper central-batch monotonicity-rule choice."
             ),
             "independently_privacy_certified": False,
         }
@@ -3995,23 +3911,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         "No independent epsilon is reported because the paper does not provide the constants/calibration needed to map sigma=2 to its epsilon sweep.",
     ]
     if slaclip_contract is not None:
-        if explicit_slaclip_targets is None:
-            target_assumption = (
-                "The active fixed targets are the current matched baseline's "
-                "per-model/per-group median clipping diagnostics."
-            )
-        else:
-            target_assumption = (
-                "The active fixed targets are prior non-DP diagnostic-derived "
-                "hyperparameters precommitted before adaptive training; the current "
-                "baseline calibration is retained separately as evidence."
-            )
         assumptions.extend(
             [
-                "The fixed-target controller is the SlaClip-Q ablation, not full SlaClip with a dynamic target.",
-                target_assumption,
-                "SlaClip-Q is adapted to the paper-literal federated mechanism by releasing one joint gradient/slack vector per client and LoRA group, then updating each A/B threshold once after FedAvg.",
-                "The calibration evidence and diagnostic-derived target selection are non-DP, so this exploratory comparison is not end-to-end DP certified.",
+                "The full SlaClip controller uses the first and final noisy CDF-proxy slots to derive a dynamic target; no fixed clipping target or baseline calibration is used.",
+                "SlaClip is adapted to the paper-literal federated mechanism by releasing one joint gradient/slack vector per client and LoRA group, then updating each A/B threshold once after FedAvg.",
+                "The controller consumes only noisy endpoints; exact endpoint values and actual clipping fractions are retained solely as explicitly labelled non-DP private diagnostics.",
+                "The requested K=15 small-batch policy exceeds the paper monotonicity-rule K for five releases at sigma=2, so this exploratory federated adaptation is not end-to-end DP certified.",
             ]
         )
     dependency_versions = package_versions()
@@ -4042,7 +3947,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "record_weighting": "equal_records_after_within_record_token_mean",
             "dropout_rng": "stateless_private_hmac_per_model_round_client",
             "contains_slaclip": slaclip_contract is not None,
-            "slaclip_q": slaclip_contract,
+            "slaclip": slaclip_contract,
         },
     }
     run_config_fingerprint = canonical_json_fingerprint(scientific_contract)
@@ -4069,7 +3974,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             "epsilon": None,
             "sigma_is_not_epsilon": True,
             "diagnostics_are_private_non_dp_data": True,
-            "baseline_derived_calibration_is_non_dp": slaclip_contract is not None,
+            "baseline_derived_calibration_is_non_dp": False,
+            "exact_cdf_diagnostics_are_non_dp": slaclip_contract is not None,
         },
         "repository": repo,
         "environment": {

@@ -1,8 +1,7 @@
 # Executable DP-LoRA paper reconstruction
 
-The upstream `main` branch is an incomplete prototype.  The
-`hpc/paper-repro` branch adds a fail-closed, single-GPU simulation of the five
-logical clients in Algorithm 1 of
+The upstream `main` branch is an incomplete prototype.  This reconstruction
+adds a fail-closed simulation of the five logical clients in Algorithm 1 of
 “Differentially Private Low-Rank Adaptation of Large Language Model Using
 Federated Learning” (arXiv:2312.17493).
 
@@ -11,9 +10,9 @@ MedDialog HealthcareMagic+iCliniq data.  It fixes the values explicitly stated
 by the paper: `K=5`, `T=50`, `B=8`, `sigma=2`, `lr=5e-4`, `C=10`, and LoRA
 rank `512`.  It updates both LoRA A and B, clips their aggregate batch-gradient
 groups separately, adds Gaussian noise, and equally averages the five local
-adapter states after every round.  An extension arm, `slaclip_q_dp_lora`, adds
-the fixed-target SlaClip-Q controller without changing that federated update
-unit.
+adapter states after every round.  The active adaptive extension is
+`slaclip_dp_lora`: full SlaClip using the two noisy endpoints of its recovered
+CDF.  It does not use a fixed target or a baseline-derived calibration.
 
 The paper omits model revisions, exact LoRA targets/alpha/dropout, optimizer,
 sequence length, seed, and enough privacy-accounting constants to reproduce its
@@ -23,9 +22,9 @@ bit-for-bit reproduction.  Exact client batch losses and gradient statistics
 are labelled `NON_DP_PRIVATE_DIAGNOSTIC`.
 
 The executable is `paper_repro/train_federated.py`; immutable input staging is
-implemented in `scripts/stage_paper_inputs.py`.  Cluster-specific launch files
-are intentionally kept outside this Git worktree under
-`$HOME/hpc/projects/dp-lora-paper/`.
+implemented in `scripts/stage_paper_inputs.py`.  The checked-in single-job
+Iridis campaign entry points are `hpc/submit_full_slaclip_campaign.sh` and
+`hpc/full_slaclip_campaign.sbatch`.
 
 ## What a completed run proves
 
@@ -40,24 +39,28 @@ The runner exposes four auditable training arms:
 
 - `no_dp_lora_control`: neither clipping nor Gaussian noise; still records
   whether each A/B aggregate gradient *would* exceed `C`;
-- `clip_only_control`: clipping without Gaussian noise; and
-- `paper_dp_lora`: the literal reconstructed clipping-plus-noise mechanism.
-- `slaclip_q_dp_lora`: a federated SlaClip-Q adaptation with independent A/B
-  thresholds.  Its required target file is derived from a completed matched
-  `paper_dp_lora` baseline by taking, for each model and A/B group, the median
-  of its per-round actual clipping fractions.  A complete set of four
-  repeated `--slaclip-target MODEL:GROUP=FRACTION` arguments can instead
-  precommit explicit controller targets while retaining the matched baseline
-  calibration as separate evidence; partial, duplicate, non-finite, and
-  out-of-range target maps fail closed.
+- `clip_only_control`: clipping without Gaussian noise;
+- `paper_dp_lora`: the literal reconstructed clipping-plus-noise mechanism;
+  and
+- `slaclip_dp_lora`: the full two-endpoint SlaClip controller with independent
+  A/B thresholds.
 
-The fixed-target arm is SlaClip-Q, not the camera-ready full SlaClip controller
-whose target changes dynamically.  Each client/group jointly releases its
-clipped gradient and slack coordinates with the same `sigma*C_t` coordinate
-scale; all clients in a round use the same `C_t`, and `C_{t+1}` takes effect
-only in the following round.  The target calibration is derived from exact
-private diagnostics, so this exploratory path remains
-`NON_DP_PRIVATE_DIAGNOSTIC`, with `epsilon=null` and no end-to-end DP claim.
+For full SlaClip, let `s_hat[0]` be the noisy CDF endpoint near the current
+threshold and `s_hat[K-1]` the noisy endpoint near zero.  The controller sets
+`gamma_t = clip(1 - beta * (1 - s_hat[K-1] / (C_t + 1e-6)), 0, 1)` and then
+`C_{t+1} = clip(C_t * exp(eta * (gamma_t - s_hat[0])), C_min, C_max)`.
+Only these noisy endpoints drive the update.  Exact CDF values and actual
+clipping events are retained solely as `NON_DP_PRIVATE_DIAGNOSTIC` telemetry.
+There is no `q_target`, target file, or calibration pass in the active method.
+
+Each client/group jointly releases its clipped gradient and slack coordinates
+with the same `sigma*C_t` coordinate scale; all clients in a round use the
+same `C_t`, and `C_{t+1}` takes effect only in the following round.  This is an
+exploratory adaptation of the sample-level SlaClip construction to the
+repository's five client aggregate-gradient records.  Its composition and
+sensitivity have not been independently certified, so it retains
+`epsilon=null` and no end-to-end DP claim.  Older fixed-target artifacts are
+historical only and are neither an active nor a recommended launch method.
 
 The same private HMAC run key and `--rng-domain` give all arms identical client
 partitions, sampled examples, and BERT supervision masks without writing the
@@ -72,8 +75,11 @@ JSONL records, adapter integrity checks, and a final behavior summary.  The
 statistics include actual and counterfactual clipping rates, raw/clipped/noisy
 gradient norms, signal/noise ratios and cosine, parameter/update norms,
 effective `B @ A` norms, sample coverage/repetition, token counts, per-phase
-timings, peak host/GPU memory, and a FedAvg reconstruction residual.  A
-configuration fingerprint prevents a checkpoint from being resumed under a
+timings, peak host/GPU memory, and a FedAvg reconstruction residual.  Full
+SlaClip additionally records the complete noisy and exact diagnostic CDFs,
+both controller endpoints, `gamma_t`, threshold update, bound hits, and the A/B
+threshold trajectories.  A configuration fingerprint prevents a checkpoint
+from being resumed under a
 different code/data/method or numerical-backend contract.  The runner hashes
 every staged input byte and requires all dataset/model references to close
 exactly over that inventory.  It also enforces deterministic Torch algorithms,
@@ -92,45 +98,38 @@ final adapter and final summaries all reconcile.
 
 ## Iridis Slurm entry points
 
-The cluster wrapper is
-`$HOME/hpc/projects/dp-lora-paper/submit.sh`.  It pins the formal paper-literal
-settings (`K=5`, `T=50`, `B=8`, `sigma=2`, `lr=5e-4`, `C=10`, `r=512`) and
-supports:
+`hpc/submit_full_slaclip_campaign.sh` submits
+`hpc/full_slaclip_campaign.sbatch` as one Slurm job on one node.  Inside that
+single allocation, two independent GPU lanes consume a resumable 60-arm
+manifest; no array or nested child job is submitted.  Every arm runs both
+BERT-base and GPT-2 small, so the manifest represents 120 model-level training
+executions:
 
-```text
-submit.sh smoke [--test-only]
-submit.sh formal [--test-only]
-submit.sh paired-smoke [--test-only]
-submit.sh paired-formal [--test-only]
-submit.sh slaclip-smoke [--test-only]
-submit.sh slaclip-formal [--test-only]
-submit.sh slaclip-target-pilot [--test-only]
-submit.sh slaclip-target-formal [--test-only]
-```
+- 30 primary arms: fixed DP-LoRA and full SlaClip, the paper's initialization
+  sweep `C_0 in {0.1, 1, 5, 10, 20}`, seeds `42, 43, 44`;
+- 24 full-SlaClip controller-sensitivity arms at `C_0=10`, seeds `42..44`,
+  crossing `eta in {0.05, 0.1, 0.2}` with
+  `beta in {0.5, 0.9, 0.99}` and excluding the already-covered
+  `(eta=0.2, beta=0.5)` default; and
+- 6 mechanism controls at `C_0=10`: no-DP and clip-only, seeds `42..44`.
 
-`paired-formal` is the recommended behavior-analysis run: one allocation
-executes no-DP, clip-only, and paper DP-LoRA in fixed order and validates their
-sample, supervision, and client-partition schedules before creating
-`pair_summary.json`.  Set `DPLORA_PAPER_SEED` for an independent repetition;
-`slaclip-formal` first runs the matched fixed-threshold baseline, atomically
-derives its four median targets, and then runs SlaClip-Q in the same allocation
-before producing a target-bound comparison.  It also retains the no-DP and
-clip-only controls for mechanism diagnosis.
-`slaclip-target-pilot` is a 20-round diagnostic with precommitted group targets
-`BERT A/B=0.066/0.146` and `GPT-2 A/B=0.01/0.01`, explicit `K_slots=15`,
-`eta=0.025`, and `C_t` constrained to `[0.1, 10]`.  `K_clients` remains 5.
-The K override is a user-defined small-batch journal policy that exceeds the
-five-release automatic SNR bound; both the theoretical normalized proxy-noise
-scale and this override are recorded in the controller contract.  The target
-values were selected from prior exact non-DP diagnostics, so the comparison is
-exploratory rather than end-to-end DP certified.
-All other formal mechanism parameters remain fixed.  A partial or
-completed-but-unarchived run is resumed only with both an explicit existing
-`DPLORA_PAPER_RUN_ID` and `--resume`.  Completed arms are deeply revalidated
-without retraining and their authoritative summaries are preserved byte for
-byte; an already archived output remains immutable and is refused.
-`--test-only` performs byte/runtime preflight and asks Slurm to validate the
-request without creating a job.
+The wrapper accepts `--test-only` for scheduler validation without submission
+and `--resume` for an existing `DPLORA_FULL_RUN_ID`; the two flags may be
+combined.
+
+All formal arms retain `K_clients=5`, `T=50`, `B=8`, `sigma=2`, `lr=5e-4`,
+and LoRA rank `512`.  Full SlaClip uses `K_slots=15`, bounds `[0.1, 50]`, and
+defaults `eta=0.2`, `beta=0.5`.  The `K_slots=15` choice follows the requested
+small-batch policy but exceeds the automatic bound implied by only five
+released client records; the override and its noise consequence are recorded
+in every controller contract.
+
+Periodic checkpoints, per-arm status, incremental compact archives, and
+completed-arm revalidation allow the same immutable campaign to resume after
+a wall-time stop without rerunning valid arms.  Scheduler-only validation does
+not create a training job.  The campaign remains Level 1: it does not add the
+paper's downstream benchmarks or 6B/7B model protocols, and it cannot by itself
+establish a paper score or a certified privacy budget.
 
 See `docs/CURRENT_RESULT_ASSESSMENT.md` for the evidence-based interpretation
 of legacy job `1298681` and its 7-minute-31-second wall time.

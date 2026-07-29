@@ -1,4 +1,4 @@
-# Assessment of the completed legacy run
+# Assessment of the completed legacy run and current evidence gap
 
 This note records why Slurm job `1298681` is not evidence of numerical paper
 reproduction, while also explaining why its `00:07:31` wall time is plausible.
@@ -51,10 +51,46 @@ internal holdout for utility inference**.  Its statistics motivated the new
 matched-arm, content-isolated, checkpoint-bound instrumentation; they must not
 be mixed with results from the new schema.
 
-For planning the SlaClip-Q extension only, a retrospective recomputation over
-the 50 legacy round summaries found per-round clipping-fraction medians of zero
-for BERT A, BERT B, GPT-2 A, and GPT-2 B. BERT's across-all-client means were
-still 6.4% for A and 16.0% for B, illustrating why a median-of-rounds target is
-not interchangeable with an overall mean. These legacy zeros are an
-expectation, not a valid calibration: the new campaign must first create a
-matched baseline from the same clean commit and bind its own medians by hash.
+For descriptive context only, a retrospective recomputation over the 50 legacy
+round summaries found per-round clipping-fraction medians of zero for BERT A,
+BERT B, GPT-2 A, and GPT-2 B.  BERT's across-all-client means were still 6.4%
+for A and 16.0% for B, illustrating how strongly a clipping summary depends on
+its reducer.  These values are neither targets nor calibration inputs for the
+active method.  Full SlaClip derives its dynamic target each round from the
+two endpoints of the *noisy* CDF proxy; it does not consume a fixed target or
+a baseline-derived median.  Any older fixed-target artifact is retained only
+for historical audit and is not evidence for full SlaClip.
+
+## What the current full-SlaClip campaign can establish
+
+The current plan is a single resumable Slurm allocation containing 60 runner
+arms, with every arm training both BERT-base and GPT-2 small.  Its primary
+matched comparison crosses fixed DP-LoRA and full `slaclip_dp_lora` over the
+paper's initialization sweep `C_0 in {0.1, 1, 5, 10, 20}` and seeds
+`42, 43, 44` (30 arms).  It adds 24 full-SlaClip
+controller-sensitivity arms at `C_0=10` over seeds `42..44`,
+`eta in {0.05, 0.1, 0.2}`, and `beta in {0.5, 0.9, 0.99}`, excluding the
+already-covered default pair.  Six no-DP/clip-only arms at `C_0=10` and seeds
+`42..44` complete the mechanism controls.  Two GPU lanes execute this manifest
+inside the same job; checkpointed state and compact incremental archives make
+it resumable without splitting the work into separately queued jobs.
+
+This design is materially stronger than one seed at the paper's default
+`C=10`: it can test whether an apparent gain is paired across seeds, robust to
+the initial threshold, and stable under controller settings while separating
+clipping from Gaussian-noise effects.  The most useful outputs are the
+per-round internal loss, actual clipping fraction, raw/clipped/noisy norms,
+signal-to-noise and cosine statistics, both noisy CDF endpoints, exact CDF
+diagnostics, dynamic `gamma_t`, threshold trajectories, bound hits, paired
+per-seed deltas, and aggregate mean/standard deviation.
+
+No effectiveness result follows from the specification alone.  Such a claim
+requires all scheduled arms to complete (or be explicitly reported missing),
+their artifacts to pass strict revalidation, and the paired summaries to show
+a repeatable utility improvement rather than only a lower noise norm.  Even a
+successful campaign would remain a **Level-1 mechanism study**: it does not
+evaluate BoolQ, PIQA, WinoGrande, MedQuAD, LiveQA, or MEDIQA-Ans; it does not
+implement the paper's ChatGLM2-6B or Llama2-7B protocols; and its adaptation of
+full SlaClip to five client aggregate-gradient records has no independently
+certified end-to-end privacy accountant.  Those are the next gates before a
+paper benchmark reproduction or privacy claim is justified.

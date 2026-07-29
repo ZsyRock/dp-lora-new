@@ -27,7 +27,7 @@ class MethodContractTests(unittest.TestCase):
                 "no_dp_lora_control",
                 "clip_only_control",
                 "paper_dp_lora",
-                "slaclip_q_dp_lora",
+                "slaclip_dp_lora",
             },
         )
         self.assertFalse(METHOD_SPECS["no_dp_lora_control"].clipping_enabled)
@@ -36,10 +36,13 @@ class MethodContractTests(unittest.TestCase):
         self.assertTrue(METHOD_SPECS["paper_dp_lora"].gaussian_noise_enabled)
         self.assertTrue(METHOD_SPECS["no_dp_lora_control"].is_control)
         self.assertFalse(METHOD_SPECS["paper_dp_lora"].independently_accounted)
-        self.assertTrue(METHOD_SPECS["slaclip_q_dp_lora"].clipping_enabled)
-        self.assertTrue(METHOD_SPECS["slaclip_q_dp_lora"].gaussian_noise_enabled)
-        self.assertFalse(
-            METHOD_SPECS["slaclip_q_dp_lora"].independently_accounted
+        self.assertTrue(METHOD_SPECS["slaclip_dp_lora"].clipping_enabled)
+        self.assertTrue(METHOD_SPECS["slaclip_dp_lora"].gaussian_noise_enabled)
+        self.assertFalse(METHOD_SPECS["slaclip_dp_lora"].is_control)
+        self.assertFalse(METHOD_SPECS["slaclip_dp_lora"].independently_accounted)
+        self.assertIn(
+            "cdf_endpoint",
+            METHOD_SPECS["slaclip_dp_lora"].release_class,
         )
 
 

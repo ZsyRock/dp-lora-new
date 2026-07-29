@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "campaign_name": "full_slaclip_cdf_endpoints_v1",
+  "description": "Matched DP-LoRA and full SlaClip CDF-endpoint controller study; no fixed-target ablation arms.",
+  "expected_arm_count": 60,
+  "common": {
+    "models": [
+      "bert",
+      "gpt2"
+    ],
+    "num_clients": 5,
+    "rounds": 50,
+    "batch_size": 8,
+    "noise_multiplier": 2.0,
+    "learning_rate": 0.0005,
+    "rank": 512,
+    "max_seq_length": 128,
+    "eval_every": 10,
+    "checkpoint_every": 10,
+    "slaclip_num_slots": 15,
+    "slaclip_c_min": 0.1,
+    "slaclip_c_max": 50.0,
+    "default_eta": 0.2,
+    "default_beta": 0.5
+  },
+  "primary": {
+    "initial_clip_norms": [
+      10.0,
+      0.1,
+      1.0,
+      5.0,
+      20.0
+    ],
+    "seeds": [
+      42,
+      43,
+      44
+    ],
+    "methods": [
+      "paper_dp_lora",
+      "slaclip_dp_lora"
+    ]
+  },
+  "sensitivity": {
+    "initial_clip_norm": 10.0,
+    "seeds": [
+      42,
+      43,
+      44
+    ],
+    "etas": [
+      0.05,
+      0.1,
+      0.2
+    ],
+    "betas": [
+      0.5,
+      0.9,
+      0.99
+    ],
+    "method": "slaclip_dp_lora",
+    "exclude_primary_default": true
+  },
+  "controls": {
+    "initial_clip_norm": 10.0,
+    "seeds": [
+      42,
+      43,
+      44
+    ],
+    "methods": [
+      "no_dp_lora_control",
+      "clip_only_control"
+    ]
+  },
+  "scientific_boundary": {
+    "claim_level": 1,
+    "paper_result_reproduced": false,
+    "paper_benchmarks_evaluated": false,
+    "end_to_end_dp_certified": false,
+    "exact_diagnostics_privacy_label": "NON_DP_PRIVATE_DIAGNOSTIC",
+    "k15_policy": "user_requested_for_local_batch_size_below_128",
+    "paper_style_primary_full_setting": {
+      "initial_clip_norm": 10.0,
+      "eta": 0.2,
+      "beta": 0.5
+    },
+    "controller": "full_SlaClip_uses_noisy_CDF_near_threshold_and_near_zero_endpoints",
+    "other_initial_thresholds": "pre_registered_initial_C_sensitivity",
+    "other_eta_beta_values": "pre_registered_controller_sensitivity",
+    "excluded_method_family": "legacy_fixed_target_ablation"
+  }
+}

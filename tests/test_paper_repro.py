@@ -23,7 +23,6 @@ from paper_repro.train_federated import (
     empty_mechanism_components,
     empty_state_like,
     parameter_groups,
-    parse_slaclip_target_overrides,
     partition_indices,
     load_data_protocol,
     round_update_statistics,
@@ -37,7 +36,6 @@ from paper_repro.train_federated import (
     read_round_shards,
     save_final_adapter_atomically,
     slaclip_round_controller_summary,
-    slaclip_contract_targets,
     validate_completed_root_summary,
 )
 from paper_repro.reproducibility import METHOD_SPECS, canonical_json_fingerprint
@@ -187,69 +185,6 @@ def minimal_valid_input_manifest(root: Path) -> dict:
 
 
 class PaperReproTests(unittest.TestCase):
-    def test_explicit_slaclip_targets_require_one_complete_four_group_map(self) -> None:
-        values = [
-            "gpt2:B=0.01",
-            "bert:A=0.066",
-            "gpt2:A=1e-2",
-            "bert:B=0.146",
-        ]
-        self.assertEqual(
-            parse_slaclip_target_overrides(
-                values, method="slaclip_q_dp_lora"
-            ),
-            {
-                "bert": {"A": 0.066, "B": 0.146},
-                "gpt2": {"A": 0.01, "B": 0.01},
-            },
-        )
-        self.assertIsNone(
-            parse_slaclip_target_overrides([], method="paper_dp_lora")
-        )
-
-    def test_explicit_slaclip_target_errors_fail_closed(self) -> None:
-        complete = [
-            "bert:A=0.066",
-            "bert:B=0.146",
-            "gpt2:A=0.01",
-            "gpt2:B=0.01",
-        ]
-        invalid_cases = (
-            (complete[:-1], "all four"),
-            ([*complete, "bert:A=0.2"], "duplicate"),
-            ([*complete[:-1], "GPT2:B=0.01"], "key must be"),
-            ([*complete[:-1], "gpt2:B=nan"], "finite"),
-            ([*complete[:-1], "gpt2:B=1.01"], "in \[0, 1\]"),
-            ([*complete[:-1], "gpt2:B"], "MODEL:GROUP=FRACTION"),
-        )
-        for values, expected in invalid_cases:
-            with self.subTest(values=values):
-                with self.assertRaisesRegex(ValueError, expected):
-                    parse_slaclip_target_overrides(
-                        values, method="slaclip_q_dp_lora"
-                    )
-        with self.assertRaisesRegex(ValueError, "only valid"):
-            parse_slaclip_target_overrides(
-                complete, method="paper_dp_lora"
-            )
-
-    def test_slaclip_contract_targets_support_current_and_historical_schema(self) -> None:
-        medians = {
-            "bert": {"A": 0.0, "B": 0.2},
-            "gpt2": {"A": 0.0, "B": 0.0},
-        }
-        explicit = {
-            "bert": {"A": 0.066, "B": 0.146},
-            "gpt2": {"A": 0.01, "B": 0.01},
-        }
-        legacy = {"calibration": {"targets": medians}}
-        current = {
-            "calibration": {"targets": medians},
-            "target_spec": {"targets": explicit},
-        }
-        self.assertEqual(slaclip_contract_targets(legacy), medians)
-        self.assertEqual(slaclip_contract_targets(current), explicit)
-
     def test_completed_root_summary_validation_rejects_derived_mismatch(self) -> None:
         config = paper_config()
         results = {
@@ -507,42 +442,82 @@ class PaperReproTests(unittest.TestCase):
                 ]
             )
 
-    def test_slaclip_round_updates_A_and_B_only_after_shared_round_threshold(self) -> None:
+    def test_slaclip_round_uses_both_noisy_cdf_endpoints_for_A_and_B(self) -> None:
         records = []
-        for client in range(2):
-            model = TinyLoRA()
-            groups = parameter_groups(model)
-            with torch.no_grad():
-                groups["A"][0][1].grad = torch.tensor([[3.0, 4.0]])
-                groups["B"][0][1].grad = torch.tensor([[0.1], [0.2]])
-            statistics = clip_noise_and_step(
-                groups,
-                clip_norm_by_group={"A": 2.0, "B": 1.0},
-                noise_multiplier=0.5,
-                learning_rate=0.1,
-                generator=torch.Generator().manual_seed(10 + client),
-                slaclip_num_slots=1,
-                slack_noise_generators={
-                    "A": torch.Generator().manual_seed(20 + client),
-                    "B": torch.Generator().manual_seed(30 + client),
-                },
+        for _ in range(2):
+            records.append(
+                {
+                    "gradient_groups": {
+                        "A": {
+                            "clip_threshold": 2.0,
+                            "clipped": True,
+                            "slaclip": {
+                                "num_slots": 2,
+                                "noisy_slack": [1.0, 0.2],
+                                "slack_signal": [0.9, 0.1],
+                                "joint_sensitivity_bound_passed": True,
+                                "slack_noise_std_per_coordinate": 1.0,
+                            },
+                        },
+                        "B": {
+                            "clip_threshold": 1.0,
+                            "clipped": False,
+                            "slaclip": {
+                                "num_slots": 2,
+                                "noisy_slack": [0.4, 0.2],
+                                "slack_signal": [0.3, 0.1],
+                                "joint_sensitivity_bound_passed": True,
+                                "slack_noise_std_per_coordinate": 0.5,
+                            },
+                        },
+                    }
+                }
             )
-            records.append({"gradient_groups": statistics})
         summary = slaclip_round_controller_summary(
             records,
             clip_thresholds={"A": 2.0, "B": 1.0},
-            target_clip_fractions={"A": 0.5, "B": 0.0},
-            num_slots=1,
+            num_slots=2,
             eta=0.2,
+            beta=0.5,
             c_min=0.1,
             c_max=50.0,
         )
+        self.assertEqual(summary["variant"], "full_slaclip_cdf_endpoints")
+        self.assertEqual(summary["near_threshold_index"], 0)
+        self.assertEqual(summary["near_zero_index"], 1)
         self.assertEqual(summary["A"]["clip_threshold_used"], 2.0)
         self.assertEqual(summary["B"]["clip_threshold_used"], 1.0)
         self.assertEqual(summary["A"]["actual_clip_fraction"], 1.0)
         self.assertEqual(summary["B"]["actual_clip_fraction"], 0.0)
-        self.assertGreater(summary["A"]["next_clip_threshold"], 0.0)
-        self.assertGreater(summary["B"]["next_clip_threshold"], 0.0)
+        for group, threshold in (("A", 2.0), ("B", 1.0)):
+            controller = summary[group]
+            noisy_cdf = controller["noisy_cdf_proxy_by_slot"]
+            self.assertAlmostEqual(
+                controller["near_threshold_proxy"], noisy_cdf[0]
+            )
+            self.assertAlmostEqual(controller["near_zero_proxy"], noisy_cdf[-1])
+            expected_gamma = max(
+                0.0,
+                min(
+                    1.0,
+                    1.0
+                    - 0.5
+                    * (
+                        1.0
+                        - noisy_cdf[-1]
+                        / (threshold + controller["epsilon"])
+                    ),
+                ),
+            )
+            self.assertAlmostEqual(
+                controller["dynamic_target_unclipped"], expected_gamma
+            )
+            expected_next = threshold * np.exp(
+                0.2 * (expected_gamma - noisy_cdf[0])
+            )
+            self.assertAlmostEqual(
+                controller["next_clip_threshold"], expected_next
+            )
 
     def test_recorded_signal_and_noise_reconstruct_fedavg_update(self) -> None:
         model = TinyLoRA()
@@ -615,25 +590,28 @@ class PaperReproTests(unittest.TestCase):
                 clients=[np.array([0]), np.array([1])],
             )
 
-    def test_checkpoint_binds_slaclip_calibration_and_next_thresholds(self) -> None:
-        config = replace(paper_config(rounds=2), method="slaclip_q_dp_lora")
+    def test_checkpoint_binds_full_slaclip_contract_and_next_thresholds(self) -> None:
+        config = replace(paper_config(rounds=2), method="slaclip_dp_lora")
         state = valid_checkpoint_state(config, completed_round=2)
         state["last_round_summary"]["slaclip_controller"] = {
             "A": {"next_clip_threshold": 11.0},
             "B": {"next_clip_threshold": 12.0},
         }
-        state["slaclip_controller_state"] = {
-            "calibration_fingerprint": "c" * 64,
-            "updates_completed": 2,
-            "target_clip_fraction_by_group": {"A": 0.1, "B": 0.2},
-            "next_clip_threshold_by_group": {"A": 11.0, "B": 12.0},
-        }
         contract = {
-            "controller": {"c_min": 0.1, "c_max": 50.0},
-            "calibration": {
-                "calibration_fingerprint": "c" * 64,
-                "targets": {"bert": {"A": 0.1, "B": 0.2}},
+            "schema_version": "full_slaclip_contract_v1",
+            "variant": "full_slaclip_cdf_endpoints",
+            "controller": {
+                "eta": 0.2,
+                "beta": 0.5,
+                "num_slots": 15,
+                "c_min": 0.1,
+                "c_max": 50.0,
             },
+        }
+        state["slaclip_controller_state"] = {
+            "controller_contract_sha256": canonical_json_fingerprint(contract),
+            "updates_completed": 2,
+            "next_clip_threshold_by_group": {"A": 11.0, "B": 12.0},
         }
         validate_checkpoint_trainer_state(
             state,
@@ -648,9 +626,9 @@ class PaperReproTests(unittest.TestCase):
         )
         corrupted = copy.deepcopy(state)
         corrupted["slaclip_controller_state"][
-            "calibration_fingerprint"
+            "controller_contract_sha256"
         ] = "d" * 64
-        with self.assertRaisesRegex(RuntimeError, "calibration_fingerprint"):
+        with self.assertRaisesRegex(RuntimeError, "controller_contract_sha256"):
             validate_checkpoint_trainer_state(
                 corrupted,
                 completed_round=2,

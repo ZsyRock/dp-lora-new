@@ -1,37 +1,54 @@
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
+import math
 import os
 import tempfile
 import unittest
 from dataclasses import asdict
 from pathlib import Path
 
-from paper_repro.calibrate_slaclip import (
-    atomic_create_calibration,
-    build_calibration,
-    round_shard_prefix_sha256,
-)
 from paper_repro.compare_slaclip import (
     ADAPTIVE_METHOD,
     BASELINE_METHOD,
     COMPARISON_STATUS,
+    SLACLIP_CONTRACT_SCHEMA,
+    SLACLIP_VARIANT,
+    _round_shard_prefix_sha256,
+    _validate_exact_cdf_range,
     build_comparison,
     main,
 )
 from paper_repro.reproducibility import METHOD_SPECS, canonical_json_fingerprint
+from paper_repro.slaclip import (
+    automatic_num_slots,
+    full_slaclip_update,
+    normalize_noisy_slack,
+)
 
 
 MODELS = ("bert", "gpt2")
 GROUPS = ("A", "B")
 ROUNDS = 3
 CLIENTS = 2
-COUNTS = {
-    "bert": {"A": [0, 1, 2], "B": [0, 0, 1]},
-    "gpt2": {"A": [1, 1, 2], "B": [0, 2, 2]},
+NUM_SLOTS = 3
+NOISE_MULTIPLIER = 2.0
+ETA = 0.2
+BETA = 0.5
+EPSILON = 1e-6
+C_MIN = 0.1
+C_MAX = 50.0
+INITIAL_C = 10.0
+NOISY_CDF = {
+    "A": [0.72, 0.51, 0.28],
+    "B": [0.81, 0.62, 0.19],
 }
+EXACT_CDF = {
+    "A": [0.75, 0.50, 0.25],
+    "B": [1.00, 0.75, 0.25],
+}
+ACTUAL_CLIP = {"A": 0.5, "B": 0.5}
 
 
 def private_directory(path: Path) -> Path:
@@ -65,9 +82,9 @@ def effective_config(method: str) -> dict:
         "num_clients": CLIENTS,
         "rounds": ROUNDS,
         "batch_size": 8,
-        "noise_multiplier": 2.0,
+        "noise_multiplier": NOISE_MULTIPLIER,
         "learning_rate": 5e-4,
-        "clip_norm": 10.0,
+        "clip_norm": INITIAL_C,
         "rank": 512,
         "max_seq_length": 128,
         "seed": 42,
@@ -76,12 +93,59 @@ def effective_config(method: str) -> dict:
         "checkpoint_every": 1,
         "data_protocol": "paper_union_minus_fixed_holdout",
         "delta": 1e-5,
-        "pair_noise_across_methods": False,
+        "pair_noise_across_methods": True,
         "smoke": False,
     }
 
 
-def scientific_contract(method: str, slaclip_contract: dict | None) -> dict:
+def slaclip_contract() -> dict:
+    automatic_slots = automatic_num_slots(CLIENTS, NOISE_MULTIPLIER)
+    return {
+        "schema_version": SLACLIP_CONTRACT_SCHEMA,
+        "variant": SLACLIP_VARIANT,
+        "federated_adaptation": (
+            "per_client_joint_gradient_slack_release_then_equal_fedavg_"
+            "and_one_controller_update_per_round"
+        ),
+        "reference": {
+            "paper": "https://openreview.net/pdf?id=48suUeYKdb",
+            "repository": "https://github.com/ZsyRock/SlaClip",
+            "revision": "c" * 40,
+        },
+        "controller": {
+            "eta": ETA,
+            "beta": BETA,
+            "epsilon": EPSILON,
+            "num_slots": NUM_SLOTS,
+            "num_slots_selection": "explicit",
+            "local_batch_size": 8,
+            "num_clients": CLIENTS,
+            "expected_release_records": CLIENTS,
+            "automatic_release_num_slots": automatic_slots,
+            "explicit_num_slots_exceeds_automatic_release_bound": (
+                NUM_SLOTS > automatic_slots
+            ),
+            "normalized_proxy_noise_std_per_slot_theoretical": (
+                NOISE_MULTIPLIER * math.sqrt(NUM_SLOTS / CLIENTS)
+            ),
+            "normalized_proxy_noise_std_formula": (
+                "noise_multiplier*sqrt(num_slots/num_clients)"
+            ),
+            "near_threshold_index": 0,
+            "near_zero_index": NUM_SLOTS - 1,
+            "numerical_log_step_bounds": [-50.0, 50.0],
+            "numerical_safeguard": "recorded test safeguard",
+            "c_min": C_MIN,
+            "c_max": C_MAX,
+            "initial_clip_threshold": INITIAL_C,
+            "controller_inputs": "noisy_joint_release_endpoints_only",
+        },
+        "exact_cdf_and_clipping_diagnostics": "NON_DP_PRIVATE_DIAGNOSTICS",
+        "independently_privacy_certified": False,
+    }
+
+
+def scientific_contract(method: str, adaptive_contract: dict | None) -> dict:
     return {
         "schema_version": 2,
         "repository_sha": "a" * 40,
@@ -104,8 +168,35 @@ def scientific_contract(method: str, slaclip_contract: dict | None) -> dict:
             "local_optimizer": "one_manual_sgd_step",
             "record_weighting": "equal_records_after_within_record_token_mean",
             "dropout_rng": "stateless_private_hmac_per_model_round_client",
-            "contains_slaclip": slaclip_contract is not None,
-            "slaclip_q": slaclip_contract,
+            "contains_slaclip": adaptive_contract is not None,
+            "slaclip": adaptive_contract,
+        },
+    }
+
+
+def run_config(method: str, contract: dict, *, adaptive: bool) -> dict:
+    fingerprint = canonical_json_fingerprint(contract)
+    return {
+        "schema_version": 2,
+        "method": method,
+        "method_spec": asdict(METHOD_SPECS[method]),
+        "contains_slaclip": adaptive,
+        "run_config_fingerprint": fingerprint,
+        "scientific_contract": contract,
+        "effective_config": contract["effective_config"],
+        "models": list(MODELS),
+        "reproduction_claim": {
+            "level": 1,
+            "paper_result_reproduced": False,
+            "paper_benchmarks_evaluated": False,
+        },
+        "privacy_claim": {
+            "end_to_end_dp_certified": False,
+            "epsilon": None,
+            "sigma_is_not_epsilon": True,
+            "diagnostics_are_private_non_dp_data": True,
+            "baseline_derived_calibration_is_non_dp": False,
+            "exact_cdf_diagnostics_are_non_dp": adaptive,
         },
     }
 
@@ -123,33 +214,6 @@ def write_adapter(model_dir: Path, method: str, model: str) -> tuple[str, str]:
     return digest(adapter), digest(config)
 
 
-def run_config(method: str, contract: dict, *, adaptive: bool) -> dict:
-    fingerprint = canonical_json_fingerprint(contract)
-    return {
-        "schema_version": 2,
-        "method": method,
-        "method_spec": asdict(METHOD_SPECS[method]),
-        "contains_slaclip": adaptive,
-        "run_config_fingerprint": fingerprint,
-        "scientific_contract": contract,
-        "effective_config": contract["effective_config"],
-        "models": list(MODELS),
-        "reproduction_claim": {
-            "level": 1,
-            "name": "algorithm_execution_reconstruction",
-            "paper_result_reproduced": False,
-            "paper_benchmarks_evaluated": False,
-        },
-        "privacy_claim": {
-            "end_to_end_dp_certified": False,
-            "epsilon": None,
-            "sigma_is_not_epsilon": True,
-            "diagnostics_are_private_non_dp_data": True,
-            "baseline_derived_calibration_is_non_dp": adaptive,
-        },
-    }
-
-
 def base_model_summary(
     *,
     method: str,
@@ -160,15 +224,6 @@ def base_model_summary(
     adapter_config_sha: str,
     behavior: dict,
 ) -> dict:
-    total = ROUNDS * CLIENTS
-    clipping = {
-        group: {
-            "count": sum(COUNTS[model][group]),
-            "fraction": sum(COUNTS[model][group]) / total,
-        }
-        for group in GROUPS
-    }
-    clipping["any_group"] = {"count": 0, "fraction": 0.0}
     final_eval = {"round": ROUNDS, "loss": 3.5}
     return {
         "schema_version": 2,
@@ -177,11 +232,15 @@ def base_model_summary(
         "model": model,
         "privacy_claim": False,
         "run_config_fingerprint": fingerprint,
-        "client_steps": total,
+        "client_steps": ROUNDS * CLIENTS,
         "client_partition_sha256": [
             digest(f"{model}:partition:{client}") for client in range(CLIENTS)
         ],
-        "clipping": clipping,
+        "clipping": {
+            "A": {"count": 1, "fraction": 1 / (ROUNDS * CLIENTS)},
+            "B": {"count": 2, "fraction": 2 / (ROUNDS * CLIENTS)},
+            "any_group": {"count": 2, "fraction": 2 / (ROUNDS * CLIENTS)},
+        },
         "behavior_summary": behavior,
         "round_shard_prefix_sha256": prefix,
         "evaluations": [{"round": 0, "loss": 4.0}, final_eval],
@@ -198,6 +257,34 @@ def base_model_summary(
     }
 
 
+def write_root(
+    directory: Path,
+    method: str,
+    fingerprint: str,
+    models: dict[str, dict],
+    schedules: dict[str, str],
+    *,
+    adaptive: bool,
+) -> None:
+    private_json(
+        directory / "final_summary.json",
+        {
+            "schema_version": 2,
+            "status": "COMPLETED",
+            "method": method,
+            "method_spec": asdict(METHOD_SPECS[method]),
+            "contains_slaclip": adaptive,
+            "run_config_fingerprint": fingerprint,
+            "reproduction_claim_level": 1,
+            "paper_result_reproduced": False,
+            "paper_benchmarks_evaluated": False,
+            "privacy_claim": False,
+            "models": models,
+            "sample_schedule_sha256_by_model": schedules,
+        },
+    )
+
+
 def write_baseline(parent: Path) -> Path:
     baseline = private_directory(parent / "baseline")
     contract = scientific_contract(BASELINE_METHOD, None)
@@ -211,22 +298,6 @@ def write_baseline(parent: Path) -> Path:
         diagnostics = private_directory(model_dir / "private_diagnostics")
         rounds_dir = private_directory(diagnostics / "rounds")
         for round_index in range(1, ROUNDS + 1):
-            counts = {
-                group: COUNTS[model][group][round_index - 1] for group in GROUPS
-            }
-            records = [
-                {
-                    "method": BASELINE_METHOD,
-                    "model": model,
-                    "round": round_index,
-                    "client": client,
-                    "gradient_groups": {
-                        group: {"clipped": client < counts[group]}
-                        for group in GROUPS
-                    },
-                }
-                for client in range(CLIENTS)
-            ]
             private_json(
                 rounds_dir / f"round-{round_index:05d}.json",
                 {
@@ -234,21 +305,10 @@ def write_baseline(parent: Path) -> Path:
                     "method": BASELINE_METHOD,
                     "model": model,
                     "round": round_index,
-                    "client_records": records,
-                    "round_summary": {
-                        "round": round_index,
-                        "clients": CLIENTS,
-                        **{
-                            group: {
-                                "clipped_count": counts[group],
-                                "clipped_fraction": counts[group] / CLIENTS,
-                            }
-                            for group in GROUPS
-                        },
-                    },
+                    "round_summary": {"round": round_index},
                 },
             )
-        prefix = round_shard_prefix_sha256(rounds_dir, ROUNDS)
+        prefix = _round_shard_prefix_sha256(rounds_dir, ROUNDS)
         adapter_sha, adapter_config_sha = write_adapter(
             model_dir, BASELINE_METHOD, model
         )
@@ -257,14 +317,7 @@ def write_baseline(parent: Path) -> Path:
         behavior = {
             "sample_schedule_sha256": schedule,
             "supervision_schedule_sha256": digest(f"{model}:shared-masks"),
-            "groups": {
-                group: {
-                    "actual_clipped_count": sum(COUNTS[model][group]),
-                    "actual_clipped_fraction": sum(COUNTS[model][group])
-                    / (ROUNDS * CLIENTS),
-                }
-                for group in GROUPS
-            },
+            "groups": {},
         }
         summary = base_model_summary(
             method=BASELINE_METHOD,
@@ -277,138 +330,135 @@ def write_baseline(parent: Path) -> Path:
         )
         private_json(model_dir / "final_summary.json", summary)
         root_models[model] = summary
-    private_json(
-        baseline / "final_summary.json",
-        {
-            "schema_version": 2,
-            "status": "COMPLETED",
-            "method": BASELINE_METHOD,
-            "method_spec": asdict(METHOD_SPECS[BASELINE_METHOD]),
-            "contains_slaclip": False,
-            "run_config_fingerprint": fingerprint,
-            "reproduction_claim_level": 1,
-            "paper_result_reproduced": False,
-            "paper_benchmarks_evaluated": False,
-            "privacy_claim": False,
-            "models": root_models,
-            "sample_schedule_sha256_by_model": schedules,
-        },
+    write_root(
+        baseline,
+        BASELINE_METHOD,
+        fingerprint,
+        root_models,
+        schedules,
+        adaptive=False,
     )
     return baseline
 
 
-def calibration_contract(
-    calibration: dict,
-    calibration_path: Path,
-    *,
-    explicit_targets: dict[str, dict[str, float]] | None = None,
+def client_release_records(thresholds: dict[str, float]) -> list[dict]:
+    records = []
+    for client in range(CLIENTS):
+        groups = {}
+        for group in GROUPS:
+            threshold = thresholds[group]
+            slack_lambda = threshold / math.sqrt(NUM_SLOTS)
+            groups[group] = {
+                "clip_threshold": threshold,
+                "clipped": client < round(ACTUAL_CLIP[group] * CLIENTS),
+                "slaclip": {
+                    "variant": SLACLIP_VARIANT,
+                    "num_slots": NUM_SLOTS,
+                    "slack_signal": [
+                        value * slack_lambda for value in EXACT_CDF[group]
+                    ],
+                    "noisy_slack": [
+                        value * slack_lambda for value in NOISY_CDF[group]
+                    ],
+                    "joint_sensitivity_bound_passed": True,
+                    "slack_noise_std_per_coordinate": (
+                        NOISE_MULTIPLIER * threshold
+                    ),
+                },
+            }
+        records.append({"client": client, "gradient_groups": groups})
+    return records
+
+
+def controller_round(
+    thresholds: dict[str, float], client_records: list[dict]
 ) -> dict:
-    targets = {
-        model: {
-            group: calibration["models"][model]["groups"][group][
-                "target_clip_fraction"
-            ]
-            for group in GROUPS
-        }
-        for model in MODELS
-    }
-    result = {
-        "variant": "SlaClip-Q_fixed_target",
-        "federated_adaptation": (
-            "per_client_joint_gradient_slack_release_then_equal_fedavg_"
-            "and_one_controller_update_per_round"
-        ),
-        "reference": {
-            "paper": "https://openreview.net/pdf?id=48suUeYKdb",
-            "repository": "https://example.invalid/slaclip",
-            "revision": "c" * 40,
-        },
-        "controller": {
-            "eta": 0.2,
-            "num_slots": 1,
-            "num_slots_selection": "automatic_monotonicity_rule",
-            "expected_release_records": CLIENTS,
-            "c_min": 0.1,
-            "c_max": 50.0,
-            "initial_clip_threshold": 10.0,
-            "target_semantics": "clipped_fraction_complemented_to_unclipped_proxy",
-        },
-        "calibration": {
-            "privacy_class": calibration["privacy_class"],
-            "calibration_fingerprint": calibration["calibration_fingerprint"],
-            "file_sha256": digest(calibration_path.read_bytes()),
-            "source": calibration["source"],
-            "reducer": calibration["reducer"],
-            "targets": targets,
-        },
-        "independently_privacy_certified": False,
-    }
-    if explicit_targets is not None:
-        result["target_spec"] = {
-            "schema_version": 1,
-            "mode": "explicit_precommitted",
-            "label": (
-                "prior_non_dp_diagnostic_derived_precommitted_hyperparameter"
-            ),
-            "privacy_class": "NON_DP_DIAGNOSTIC_DERIVED_HYPERPARAMETER",
-            "precommitted_before_adaptive_training": True,
-            "targets": copy.deepcopy(explicit_targets),
-        }
-    return result
-
-
-def controller_round(targets: dict[str, float]) -> dict:
     value: dict = {
-        "variant": "SlaClip-Q",
+        "variant": SLACLIP_VARIANT,
         "update_timing": "once_after_all_clients_for_use_in_next_round",
         "clients": CLIENTS,
-        "num_slots": 1,
-        "eta": 0.2,
-        "c_min": 0.1,
-        "c_max": 50.0,
+        "num_slots": NUM_SLOTS,
+        "eta": ETA,
+        "beta": BETA,
+        "epsilon": EPSILON,
+        "near_threshold_index": 0,
+        "near_zero_index": NUM_SLOTS - 1,
+        "c_min": C_MIN,
+        "c_max": C_MAX,
     }
     for group in GROUPS:
-        target = targets[group]
+        noisy_sum = [
+            math.fsum(
+                record["gradient_groups"][group]["slaclip"]["noisy_slack"][slot]
+                for record in client_records
+            )
+            for slot in range(NUM_SLOTS)
+        ]
+        exact_sum = [
+            math.fsum(
+                record["gradient_groups"][group]["slaclip"]["slack_signal"][slot]
+                for record in client_records
+            )
+            for slot in range(NUM_SLOTS)
+        ]
+        noisy = list(
+            normalize_noisy_slack(
+                noisy_sum, thresholds[group], NUM_SLOTS, CLIENTS
+            )
+        )
+        exact = list(
+            normalize_noisy_slack(
+                exact_sum, thresholds[group], NUM_SLOTS, CLIENTS
+            )
+        )
+        update = full_slaclip_update(
+            thresholds[group],
+            noisy[0],
+            noisy[-1],
+            beta=BETA,
+            eta=ETA,
+            min_clip_norm=C_MIN,
+            max_clip_norm=C_MAX,
+            epsilon=EPSILON,
+        )
+        update_fields = dict(update)
+        update_fields["unbounded_next_clip_threshold"] = update_fields.pop(
+            "unbounded_next_clip_norm"
+        )
+        update_fields["next_clip_threshold"] = update_fields.pop("next_clip_norm")
+        update_fields["c_min"] = update_fields.pop("min_clip_norm")
+        update_fields["c_max"] = update_fields.pop("max_clip_norm")
+        update_fields.pop("current_clip_norm")
+        actual = ACTUAL_CLIP[group]
         value[group] = {
-            "clip_threshold_used": 10.0,
-            "target_clip_fraction": target,
-            "target_clipped_fraction": target,
-            "target_unclipped_proxy": 1.0 - target,
-            "noisy_unclipped_proxy_by_slot": [1.0 - target],
-            "exact_unclipped_proxy_by_slot": [1.0 - target],
-            "controller_error": 0.0,
-            "actual_clip_fraction": target,
-            "actual_minus_target_clip_fraction": 0.0,
-            "noisy_unclipped_proxy": 1.0 - target,
-            "eta": 0.2,
-            "raw_log_update": 0.0,
-            "bounded_log_update": 0.0,
-            "log_update_was_clamped": False,
-            "unbounded_next_clip_threshold": 10.0,
-            "next_clip_threshold": 10.0,
-            "c_min": 0.1,
-            "c_max": 50.0,
-            "hit_lower_bound": False,
-            "hit_upper_bound": False,
+            "clip_threshold_used": thresholds[group],
+            "noisy_cdf_proxy_by_slot": noisy,
+            "exact_cdf_proxy_by_slot": exact,
+            "normalized_proxy_noise_std_per_slot": (
+                NOISE_MULTIPLIER * math.sqrt(NUM_SLOTS / CLIENTS)
+            ),
+            "noisy_near_threshold_minus_exact": noisy[0] - exact[0],
+            "noisy_near_zero_minus_exact": noisy[-1] - exact[-1],
+            "noisy_adjacent_monotonicity_violations": sum(
+                noisy[index + 1] > noisy[index]
+                for index in range(NUM_SLOTS - 1)
+            ),
+            "exact_adjacent_monotonicity_violations": sum(
+                exact[index + 1] > exact[index]
+                for index in range(NUM_SLOTS - 1)
+            ),
+            "actual_clip_fraction": actual,
+            "actual_minus_dynamic_target_clipped": (
+                actual - update_fields["dynamic_target_clipped"]
+            ),
+            **update_fields,
         }
     return value
 
 
-def write_adaptive(
-    parent: Path,
-    baseline: Path,
-    calibration_path: Path,
-    calibration: dict,
-    *,
-    explicit_targets: dict[str, dict[str, float]] | None = None,
-) -> Path:
-    del baseline  # Source binding is carried by the immutable calibration contract.
+def write_adaptive(parent: Path) -> Path:
     adaptive = private_directory(parent / "adaptive")
-    slaclip = calibration_contract(
-        calibration,
-        calibration_path,
-        explicit_targets=explicit_targets,
-    )
+    slaclip = slaclip_contract()
     contract = scientific_contract(ADAPTIVE_METHOD, slaclip)
     config = run_config(ADAPTIVE_METHOD, contract, adaptive=True)
     private_json(adaptive / "run_config.json", config)
@@ -419,14 +469,11 @@ def write_adaptive(
         model_dir = private_directory(adaptive / model)
         diagnostics = private_directory(model_dir / "private_diagnostics")
         rounds_dir = private_directory(diagnostics / "rounds")
-        targets = (
-            slaclip["target_spec"]["targets"][model]
-            if "target_spec" in slaclip
-            else slaclip["calibration"]["targets"][model]
-        )
+        thresholds = {group: INITIAL_C for group in GROUPS}
         trajectory = []
         for round_index in range(1, ROUNDS + 1):
-            controller = controller_round(targets)
+            client_records = client_release_records(thresholds)
+            controller = controller_round(thresholds, client_records)
             trajectory.append(controller)
             private_json(
                 rounds_dir / f"round-{round_index:05d}.json",
@@ -435,27 +482,28 @@ def write_adaptive(
                     "method": ADAPTIVE_METHOD,
                     "model": model,
                     "round": round_index,
+                    "client_records": client_records,
                     "round_summary": {
                         "round": round_index,
                         "slaclip_controller": controller,
                     },
                 },
             )
-        prefix = round_shard_prefix_sha256(rounds_dir, ROUNDS)
+            thresholds = {
+                group: controller[group]["next_clip_threshold"] for group in GROUPS
+            }
+        prefix = _round_shard_prefix_sha256(rounds_dir, ROUNDS)
         adapter_sha, adapter_config_sha = write_adapter(
             model_dir, ADAPTIVE_METHOD, model
         )
         schedule = digest(f"{model}:shared-samples")
         schedules[model] = schedule
         controller_summary = {
-            "variant": "SlaClip-Q",
+            "variant": SLACLIP_VARIANT,
             "rounds": ROUNDS,
             "trajectory_sha256": canonical_json_fingerprint(trajectory),
             "groups": {
-                group: {
-                    "target_clip_fraction": targets[group],
-                    "final_next_clip_threshold": 10.0,
-                }
+                group: {"final_next_clip_threshold": thresholds[group]}
                 for group in GROUPS
             },
         }
@@ -474,52 +522,26 @@ def write_adaptive(
             adapter_config_sha=adapter_config_sha,
             behavior=behavior,
         )
-        summary["slaclip_q"] = {
+        summary["slaclip"] = {
             "contract": slaclip,
-            "target_clip_fraction_by_group": targets,
-            "final_next_clip_threshold_by_group": {group: 10.0 for group in GROUPS},
+            "final_next_clip_threshold_by_group": thresholds,
             "controller_summary": controller_summary,
         }
         private_json(model_dir / "final_summary.json", summary)
         root_models[model] = summary
-    private_json(
-        adaptive / "final_summary.json",
-        {
-            "schema_version": 2,
-            "status": "COMPLETED",
-            "method": ADAPTIVE_METHOD,
-            "method_spec": asdict(METHOD_SPECS[ADAPTIVE_METHOD]),
-            "contains_slaclip": True,
-            "run_config_fingerprint": fingerprint,
-            "reproduction_claim_level": 1,
-            "paper_result_reproduced": False,
-            "paper_benchmarks_evaluated": False,
-            "privacy_claim": False,
-            "models": root_models,
-            "sample_schedule_sha256_by_model": schedules,
-        },
+    write_root(
+        adaptive,
+        ADAPTIVE_METHOD,
+        fingerprint,
+        root_models,
+        schedules,
+        adaptive=True,
     )
     return adaptive
 
 
-def build_fixture(
-    parent: Path,
-    *,
-    explicit_targets: dict[str, dict[str, float]] | None = None,
-) -> tuple[Path, Path, Path]:
-    baseline = write_baseline(parent)
-    calibration_dir = private_directory(parent / "calibration")
-    calibration_path = calibration_dir / "median.json"
-    calibration = build_calibration(baseline)
-    atomic_create_calibration(calibration_path, calibration)
-    adaptive = write_adaptive(
-        parent,
-        baseline,
-        calibration_path,
-        calibration,
-        explicit_targets=explicit_targets,
-    )
-    return baseline, adaptive, calibration_path
+def build_fixture(parent: Path) -> tuple[Path, Path]:
+    return write_baseline(parent), write_adaptive(parent)
 
 
 def rewrite_adaptive_model_and_root(adaptive: Path, model: str, summary: dict) -> None:
@@ -532,80 +554,72 @@ def rewrite_adaptive_model_and_root(adaptive: Path, model: str, summary: dict) -
     private_json(adaptive / "final_summary.json", root)
 
 
+def rewrite_adaptive_contract(adaptive: Path, contract: dict) -> None:
+    config_path = adaptive / "run_config.json"
+    config = load_json(config_path)
+    scientific = config["scientific_contract"]
+    scientific["algorithm_contract"]["slaclip"] = contract
+    fingerprint = canonical_json_fingerprint(scientific)
+    config["run_config_fingerprint"] = fingerprint
+    private_json(config_path, config)
+    root = load_json(adaptive / "final_summary.json")
+    root["run_config_fingerprint"] = fingerprint
+    for model in MODELS:
+        summary = load_json(adaptive / model / "final_summary.json")
+        summary["run_config_fingerprint"] = fingerprint
+        summary["slaclip"]["contract"] = contract
+        private_json(adaptive / model / "final_summary.json", summary)
+        root["models"][model] = summary
+    private_json(adaptive / "final_summary.json", root)
+
+
 class CompareSlaClipTests(unittest.TestCase):
-    def test_valid_pair_is_matched_level_one_and_explicitly_non_dp(self) -> None:
+    def test_exact_cdf_allows_only_float32_roundoff(self) -> None:
+        _validate_exact_cdf_range([0.0, 1.0 + 5e-8], "exact CDF")
+        with self.assertRaisesRegex(RuntimeError, "float32 tolerance"):
+            _validate_exact_cdf_range([1.0 + 2e-6], "exact CDF")
+
+    def test_valid_pair_uses_both_noisy_endpoints_without_fixed_target(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
-            root = Path(raw_root)
-            baseline, adaptive, calibration = build_fixture(root)
-            result = build_comparison(baseline, adaptive, calibration)
+            baseline, adaptive = build_fixture(Path(raw_root))
+            result = build_comparison(baseline, adaptive)
             self.assertEqual(result["status"], COMPARISON_STATUS)
             self.assertEqual(result["claim_level"], 1)
-            self.assertTrue(result["contains_slaclip"])
             self.assertFalse(result["paper_result_reproduced"])
-            self.assertIsNone(result["privacy_notice"]["epsilon"])
-            self.assertFalse(
-                result["privacy_notice"]["end_to_end_dp_certified"]
-            )
+            self.assertFalse(result["uses_baseline_calibration"])
+            self.assertFalse(result["uses_fixed_target_clip_fraction"])
+            self.assertEqual(result["slaclip_variant"], SLACLIP_VARIANT)
             self.assertTrue(
                 result["privacy_notice"][
-                    "data_dependent_baseline_calibration_is_non_dp"
+                    "controller_consumes_noisy_cdf_endpoints"
                 ]
             )
-            self.assertEqual(
-                result["models"]["bert"]["controller"]["rounds"], ROUNDS
+            controller = result["models"]["bert"]["controller"]
+            self.assertEqual(controller["near_threshold_index"], 0)
+            self.assertEqual(controller["near_zero_index"], NUM_SLOTS - 1)
+            self.assertEqual(controller["beta"], BETA)
+            self.assertNotEqual(
+                controller["final_clip_norm_by_group"]["A"], INITIAL_C
             )
             self.assertEqual(
-                result["models"]["bert"]["controller"][
-                    "initial_clip_threshold"
+                result["models"]["bert"]["paired_internal_holdout"][
+                    "adaptive_minus_baseline_final"
                 ],
-                10.0,
+                0.0,
             )
+            self.assertNotIn("calibration_evidence", result)
             self.assertNotIn("active_target_spec", result)
 
-    def test_explicit_precommitted_targets_are_separate_from_calibration(self) -> None:
-        explicit_targets = {
-            "bert": {"A": 0.066, "B": 0.146},
-            "gpt2": {"A": 0.01, "B": 0.01},
-        }
+    def test_cli_create_and_verify_existing_has_no_calibration_argument(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
-            baseline, adaptive, calibration = build_fixture(
-                root, explicit_targets=explicit_targets
-            )
-            result = build_comparison(baseline, adaptive, calibration)
-            self.assertEqual(
-                result["active_target_spec"]["mode"], "explicit_precommitted"
-            )
-            self.assertEqual(
-                result["active_target_spec"]["label"],
-                "prior_non_dp_diagnostic_derived_precommitted_hyperparameter",
-            )
-            self.assertEqual(
-                result["active_target_spec"]["targets"], explicit_targets
-            )
-            self.assertEqual(
-                result["models"]["bert"]["target_clip_fraction_by_group"],
-                explicit_targets["bert"],
-            )
-            self.assertNotEqual(
-                result["calibration_evidence"][
-                    "target_clip_fraction_by_model_and_group"
-                ],
-                explicit_targets,
-            )
-
-    def test_cli_create_and_verify_existing(self) -> None:
-        with tempfile.TemporaryDirectory() as raw_root:
-            root = Path(raw_root)
-            baseline, adaptive, calibration = build_fixture(root)
+            baseline, adaptive = build_fixture(root)
             output = root / "comparison.json"
             arguments = [
                 "--baseline-dir",
                 str(baseline),
                 "--adaptive-dir",
                 str(adaptive),
-                "--calibration",
-                str(calibration),
                 "--output",
                 str(output),
             ]
@@ -614,92 +628,110 @@ class CompareSlaClipTests(unittest.TestCase):
             main([*arguments, "--verify-existing"])
             with self.assertRaises(SystemExit):
                 main(arguments)
+            with self.assertRaises(SystemExit):
+                main([*arguments, "--calibration", "unused.json"])
 
     def test_schedule_mismatch_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
-            root = Path(raw_root)
-            baseline, adaptive, calibration = build_fixture(root)
-            path = adaptive / "bert" / "final_summary.json"
-            summary = load_json(path)
+            baseline, adaptive = build_fixture(Path(raw_root))
+            summary = load_json(adaptive / "bert" / "final_summary.json")
             summary["behavior_summary"]["sample_schedule_sha256"] = digest(
                 "tampered schedule"
             )
             rewrite_adaptive_model_and_root(adaptive, "bert", summary)
             with self.assertRaisesRegex(RuntimeError, "sample schedules do not match"):
-                build_comparison(baseline, adaptive, calibration)
+                build_comparison(baseline, adaptive)
 
-    def test_calibration_file_tampering_fails_closed(self) -> None:
+    def test_near_zero_endpoint_tampering_fails_formula_validation(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
-            root = Path(raw_root)
-            baseline, adaptive, calibration = build_fixture(root)
-            value = load_json(calibration)
-            value["models"]["bert"]["groups"]["A"][
-                "target_clip_fraction"
-            ] = 0.9
-            private_json(calibration, value)
-            with self.assertRaisesRegex(RuntimeError, "median mismatch"):
-                build_comparison(baseline, adaptive, calibration)
+            baseline, adaptive = build_fixture(Path(raw_root))
+            shard_path = (
+                adaptive
+                / "bert"
+                / "private_diagnostics"
+                / "rounds"
+                / "round-00001.json"
+            )
+            shard = load_json(shard_path)
+            shard["round_summary"]["slaclip_controller"]["A"][
+                "noisy_cdf_proxy_by_slot"
+            ][-1] += 0.2
+            private_json(shard_path, shard)
+            with self.assertRaisesRegex(RuntimeError, "noisy CDF does not reconcile"):
+                build_comparison(baseline, adaptive)
 
-    def test_adaptive_target_contract_tampering_fails_closed(self) -> None:
+    def test_exact_endpoint_telemetry_tampering_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
-            root = Path(raw_root)
-            baseline, adaptive, calibration = build_fixture(root)
-            config_path = adaptive / "run_config.json"
-            config = load_json(config_path)
-            contract = config["scientific_contract"]
-            slaclip = contract["algorithm_contract"]["slaclip_q"]
-            slaclip["calibration"]["targets"]["bert"]["A"] = 0.9
-            fingerprint = canonical_json_fingerprint(contract)
-            config["run_config_fingerprint"] = fingerprint
-            private_json(config_path, config)
+            baseline, adaptive = build_fixture(Path(raw_root))
+            shard_path = (
+                adaptive
+                / "gpt2"
+                / "private_diagnostics"
+                / "rounds"
+                / "round-00001.json"
+            )
+            shard = load_json(shard_path)
+            shard["round_summary"]["slaclip_controller"]["B"][
+                "exact_cdf_proxy_by_slot"
+            ][0] -= 0.1
+            private_json(shard_path, shard)
+            with self.assertRaisesRegex(RuntimeError, "exact CDF does not reconcile"):
+                build_comparison(baseline, adaptive)
 
-            root_summary = load_json(adaptive / "final_summary.json")
-            root_summary["run_config_fingerprint"] = fingerprint
-            for model in MODELS:
-                summary = load_json(adaptive / model / "final_summary.json")
-                summary["run_config_fingerprint"] = fingerprint
-                summary["slaclip_q"]["contract"] = copy.deepcopy(slaclip)
-                private_json(adaptive / model / "final_summary.json", summary)
-                root_summary["models"][model] = summary
-            private_json(adaptive / "final_summary.json", root_summary)
-            with self.assertRaisesRegex(RuntimeError, "calibration contract"):
-                build_comparison(baseline, adaptive, calibration)
+    def test_client_slack_release_tampering_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            baseline, adaptive = build_fixture(Path(raw_root))
+            shard_path = (
+                adaptive
+                / "bert"
+                / "private_diagnostics"
+                / "rounds"
+                / "round-00001.json"
+            )
+            shard = load_json(shard_path)
+            shard["client_records"][0]["gradient_groups"]["A"]["slaclip"][
+                "noisy_slack"
+            ][-1] += 0.2
+            private_json(shard_path, shard)
+            with self.assertRaisesRegex(RuntimeError, "noisy CDF does not reconcile"):
+                build_comparison(baseline, adaptive)
 
-    def test_controller_target_or_bounds_tampering_fails_closed(self) -> None:
-        mutations = (
-            ("target_clip_fraction", 0.99, "controller target mismatch"),
-            ("next_clip_threshold", 100.0, "SlaClip-Q formula mismatch"),
-            ("raw_log_update", 0.5, "SlaClip-Q formula mismatch"),
-        )
-        for field, value, expected in mutations:
+    def test_fixed_target_or_calibration_contract_is_rejected(self) -> None:
+        for field in ("target_spec", "calibration"):
             with self.subTest(field=field):
                 with tempfile.TemporaryDirectory() as raw_root:
-                    root = Path(raw_root)
-                    baseline, adaptive, calibration = build_fixture(root)
-                    shard_path = (
-                        adaptive
-                        / "bert"
-                        / "private_diagnostics"
-                        / "rounds"
-                        / "round-00001.json"
-                    )
-                    shard = load_json(shard_path)
-                    shard["round_summary"]["slaclip_controller"]["A"][field] = value
-                    private_json(shard_path, shard)
-                    with self.assertRaisesRegex(RuntimeError, expected):
-                        build_comparison(baseline, adaptive, calibration)
+                    baseline, adaptive = build_fixture(Path(raw_root))
+                    contract = load_json(adaptive / "run_config.json")[
+                        "scientific_contract"
+                    ]["algorithm_contract"]["slaclip"]
+                    contract[field] = {"legacy": True}
+                    rewrite_adaptive_contract(adaptive, contract)
+                    with self.assertRaisesRegex(
+                        RuntimeError, "must not contain fixed-target field"
+                    ):
+                        build_comparison(baseline, adaptive)
+
+    def test_endpoint_index_contract_tampering_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            baseline, adaptive = build_fixture(Path(raw_root))
+            contract = load_json(adaptive / "run_config.json")[
+                "scientific_contract"
+            ]["algorithm_contract"]["slaclip"]
+            contract["controller"]["near_zero_index"] = 0
+            rewrite_adaptive_contract(adaptive, contract)
+            with self.assertRaisesRegex(RuntimeError, "near-zero endpoint index"):
+                build_comparison(baseline, adaptive)
 
     def test_adaptive_adapter_tampering_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
-            root = Path(raw_root)
-            baseline, adaptive, calibration = build_fixture(root)
+            baseline, adaptive = build_fixture(Path(raw_root))
             adapter = (
                 adaptive / "gpt2" / "final_adapter" / "adapter_model.safetensors"
             )
             adapter.write_bytes(b"tampered")
             os.chmod(adapter, 0o600)
             with self.assertRaisesRegex(RuntimeError, "adapter checksum mismatch"):
-                build_comparison(baseline, adaptive, calibration)
+                build_comparison(baseline, adaptive)
 
 
 if __name__ == "__main__":

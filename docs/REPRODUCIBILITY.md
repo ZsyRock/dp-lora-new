@@ -170,7 +170,7 @@ equivalent to each other or to the unpublished paper protocol.
 
 ## Required controls and repetitions
 
-Every benchmark study must evaluate these four arms through the identical
+Every benchmark study must evaluate these four controls through the identical
 data and evaluation pipeline:
 
 | Arm | Training mechanism |
@@ -184,6 +184,12 @@ Apart from the mechanism difference in the table, model revision, LoRA
 configuration, client partitions, batch selection policy, rounds, local steps,
 learning rate, context length, and evaluator must remain fixed. Any unavoidable
 difference must be named in the result.
+
+A claim about the adaptive extension must additionally evaluate
+`slaclip_dp_lora` against its matched `paper_dp_lora` arm with the same initial
+threshold, seed, examples, supervision masks, and standardized Gaussian-noise
+draws.  The active extension is full SlaClip; an older fixed-target run is not
+an acceptable substitute.
 
 Use at least three independent training seeds for every stochastic trained arm
 and report each seed plus mean, standard deviation, and sample count. More
@@ -208,26 +214,69 @@ information to establish equivalence, the computed budget must be labelled as
 the repository's reconstructed privacy accounting rather than the authors'
 budget.
 
-### SlaClip-Q extension boundary
+### Full SlaClip extension boundary
 
-The repository's fixed-target adaptive arm is `slaclip_q_dp_lora`. It is the
-SlaClip-Q ablation, not full SlaClip: for every model and LoRA A/B group it
-uses `gamma = 1 - q_target` and updates the clipping threshold only after all
-clients in a round have completed. Its target is the median of the matched
-fixed-threshold baseline's per-round actual clipping fractions for that same
-model/group. The calibration manifest binds the baseline configuration,
-summaries, complete round-shard prefix, reducer, targets, and hashes.
+The active adaptive arm is `slaclip_dp_lora`.  For each model and LoRA A/B
+group, its K-slot noisy slack release provides two CDF proxies:
+`q_hat = s_hat[0]` near the current threshold and
+`r_hat = s_hat[K-1]` near zero.  Following the pinned full-SlaClip controller,
+it computes
+
+```text
+z_hat   = r_hat / (C_t + 1e-6)
+gamma_t = clip(1 - beta * (1 - z_hat), 0, 1)
+C_{t+1} = clip(C_t * exp(eta * (gamma_t - q_hat)), C_min, C_max)
+```
+
+All five clients in a round use the same `C_t`; the new threshold takes effect
+only in the next round.  Only the *noisy* endpoints drive the update.  The
+exact CDF proxy, raw gradient norms, and actual clipping fractions are written
+only as `NON_DP_PRIVATE_DIAGNOSTIC` telemetry and must not be presented as DP
+releases.  Full SlaClip has no fixed clipping target, target file, or
+baseline-derived calibration stage.
 
 The slack coordinates and clipped gradient form one bounded vector per client
 and group and receive independent Gaussian coordinates at scale `sigma*C_t`.
-This preserves the intended joint-release construction inside the declared
-federated adaptation, but it does not supply the missing end-to-end accountant.
-Moreover, selecting `q_target` from exact baseline diagnostics is itself a
-data-dependent non-DP calibration step. Therefore the current SlaClip-Q study
-must retain `NON_DP_PRIVATE_DIAGNOSTIC`, `epsilon=null`, and
-`end_to_end_dp_certified=false`. A privacy claim would require a public or
-independent calibration set, or a separately private target release and full
-composition analysis.
+This retains the joint-release construction inside the declared federated
+adaptation, but it does not establish the missing end-to-end accountant.  In
+particular, the original construction is adapted here to five client
+aggregate-gradient records rather than a standard per-sample DP-SGD batch, and
+the requested `K_slots=15` small-batch policy exceeds the automatic SNR bound
+implied by five released records at `sigma=2`.  Consequently all current full
+SlaClip results must retain `epsilon=null`,
+`end_to_end_dp_certified=false`, and the Level-1 claim boundary.
+
+Baseline-derived fixed targets may still be mentioned by old artifacts so
+that historical runs remain interpretable.  That ablation is not an active
+method, is not included in the current campaign, and must not be recommended
+or launched as evidence for the full-SlaClip extension.
+
+## Current single-job Level-1 campaign
+
+The checked-in campaign specification contains 60 resumable runner arms in one
+Slurm allocation on one node.  Two GPU lanes consume the manifest without job
+arrays or nested submissions.  Each runner arm trains both BERT-base and GPT-2
+small, producing 120 model-level training executions:
+
+| Family | Runner-arm matrix | Count |
+| --- | --- | ---: |
+| Primary matched study | `paper_dp_lora` and `slaclip_dp_lora`; paper initialization sweep `C_0 in {0.1, 1, 5, 10, 20}`; seeds `42, 43, 44` | 30 |
+| Full-SlaClip sensitivity | `C_0=10`; seeds `42..44`; `eta in {0.05, 0.1, 0.2}` x `beta in {0.5, 0.9, 0.99}`, excluding the primary default `(0.2, 0.5)` | 24 |
+| Mechanism controls | `no_dp_lora_control` and `clip_only_control`; `C_0=10`; seeds `42..44` | 6 |
+
+The common formal settings remain five clients, 50 rounds, batch size 8,
+`sigma=2`, learning rate `5e-4`, and LoRA rank 512.  Full SlaClip uses
+`K_slots=15`, `C_min=0.1`, and `C_max=50`.  Checkpointed per-arm state,
+incremental compact archives, and strict completed-arm validation make the
+same immutable campaign resumable after a wall-time stop.
+
+This matrix measures execution behavior, initialization sensitivity,
+controller sensitivity, and paired internal-loss/clipping trajectories.  It
+does **not** implement the paper's BoolQ, PIQA, WinoGrande, MedQuAD, LiveQA, or
+MEDIQA-Ans evaluators; it does not add ChatGLM2-6B or Llama2-7B; and it does not
+resolve the privacy-accounting omissions.  Until those gates are implemented,
+even a clean campaign completion remains Level 1 rather than a paper benchmark
+reproduction or evidence of an end-to-end certified privacy guarantee.
 
 ## Minimum result package
 

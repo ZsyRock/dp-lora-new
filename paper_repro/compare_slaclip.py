@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Validate and summarize one matched DP-LoRA/SlaClip-Q Level-1 pair.
+"""Validate and summarize one matched DP-LoRA/full-SlaClip Level-1 pair.
 
-The calibration consumed by the adaptive arm is derived from exact baseline
-clipping diagnostics.  Consequently this comparison is deliberately labelled
-non-DP and cannot establish either a paper-result reproduction or an epsilon
-guarantee.  The validator binds the calibration, both completed arms, their
-matched stochastic schedules, and the complete adaptive threshold trajectory.
+Full SlaClip reconstructs a noisy binned CDF and updates the clipping norm
+from its endpoint nearest the current threshold and its endpoint nearest zero.
+There is no baseline-derived calibration and no fixed target clipping rate in
+this comparison.  Exact CDF indicators remain non-DP diagnostic data; only
+the noisy endpoints are permitted to drive the controller.
 """
 
 from __future__ import annotations
@@ -24,53 +24,40 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 try:
-    from paper_repro.calibrate_slaclip import (
-        CALIBRATION_PRIVACY_CLASS,
-        CALIBRATION_REDUCER,
-        DEFAULT_MODELS,
-        LORA_GROUPS,
-        load_and_validate_calibration,
-        round_shard_prefix_sha256,
-    )
     from paper_repro.reproducibility import (
         METHOD_SPECS,
         canonical_json_fingerprint,
     )
-    from paper_repro.slaclip import automatic_num_slots, slaclip_q_update
-except ModuleNotFoundError:  # Support direct execution.
-    from calibrate_slaclip import (  # type: ignore[no-redef]
-        CALIBRATION_PRIVACY_CLASS,
-        CALIBRATION_REDUCER,
-        DEFAULT_MODELS,
-        LORA_GROUPS,
-        load_and_validate_calibration,
-        round_shard_prefix_sha256,
+    from paper_repro.slaclip import (
+        MAX_ABS_LOG_STEP,
+        automatic_num_slots,
+        full_slaclip_update,
+        normalize_noisy_slack,
     )
+except ModuleNotFoundError:  # Support direct execution.
     from reproducibility import (  # type: ignore[no-redef]
         METHOD_SPECS,
         canonical_json_fingerprint,
     )
     from slaclip import (  # type: ignore[no-redef]
+        MAX_ABS_LOG_STEP,
         automatic_num_slots,
-        slaclip_q_update,
+        full_slaclip_update,
+        normalize_noisy_slack,
     )
 
 
 BASELINE_METHOD = "paper_dp_lora"
-ADAPTIVE_METHOD = "slaclip_q_dp_lora"
+ADAPTIVE_METHOD = "slaclip_dp_lora"
 EXPECTED_METHODS = (BASELINE_METHOD, ADAPTIVE_METHOD)
-COMPARISON_SCHEMA_VERSION = 1
-COMPARISON_STATUS = "VALID_MATCHED_DP_LORA_SLACLIP_Q_LEVEL1_COMPARISON"
-TARGET_SPEC_SCHEMA_VERSION = 1
-TARGET_MODE_BASELINE_MEDIAN = "baseline_median"
-TARGET_MODE_EXPLICIT = "explicit_precommitted"
-TARGET_LABEL_BASELINE_MEDIAN = (
-    "current_run_baseline_median_non_dp_private_diagnostic_derived_target"
-)
-TARGET_LABEL_EXPLICIT = (
-    "prior_non_dp_diagnostic_derived_precommitted_hyperparameter"
-)
-TARGET_PRIVACY_CLASS = "NON_DP_DIAGNOSTIC_DERIVED_HYPERPARAMETER"
+DEFAULT_MODELS = ("bert", "gpt2")
+LORA_GROUPS = ("A", "B")
+COMPARISON_SCHEMA_VERSION = 2
+COMPARISON_STATUS = "FULL_SLACLIP_COMPARISON_COMPLETE"
+SLACLIP_CONTRACT_SCHEMA = "full_slaclip_contract_v1"
+SLACLIP_VARIANT = "full_slaclip_cdf_endpoints"
+ROUND_PREFIX_DOMAIN = b"dp-lora-round-shard-prefix-v1\0"
+EXACT_CDF_FLOAT32_TOLERANCE = 1e-6
 
 
 def utc_now() -> str:
@@ -81,7 +68,7 @@ def _absolute_path(path: str | os.PathLike[str]) -> Path:
     raw = Path(os.path.abspath(os.fspath(Path(path).expanduser())))
     if os.path.lexists(raw):
         # Reject a symlink at the requested object itself, while allowing the
-        # canonicalized ancestor alias used by this cluster for /scratch.
+        # cluster's canonicalized /scratch ancestor alias.
         if stat.S_ISLNK(raw.lstat().st_mode):
             return raw
         return raw.resolve(strict=True)
@@ -216,41 +203,42 @@ def _positive_integer(value: Any, description: str) -> int:
 
 
 def _require_claims(
-    run_config: Mapping[str, Any], root_summary: Mapping[str, Any], *, adaptive: bool
+    run_config: Mapping[str, Any],
+    root_summary: Mapping[str, Any],
+    *,
+    adaptive: bool,
 ) -> None:
     reproduction = run_config.get("reproduction_claim")
     if not isinstance(reproduction, dict):
         raise RuntimeError("run config has no reproduction claim")
-    expected_reproduction = {
+    for key, expected in {
         "level": 1,
         "paper_result_reproduced": False,
         "paper_benchmarks_evaluated": False,
-    }
-    for key, expected in expected_reproduction.items():
+    }.items():
         if reproduction.get(key) != expected:
             raise RuntimeError(f"unsafe reproduction claim: {key}")
 
     privacy = run_config.get("privacy_claim")
     if not isinstance(privacy, dict):
         raise RuntimeError("run config has no privacy claim")
-    expected_privacy = {
+    for key, expected in {
         "end_to_end_dp_certified": False,
         "epsilon": None,
         "sigma_is_not_epsilon": True,
         "diagnostics_are_private_non_dp_data": True,
-        "baseline_derived_calibration_is_non_dp": adaptive,
-    }
-    for key, expected in expected_privacy.items():
+        "baseline_derived_calibration_is_non_dp": False,
+        "exact_cdf_diagnostics_are_non_dp": adaptive,
+    }.items():
         if privacy.get(key) != expected:
             raise RuntimeError(f"unsafe privacy claim: {key}")
 
-    expected_root = {
+    for key, expected in {
         "reproduction_claim_level": 1,
         "paper_result_reproduced": False,
         "paper_benchmarks_evaluated": False,
         "privacy_claim": False,
-    }
-    for key, expected in expected_root.items():
+    }.items():
         if root_summary.get(key) != expected:
             raise RuntimeError(f"unsafe root claim: {key}")
 
@@ -278,6 +266,25 @@ def _evaluation_delta(model_summary: Mapping[str, Any], rounds: int) -> dict[str
     }
 
 
+def _round_shard_prefix_sha256(rounds_directory: Path, rounds: int) -> str:
+    _validate_private_directory(rounds_directory, "round diagnostics directory")
+    expected_paths = [
+        rounds_directory / f"round-{round_index:05d}.json"
+        for round_index in range(1, rounds + 1)
+    ]
+    actual_paths = set(rounds_directory.glob("round-*.json"))
+    if actual_paths != set(expected_paths):
+        raise RuntimeError("round shard set mismatch")
+    digest = hashlib.sha256(ROUND_PREFIX_DOMAIN)
+    for path in expected_paths:
+        encoded = _read_private_bytes(path, "round diagnostic shard")
+        digest.update(path.name.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(encoded).digest())
+    digest.update(rounds.to_bytes(8, byteorder="little", signed=False))
+    return digest.hexdigest()
+
+
 def _load_arm(directory: Path, method: str, *, adaptive: bool) -> dict[str, Any]:
     _validate_private_directory(directory, f"{method} run directory")
     run_config, run_config_bytes = _load_private_object(
@@ -287,13 +294,12 @@ def _load_arm(directory: Path, method: str, *, adaptive: bool) -> dict[str, Any]
         directory / "final_summary.json", f"{method} root summary"
     )
     expected_method_spec = asdict(METHOD_SPECS[method])
-    run_identity = {
+    for key, expected in {
         "schema_version": 2,
         "method": method,
         "method_spec": expected_method_spec,
         "contains_slaclip": adaptive,
-    }
-    for key, expected in run_identity.items():
+    }.items():
         if run_config.get(key) != expected:
             raise RuntimeError(f"{method} run-config identity mismatch: {key}")
     contract = run_config.get("scientific_contract")
@@ -319,19 +325,20 @@ def _load_arm(directory: Path, method: str, *, adaptive: bool) -> dict[str, Any]
         raise RuntimeError(f"{method} algorithm contract is missing")
     if algorithm.get("contains_slaclip") is not adaptive:
         raise RuntimeError(f"{method} algorithm SlaClip flag mismatch")
-    slaclip_contract = algorithm.get("slaclip_q")
+    slaclip_contract = algorithm.get("slaclip")
     if adaptive != isinstance(slaclip_contract, dict):
-        raise RuntimeError(f"{method} SlaClip-Q contract presence mismatch")
+        raise RuntimeError(f"{method} full-SlaClip contract presence mismatch")
+    if algorithm.get("slaclip_q") is not None:
+        raise RuntimeError(f"{method} unexpectedly enables legacy SlaClip-Q")
 
-    root_identity = {
+    for key, expected in {
         "schema_version": 2,
         "status": "COMPLETED",
         "method": method,
         "method_spec": expected_method_spec,
         "contains_slaclip": adaptive,
         "run_config_fingerprint": run_fingerprint,
-    }
-    for key, expected in root_identity.items():
+    }.items():
         if root_summary.get(key) != expected:
             raise RuntimeError(f"{method} root-summary identity mismatch: {key}")
     _require_claims(run_config, root_summary, adaptive=adaptive)
@@ -342,11 +349,9 @@ def _load_arm(directory: Path, method: str, *, adaptive: bool) -> dict[str, Any]
     if not isinstance(root_schedules, dict) or tuple(root_schedules) != DEFAULT_MODELS:
         raise RuntimeError(f"{method} root sample-schedule map is invalid")
 
-    model_records: dict[str, Any] = {}
     rounds = _positive_integer(effective.get("rounds"), f"{method} rounds")
-    clients = _positive_integer(
-        effective.get("num_clients"), f"{method} client count"
-    )
+    clients = _positive_integer(effective.get("num_clients"), f"{method} clients")
+    model_records: dict[str, Any] = {}
     for model in DEFAULT_MODELS:
         model_dir = directory / model
         _validate_private_directory(model_dir, f"{method}/{model} output directory")
@@ -355,7 +360,7 @@ def _load_arm(directory: Path, method: str, *, adaptive: bool) -> dict[str, Any]
         )
         if root_models[model] != model_summary:
             raise RuntimeError(f"{method}/{model} root/model summary mismatch")
-        model_identity = {
+        for key, expected in {
             "schema_version": 2,
             "status": "COMPLETED",
             "method": method,
@@ -363,8 +368,7 @@ def _load_arm(directory: Path, method: str, *, adaptive: bool) -> dict[str, Any]
             "privacy_claim": False,
             "run_config_fingerprint": run_fingerprint,
             "client_steps": rounds * clients,
-        }
-        for key, expected in model_identity.items():
+        }.items():
             if model_summary.get(key) != expected:
                 raise RuntimeError(f"{method}/{model} summary mismatch: {key}")
         behavior = model_summary.get("behavior_summary")
@@ -402,12 +406,10 @@ def _load_arm(directory: Path, method: str, *, adaptive: bool) -> dict[str, Any]
         adapter_dir = model_dir / "final_adapter"
         _validate_private_directory(adapter_dir, f"{method}/{model} adapter directory")
         adapter_bytes = _read_private_bytes(
-            adapter_dir / "adapter_model.safetensors",
-            f"{method}/{model} adapter",
+            adapter_dir / "adapter_model.safetensors", f"{method}/{model} adapter"
         )
         adapter_config_bytes = _read_private_bytes(
-            adapter_dir / "adapter_config.json",
-            f"{method}/{model} adapter config",
+            adapter_dir / "adapter_config.json", f"{method}/{model} adapter config"
         )
         adapter_sha = _sha256_bytes(adapter_bytes)
         adapter_config_sha = _sha256_bytes(adapter_config_bytes)
@@ -418,7 +420,6 @@ def _load_arm(directory: Path, method: str, *, adaptive: bool) -> dict[str, Any]
         integrity = model_summary.get("adapter_integrity")
         if not isinstance(integrity, dict) or integrity.get("all_finite") is not True:
             raise RuntimeError(f"{method}/{model} adapter integrity failed")
-
         model_records[model] = {
             "summary": model_summary,
             "summary_sha256": _sha256_bytes(model_summary_bytes),
@@ -431,11 +432,7 @@ def _load_arm(directory: Path, method: str, *, adaptive: bool) -> dict[str, Any]
         }
     return {
         "directory": directory,
-        "run_config": run_config,
-        "run_config_bytes": run_config_bytes,
         "run_config_sha256": _sha256_bytes(run_config_bytes),
-        "root_summary": root_summary,
-        "root_summary_bytes": root_summary_bytes,
         "root_summary_sha256": _sha256_bytes(root_summary_bytes),
         "contract": contract,
         "run_config_fingerprint": run_fingerprint,
@@ -457,268 +454,285 @@ def _normalized_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
         raise RuntimeError("scientific contract cannot be normalized")
     effective.pop("method", None)
     algorithm.pop("contains_slaclip", None)
+    algorithm.pop("slaclip", None)
     algorithm.pop("slaclip_q", None)
     return normalized
 
 
-def _calibration_targets(calibration: Mapping[str, Any]) -> dict[str, dict[str, float]]:
+def _validate_contract(
+    adaptive: Mapping[str, Any], *, baseline_clip_norm: float
+) -> dict[str, Any]:
+    contract = adaptive["slaclip_contract"]
+    assert isinstance(contract, dict)
+    if contract.get("schema_version") != SLACLIP_CONTRACT_SCHEMA:
+        raise RuntimeError("full-SlaClip contract schema mismatch")
+    if contract.get("variant") != SLACLIP_VARIANT:
+        raise RuntimeError("full-SlaClip contract variant mismatch")
+    forbidden_fields = {
+        "calibration",
+        "target_spec",
+        "target_clip_fraction",
+        "target_clip_fraction_by_group",
+    }
+    pending: list[Any] = [contract]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            forbidden = forbidden_fields.intersection(value)
+            if forbidden:
+                field = sorted(forbidden)[0]
+                raise RuntimeError(
+                    f"full SlaClip must not contain fixed-target field: {field}"
+                )
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+    if contract.get("independently_privacy_certified") is not False:
+        raise RuntimeError("full-SlaClip contract makes an unsafe privacy claim")
+    controller = contract.get("controller")
+    if not isinstance(controller, dict):
+        raise RuntimeError("full-SlaClip controller contract is missing")
+    num_slots = _positive_integer(controller.get("num_slots"), "SlaClip slots")
+    eta = _finite_number(controller.get("eta"), "SlaClip eta")
+    beta = _finite_number(controller.get("beta"), "SlaClip beta")
+    lower = _finite_number(controller.get("c_min"), "SlaClip lower bound")
+    upper = _finite_number(controller.get("c_max"), "SlaClip upper bound")
+    epsilon = _finite_number(controller.get("epsilon"), "SlaClip endpoint epsilon")
+    initial = _finite_number(
+        controller.get("initial_clip_threshold"), "SlaClip initial threshold"
+    )
+    if eta < 0.0 or not 0.0 <= beta <= 1.0 or epsilon <= 0.0:
+        raise RuntimeError("full-SlaClip controller parameters are invalid")
+    if lower <= 0.0 or upper < lower or not lower <= initial <= upper:
+        raise RuntimeError("full-SlaClip threshold contract is invalid")
+    if initial != baseline_clip_norm:
+        raise RuntimeError("adaptive initial C differs from baseline C")
+    if controller.get("near_threshold_index") != 0:
+        raise RuntimeError("full-SlaClip near-threshold endpoint index mismatch")
+    if controller.get("near_zero_index") != num_slots - 1:
+        raise RuntimeError("full-SlaClip near-zero endpoint index mismatch")
+    if controller.get("numerical_log_step_bounds") != [
+        -MAX_ABS_LOG_STEP,
+        MAX_ABS_LOG_STEP,
+    ]:
+        raise RuntimeError("full-SlaClip numerical log-step bound mismatch")
+    if controller.get("expected_release_records") != adaptive["clients"]:
+        raise RuntimeError("full-SlaClip release count mismatch")
+    effective = adaptive["effective_config"]
+    local_batch_size = _positive_integer(
+        effective.get("batch_size"), "SlaClip local batch size"
+    )
+    noise_multiplier = _finite_number(
+        effective.get("noise_multiplier"), "SlaClip noise multiplier"
+    )
+    automatic_slots = automatic_num_slots(adaptive["clients"], noise_multiplier)
+    theoretical_noise = noise_multiplier * math.sqrt(
+        num_slots / adaptive["clients"]
+    )
+    expected_audit = {
+        "local_batch_size": local_batch_size,
+        "num_clients": adaptive["clients"],
+        "automatic_release_num_slots": automatic_slots,
+        "explicit_num_slots_exceeds_automatic_release_bound": bool(
+            controller.get("num_slots_selection") != "automatic_monotonicity_rule"
+            and num_slots > automatic_slots
+        ),
+        "normalized_proxy_noise_std_formula": (
+            "noise_multiplier*sqrt(num_slots/num_clients)"
+        ),
+        "controller_inputs": "noisy_joint_release_endpoints_only",
+    }
+    for key, expected in expected_audit.items():
+        if controller.get(key) != expected:
+            raise RuntimeError(f"full-SlaClip K/noise audit mismatch: {key}")
+    recorded_noise = _finite_number(
+        controller.get("normalized_proxy_noise_std_per_slot_theoretical"),
+        "SlaClip theoretical endpoint noise",
+    )
+    if not math.isclose(
+        recorded_noise, theoretical_noise, rel_tol=1e-12, abs_tol=1e-12
+    ):
+        raise RuntimeError("full-SlaClip K/noise audit mismatch: theoretical noise")
     return {
-        model: {
-            group: float(
-                calibration["models"][model]["groups"][group][
-                    "target_clip_fraction"
-                ]
+        "num_slots": num_slots,
+        "eta": eta,
+        "beta": beta,
+        "min_clip_norm": lower,
+        "max_clip_norm": upper,
+        "epsilon": epsilon,
+        "initial_clip_norm": initial,
+        "theoretical_endpoint_noise_std": theoretical_noise,
+    }
+
+
+def _finite_vector(value: Any, length: int, description: str) -> list[float]:
+    if not isinstance(value, list) or len(value) != length:
+        raise RuntimeError(f"{description} must contain exactly {length} values")
+    return [_finite_number(item, description) for item in value]
+
+
+def _validate_exact_cdf_range(values: Sequence[float], description: str) -> None:
+    """Accept only the tiny endpoint overshoot caused by float32 slack storage."""
+
+    if any(
+        item < -EXACT_CDF_FLOAT32_TOLERANCE
+        or item > 1.0 + EXACT_CDF_FLOAT32_TOLERANCE
+        for item in values
+    ):
+        raise RuntimeError(f"{description} must lie within float32 tolerance of [0, 1]")
+
+
+def _reconstruct_round_release(
+    client_records: Sequence[Mapping[str, Any]],
+    *,
+    group: str,
+    threshold: float,
+    num_slots: int,
+    description: str,
+) -> dict[str, Any]:
+    """Rebuild both CDF proxies directly from the protected client releases."""
+
+    noisy_releases: list[list[float]] = []
+    signal_releases: list[list[float]] = []
+    clipped: list[bool] = []
+    slack_noise_stds: list[float] = []
+    for client_index, record in enumerate(client_records):
+        gradient_groups = record.get("gradient_groups")
+        statistics = (
+            gradient_groups.get(group)
+            if isinstance(gradient_groups, dict)
+            else None
+        )
+        if not isinstance(statistics, dict):
+            raise RuntimeError(
+                f"{description} client {client_index} gradient group is missing"
             )
-            for group in LORA_GROUPS
-        }
-        for model in DEFAULT_MODELS
-    }
-
-
-def _validated_target_map(
-    value: Any, description: str
-) -> dict[str, dict[str, float]]:
-    if not isinstance(value, dict) or tuple(value) != DEFAULT_MODELS:
-        raise RuntimeError(f"{description} model set/order mismatch")
-    result: dict[str, dict[str, float]] = {}
-    for model in DEFAULT_MODELS:
-        groups = value.get(model)
-        if not isinstance(groups, dict) or tuple(groups) != LORA_GROUPS:
-            raise RuntimeError(f"{description} {model} group set/order mismatch")
-        result[model] = {
-            group: _fraction(
-                groups.get(group), f"{description} {model}/{group} fraction"
+        if statistics.get("clip_threshold") != threshold:
+            raise RuntimeError(
+                f"{description} client {client_index} threshold mismatch"
             )
-            for group in LORA_GROUPS
-        }
-    return result
-
-
-def _active_target_spec(
-    slaclip_contract: Mapping[str, Any],
-    calibration_targets: dict[str, dict[str, float]],
-) -> tuple[dict[str, dict[str, float]], dict[str, Any] | None]:
-    """Validate current target metadata, or accept the historical schema."""
-
-    raw_spec = slaclip_contract.get("target_spec")
-    if raw_spec is None:
-        # Historical contracts used calibration.targets directly.
-        return calibration_targets, None
-    expected_keys = {
-        "schema_version",
-        "mode",
-        "label",
-        "privacy_class",
-        "precommitted_before_adaptive_training",
-        "targets",
-    }
-    if not isinstance(raw_spec, dict) or set(raw_spec) != expected_keys:
-        raise RuntimeError("adaptive SlaClip-Q target-spec schema mismatch")
-    if raw_spec.get("schema_version") != TARGET_SPEC_SCHEMA_VERSION:
-        raise RuntimeError("adaptive SlaClip-Q target-spec version mismatch")
-    mode = raw_spec.get("mode")
-    expected_labels = {
-        TARGET_MODE_BASELINE_MEDIAN: TARGET_LABEL_BASELINE_MEDIAN,
-        TARGET_MODE_EXPLICIT: TARGET_LABEL_EXPLICIT,
-    }
-    if mode not in expected_labels:
-        raise RuntimeError("adaptive SlaClip-Q target-spec mode mismatch")
-    if raw_spec.get("label") != expected_labels[mode]:
-        raise RuntimeError("adaptive SlaClip-Q target-spec label mismatch")
-    if raw_spec.get("privacy_class") != TARGET_PRIVACY_CLASS:
-        raise RuntimeError("adaptive SlaClip-Q target-spec privacy class mismatch")
-    if raw_spec.get("precommitted_before_adaptive_training") is not True:
-        raise RuntimeError("adaptive SlaClip-Q targets were not precommitted")
-    targets = _validated_target_map(
-        raw_spec.get("targets"), "adaptive SlaClip-Q target spec"
-    )
-    if mode == TARGET_MODE_BASELINE_MEDIAN and targets != calibration_targets:
-        raise RuntimeError(
-            "adaptive baseline-median target spec differs from calibration"
-        )
-    return targets, copy.deepcopy(raw_spec)
-
-
-def _validate_calibration_binding(
-    calibration_path: Path,
-    calibration: Mapping[str, Any],
-    baseline: Mapping[str, Any],
-    adaptive: Mapping[str, Any],
-) -> tuple[
-    str,
-    dict[str, dict[str, float]],
-    dict[str, dict[str, float]],
-    dict[str, Any] | None,
-]:
-    calibration_bytes = _read_private_bytes(
-        calibration_path, "SlaClip calibration"
-    )
-    calibration_sha = _sha256_bytes(calibration_bytes)
-    source = calibration["source"]
-    baseline_source_expected = {
-        "method": BASELINE_METHOD,
-        "baseline_dir": str(baseline["directory"]),
-        "run_config_fingerprint": baseline["run_config_fingerprint"],
-        "run_config_sha256": baseline["run_config_sha256"],
-        "root_final_summary_sha256": baseline["root_summary_sha256"],
-        "repository_sha": baseline["contract"].get("repository_sha"),
-    }
-    if source != baseline_source_expected:
-        raise RuntimeError("calibration source evidence does not match the baseline")
-    if adaptive["contract"].get("repository_sha") != source["repository_sha"]:
-        raise RuntimeError("adaptive repository SHA differs from calibration source")
-
-    for model in DEFAULT_MODELS:
-        calibration_model = calibration["models"][model]
-        baseline_model = baseline["models"][model]
-        if calibration_model["model_final_summary_sha256"] != baseline_model[
-            "summary_sha256"
-        ]:
-            raise RuntimeError(f"calibration {model} model-summary evidence mismatch")
-        baseline_prefix = baseline_model["summary"].get(
-            "round_shard_prefix_sha256"
-        )
-        if calibration_model["round_shard_prefix_sha256"] != baseline_prefix:
-            raise RuntimeError(f"calibration {model} round-prefix evidence mismatch")
-        recomputed_prefix = round_shard_prefix_sha256(
-            baseline["directory"] / model / "private_diagnostics" / "rounds",
-            baseline["rounds"],
-        )
-        if recomputed_prefix != baseline_prefix:
-            raise RuntimeError(f"baseline {model} round-prefix changed after calibration")
+        telemetry = statistics.get("slaclip")
         if (
-            calibration_model["rounds"] != baseline["rounds"]
-            or calibration_model["clients_per_round"] != baseline["clients"]
+            not isinstance(telemetry, dict)
+            or telemetry.get("variant") != SLACLIP_VARIANT
+            or telemetry.get("num_slots") != num_slots
+            or telemetry.get("joint_sensitivity_bound_passed") is not True
         ):
-            raise RuntimeError(f"calibration {model} schedule evidence mismatch")
+            raise RuntimeError(
+                f"{description} client {client_index} joint release is invalid"
+            )
+        noisy_releases.append(
+            _finite_vector(
+                telemetry.get("noisy_slack"),
+                num_slots,
+                f"{description} client {client_index} noisy slack",
+            )
+        )
+        signal_releases.append(
+            _finite_vector(
+                telemetry.get("slack_signal"),
+                num_slots,
+                f"{description} client {client_index} slack signal",
+            )
+        )
+        slack_noise_stds.append(
+            _finite_number(
+                telemetry.get("slack_noise_std_per_coordinate"),
+                f"{description} client {client_index} slack noise std",
+            )
+        )
+        if not isinstance(statistics.get("clipped"), bool):
+            raise RuntimeError(
+                f"{description} client {client_index} clipping flag is invalid"
+            )
+        clipped.append(bool(statistics["clipped"]))
 
-    calibration_targets = _calibration_targets(calibration)
-    slaclip_contract = adaptive["slaclip_contract"]
-    assert isinstance(slaclip_contract, dict)
-    expected_contract_calibration = {
-        "privacy_class": CALIBRATION_PRIVACY_CLASS,
-        "calibration_fingerprint": calibration["calibration_fingerprint"],
-        "file_sha256": calibration_sha,
-        "source": source,
-        "reducer": CALIBRATION_REDUCER,
-        "targets": calibration_targets,
-    }
-    if slaclip_contract.get("calibration") != expected_contract_calibration:
-        raise RuntimeError("adaptive calibration contract does not match its file")
-    if slaclip_contract.get("independently_privacy_certified") is not False:
-        raise RuntimeError("adaptive SlaClip-Q contract makes an unsafe privacy claim")
-    active_targets, target_spec = _active_target_spec(
-        slaclip_contract, calibration_targets
+    client_count = len(client_records)
+    noisy_sum = [
+        math.fsum(release[slot] for release in noisy_releases)
+        for slot in range(num_slots)
+    ]
+    signal_sum = [
+        math.fsum(release[slot] for release in signal_releases)
+        for slot in range(num_slots)
+    ]
+    noisy = list(
+        normalize_noisy_slack(noisy_sum, threshold, num_slots, client_count)
     )
-    return calibration_sha, calibration_targets, active_targets, target_spec
+    exact = list(
+        normalize_noisy_slack(signal_sum, threshold, num_slots, client_count)
+    )
+    if any(value < 0.0 for value in slack_noise_stds) or len(
+        set(slack_noise_stds)
+    ) != 1:
+        raise RuntimeError(f"{description} client slack noise scales disagree")
+    slack_lambda = threshold / math.sqrt(num_slots)
+    normalized_noise = (
+        slack_noise_stds[0]
+        * math.sqrt(client_count)
+        / (slack_lambda * client_count)
+    )
+    return {
+        "noisy": noisy,
+        "exact": exact,
+        "actual_clip_fraction": sum(clipped) / client_count,
+        "normalized_proxy_noise_std_per_slot": normalized_noise,
+    }
+
+
+def _runner_update_fields(recomputed: Mapping[str, Any]) -> dict[str, Any]:
+    expected = dict(recomputed)
+    expected["unbounded_next_clip_threshold"] = expected.pop(
+        "unbounded_next_clip_norm"
+    )
+    expected["next_clip_threshold"] = expected.pop("next_clip_norm")
+    expected["c_min"] = expected.pop("min_clip_norm")
+    expected["c_max"] = expected.pop("max_clip_norm")
+    expected.pop("current_clip_norm", None)
+    return expected
+
+
+def _validate_update_fields(
+    recorded: Mapping[str, Any], recomputed: Mapping[str, Any], description: str
+) -> dict[str, Any]:
+    expected_fields = _runner_update_fields(recomputed)
+    for key, expected in expected_fields.items():
+        if recorded.get(key) != expected:
+            raise RuntimeError(f"{description} full-SlaClip formula mismatch: {key}")
+    return expected_fields
 
 
 def _validate_controller_trajectory(
-    adaptive: Mapping[str, Any],
-    *,
-    model: str,
-    targets: Mapping[str, float],
-    baseline_clip_norm: float,
+    adaptive: Mapping[str, Any], *, model: str, baseline_clip_norm: float
 ) -> dict[str, Any]:
-    slaclip_contract = adaptive["slaclip_contract"]
-    assert isinstance(slaclip_contract, dict)
-    if slaclip_contract.get("variant") != "SlaClip-Q_fixed_target":
-        raise RuntimeError("adaptive SlaClip-Q variant mismatch")
-    controller = slaclip_contract.get("controller")
-    if not isinstance(controller, dict):
-        raise RuntimeError("adaptive controller contract is missing")
-    eta = _finite_number(controller.get("eta"), "SlaClip-Q eta")
-    if eta < 0.0:
-        raise RuntimeError("SlaClip-Q eta must be non-negative")
-    num_slots = _positive_integer(controller.get("num_slots"), "SlaClip-Q slots")
-    c_min = _finite_number(controller.get("c_min"), "SlaClip-Q lower bound")
-    c_max = _finite_number(controller.get("c_max"), "SlaClip-Q upper bound")
-    initial = _finite_number(
-        controller.get("initial_clip_threshold"), "SlaClip-Q initial threshold"
-    )
-    if c_min <= 0.0 or c_max < c_min or not c_min <= initial <= c_max:
-        raise RuntimeError("SlaClip-Q threshold contract is invalid")
-    if initial != baseline_clip_norm:
-        raise RuntimeError("adaptive initial threshold differs from baseline C")
-    if controller.get("expected_release_records") != adaptive["clients"]:
-        raise RuntimeError("adaptive controller release count mismatch")
-    audit_fields = {
-        "local_batch_size",
-        "num_clients",
-        "automatic_release_num_slots",
-        "explicit_num_slots_exceeds_automatic_release_bound",
-        "normalized_proxy_noise_std_per_slot_theoretical",
-        "normalized_proxy_noise_std_formula",
-        "controlled_slot_index",
-    }
-    present_audit_fields = audit_fields.intersection(controller)
-    if present_audit_fields and present_audit_fields != audit_fields:
-        raise RuntimeError("adaptive controller K/noise audit fields are incomplete")
-    if present_audit_fields:
-        effective = adaptive["effective_config"]
-        local_batch_size = _positive_integer(
-            effective.get("batch_size"), "adaptive local batch size"
-        )
-        noise_multiplier = _finite_number(
-            effective.get("noise_multiplier"), "adaptive noise multiplier"
-        )
-        automatic_slots = automatic_num_slots(
-            adaptive["clients"], noise_multiplier
-        )
-        theoretical_proxy_std = noise_multiplier * math.sqrt(
-            num_slots / adaptive["clients"]
-        )
-        expected_exceeds = bool(
-            controller.get("num_slots_selection") == "explicit"
-            and num_slots > automatic_slots
-        )
-        expected_audit_values = {
-            "local_batch_size": local_batch_size,
-            "num_clients": adaptive["clients"],
-            "automatic_release_num_slots": automatic_slots,
-            "explicit_num_slots_exceeds_automatic_release_bound": expected_exceeds,
-            "normalized_proxy_noise_std_formula": (
-                "noise_multiplier*sqrt(num_slots/num_clients)"
-            ),
-            "controlled_slot_index": 0,
-        }
-        for key, expected in expected_audit_values.items():
-            if controller.get(key) != expected:
-                raise RuntimeError(
-                    f"adaptive controller K/noise audit mismatch: {key}"
-                )
-        recorded_proxy_std = _finite_number(
-            controller.get("normalized_proxy_noise_std_per_slot_theoretical"),
-            "adaptive theoretical proxy noise",
-        )
-        if not math.isclose(
-            recorded_proxy_std,
-            theoretical_proxy_std,
-            rel_tol=1e-12,
-            abs_tol=1e-12,
-        ):
-            raise RuntimeError(
-                "adaptive controller K/noise audit mismatch: theoretical proxy noise"
-            )
-
-    rounds_dir = (
-        adaptive["directory"] / model / "private_diagnostics" / "rounds"
-    )
+    parameters = _validate_contract(adaptive, baseline_clip_norm=baseline_clip_norm)
+    num_slots = parameters["num_slots"]
+    rounds_dir = adaptive["directory"] / model / "private_diagnostics" / "rounds"
     _validate_private_directory(rounds_dir, f"adaptive/{model} rounds directory")
-    expected_thresholds = {group: initial for group in LORA_GROUPS}
+    expected_thresholds = {
+        group: parameters["initial_clip_norm"] for group in LORA_GROUPS
+    }
     trajectory: list[dict[str, Any]] = []
+    accumulators = {
+        group: {
+            "actual_clip_fractions": [],
+            "dynamic_targets": [],
+            "gamma_clamped_rounds": 0,
+            "threshold_bound_hit_rounds": 0,
+        }
+        for group in LORA_GROUPS
+    }
     for round_index in range(1, adaptive["rounds"] + 1):
         shard, _ = _load_private_object(
             rounds_dir / f"round-{round_index:05d}.json",
             f"adaptive/{model} round shard",
         )
-        shard_identity = {
+        for key, expected in {
             "schema_version": 2,
             "method": ADAPTIVE_METHOD,
             "model": model,
             "round": round_index,
-        }
-        for key, expected in shard_identity.items():
+        }.items():
             if shard.get(key) != expected:
                 raise RuntimeError(
                     f"adaptive/{model} round shard identity mismatch: {key}"
@@ -726,23 +740,39 @@ def _validate_controller_trajectory(
         round_summary = shard.get("round_summary")
         if not isinstance(round_summary, dict) or round_summary.get("round") != round_index:
             raise RuntimeError(f"adaptive/{model} round summary is invalid")
+        client_records = shard.get("client_records")
+        if (
+            not isinstance(client_records, list)
+            or len(client_records) != adaptive["clients"]
+            or any(not isinstance(record, dict) for record in client_records)
+            or [record.get("client") for record in client_records]
+            != list(range(adaptive["clients"]))
+        ):
+            raise RuntimeError(
+                f"adaptive/{model} protected client releases are missing or reordered"
+            )
         value = round_summary.get("slaclip_controller")
         if not isinstance(value, dict):
             raise RuntimeError(f"adaptive/{model} controller round is missing")
         expected_header = {
-            "variant": "SlaClip-Q",
+            "variant": SLACLIP_VARIANT,
             "update_timing": "once_after_all_clients_for_use_in_next_round",
             "clients": adaptive["clients"],
-            "num_slots": num_slots,
-            "eta": eta,
-            "c_min": c_min,
-            "c_max": c_max,
+            "num_slots": parameters["num_slots"],
+            "eta": parameters["eta"],
+            "beta": parameters["beta"],
+            "epsilon": parameters["epsilon"],
+            "near_threshold_index": 0,
+            "near_zero_index": parameters["num_slots"] - 1,
+            "c_min": parameters["min_clip_norm"],
+            "c_max": parameters["max_clip_norm"],
         }
         for key, expected in expected_header.items():
             if value.get(key) != expected:
                 raise RuntimeError(
                     f"adaptive/{model} controller header mismatch: {key}"
                 )
+
         for group in LORA_GROUPS:
             group_value = value.get(group)
             if not isinstance(group_value, dict):
@@ -755,121 +785,128 @@ def _validate_controller_trajectory(
                 raise RuntimeError(
                     f"adaptive/{model}/{group} threshold trajectory is discontinuous"
                 )
-            target = _fraction(
-                group_value.get("target_clip_fraction"),
-                f"adaptive/{model}/{group} target",
+            noisy = _finite_vector(
+                group_value.get("noisy_cdf_proxy_by_slot"),
+                num_slots,
+                f"adaptive/{model}/{group} noisy CDF",
             )
-            if target != targets[group]:
-                raise RuntimeError(
-                    f"adaptive/{model}/{group} controller target mismatch"
-                )
-            if group_value.get("target_clipped_fraction") != target:
-                raise RuntimeError(
-                    f"adaptive/{model}/{group} update target mismatch"
-                )
-            target_unclipped = _finite_number(
-                group_value.get("target_unclipped_proxy"),
-                f"adaptive/{model}/{group} unclipped target",
+            exact = _finite_vector(
+                group_value.get("exact_cdf_proxy_by_slot"),
+                num_slots,
+                f"adaptive/{model}/{group} exact CDF",
             )
-            if not math.isclose(target_unclipped, 1.0 - target, abs_tol=1e-15):
+            reconstructed = _reconstruct_round_release(
+                client_records,
+                group=group,
+                threshold=used,
+                num_slots=num_slots,
+                description=f"adaptive/{model}/{group}",
+            )
+            if noisy != reconstructed["noisy"]:
                 raise RuntimeError(
-                    f"adaptive/{model}/{group} target complement mismatch"
+                    f"adaptive/{model}/{group} noisy CDF does not reconcile "
+                    "with client slack releases"
                 )
-            noisy_slots = group_value.get("noisy_unclipped_proxy_by_slot")
-            if (
-                not isinstance(noisy_slots, list)
-                or len(noisy_slots) != num_slots
-                or any(
-                    not math.isfinite(
-                        _finite_number(item, f"adaptive/{model}/{group} proxy")
+            if exact != reconstructed["exact"]:
+                raise RuntimeError(
+                    f"adaptive/{model}/{group} exact CDF does not reconcile "
+                    "with client slack signals"
+                )
+            _validate_exact_cdf_range(
+                exact,
+                f"adaptive/{model}/{group} exact CDF",
+            )
+            actual = _fraction(
+                group_value.get("actual_clip_fraction"),
+                f"adaptive/{model}/{group} actual clip fraction",
+            )
+            if actual != reconstructed["actual_clip_fraction"]:
+                raise RuntimeError(
+                    f"adaptive/{model}/{group} clipping fraction does not "
+                    "reconcile with client releases"
+                )
+            recomputed = full_slaclip_update(
+                used,
+                noisy[0],
+                noisy[-1],
+                beta=parameters["beta"],
+                eta=parameters["eta"],
+                min_clip_norm=parameters["min_clip_norm"],
+                max_clip_norm=parameters["max_clip_norm"],
+                epsilon=parameters["epsilon"],
+            )
+            recorded_update = _validate_update_fields(
+                group_value,
+                recomputed,
+                f"adaptive/{model}/{group}",
+            )
+            expected_endpoint_telemetry = {
+                "noisy_near_threshold_minus_exact": noisy[0] - exact[0],
+                "noisy_near_zero_minus_exact": noisy[-1] - exact[-1],
+                "noisy_adjacent_monotonicity_violations": sum(
+                    noisy[index + 1] > noisy[index]
+                    for index in range(num_slots - 1)
+                ),
+                "exact_adjacent_monotonicity_violations": sum(
+                    exact[index + 1] > exact[index]
+                    for index in range(num_slots - 1)
+                ),
+                "actual_minus_dynamic_target_clipped": (
+                    actual - float(recorded_update["dynamic_target_clipped"])
+                ),
+            }
+            for key, expected in expected_endpoint_telemetry.items():
+                if group_value.get(key) != expected:
+                    raise RuntimeError(
+                        f"adaptive/{model}/{group} endpoint telemetry mismatch: {key}"
                     )
-                    for item in noisy_slots
-                )
-            ):
-                raise RuntimeError(f"adaptive/{model}/{group} proxy vector is invalid")
-            controller_error = _finite_number(
-                group_value.get("controller_error"),
-                f"adaptive/{model}/{group} controller error",
+            normalized_noise = _finite_number(
+                group_value.get("normalized_proxy_noise_std_per_slot"),
+                f"adaptive/{model}/{group} normalized endpoint noise",
             )
             if not math.isclose(
-                controller_error,
-                target_unclipped - float(noisy_slots[0]),
+                normalized_noise,
+                reconstructed["normalized_proxy_noise_std_per_slot"],
                 rel_tol=1e-12,
                 abs_tol=1e-12,
             ):
                 raise RuntimeError(
-                    f"adaptive/{model}/{group} controller error mismatch"
+                    f"adaptive/{model}/{group} normalized endpoint noise does "
+                    "not reconcile with client releases"
                 )
-            recomputed_update = slaclip_q_update(
-                used,
-                target,
-                float(noisy_slots[0]),
-                eta,
-                c_min,
-                c_max,
-            )
-            expected_update_fields = {
-                "target_clipped_fraction": recomputed_update[
-                    "target_clipped_fraction"
-                ],
-                "target_unclipped_proxy": recomputed_update[
-                    "target_unclipped_proxy"
-                ],
-                "noisy_unclipped_proxy": recomputed_update[
-                    "noisy_unclipped_proxy"
-                ],
-                "controller_error": recomputed_update["controller_error"],
-                "eta": recomputed_update["eta"],
-                "raw_log_update": recomputed_update["raw_log_update"],
-                "bounded_log_update": recomputed_update["bounded_log_update"],
-                "log_update_was_clamped": recomputed_update[
-                    "log_update_was_clamped"
-                ],
-                "unbounded_next_clip_threshold": recomputed_update[
-                    "unbounded_next_clip_norm"
-                ],
-                "next_clip_threshold": recomputed_update["next_clip_norm"],
-                "c_min": recomputed_update["min_clip_norm"],
-                "c_max": recomputed_update["max_clip_norm"],
-                "hit_lower_bound": recomputed_update["hit_lower_bound"],
-                "hit_upper_bound": recomputed_update["hit_upper_bound"],
-            }
-            for key, expected in expected_update_fields.items():
-                if group_value.get(key) != expected:
-                    raise RuntimeError(
-                        f"adaptive/{model}/{group} SlaClip-Q formula mismatch: {key}"
-                    )
-            if group_value.get("c_min") != c_min or group_value.get("c_max") != c_max:
+            if normalized_noise < 0.0:
                 raise RuntimeError(
-                    f"adaptive/{model}/{group} controller bounds mismatch"
+                    f"adaptive/{model}/{group} endpoint noise must be non-negative"
                 )
-            unbounded = _finite_number(
-                group_value.get("unbounded_next_clip_threshold"),
-                f"adaptive/{model}/{group} unbounded threshold",
-            )
-            next_threshold = _finite_number(
-                group_value.get("next_clip_threshold"),
-                f"adaptive/{model}/{group} next threshold",
-            )
-            expected_next = max(c_min, min(c_max, unbounded))
-            if next_threshold != expected_next or not c_min <= next_threshold <= c_max:
-                raise RuntimeError(
-                    f"adaptive/{model}/{group} next threshold violates bounds"
-                )
-            expected_lower_hit = unbounded < c_min
-            expected_upper_hit = unbounded > c_max
-            if (
-                group_value.get("hit_lower_bound") is not expected_lower_hit
-                or group_value.get("hit_upper_bound") is not expected_upper_hit
+            if not math.isclose(
+                normalized_noise,
+                parameters["theoretical_endpoint_noise_std"],
+                rel_tol=1e-12,
+                abs_tol=1e-12,
             ):
                 raise RuntimeError(
-                    f"adaptive/{model}/{group} bound-hit telemetry mismatch"
+                    f"adaptive/{model}/{group} endpoint noise audit mismatch"
                 )
-            expected_thresholds[group] = next_threshold
+            expected_thresholds[group] = _finite_number(
+                recorded_update["next_clip_threshold"],
+                f"adaptive/{model}/{group} next threshold",
+            )
+            accumulator = accumulators[group]
+            accumulator["actual_clip_fractions"].append(actual)
+            accumulator["dynamic_targets"].append(
+                _fraction(
+                    recomputed["dynamic_target_clipped"],
+                    f"adaptive/{model}/{group} dynamic clipped target",
+                )
+            )
+            if recomputed["gamma_clamped_low"] or recomputed["gamma_clamped_high"]:
+                accumulator["gamma_clamped_rounds"] += 1
+            if recomputed["hit_min_clip_norm"] or recomputed["hit_max_clip_norm"]:
+                accumulator["threshold_bound_hit_rounds"] += 1
         trajectory.append(value)
 
     model_summary = adaptive["models"][model]["summary"]
-    prefix = round_shard_prefix_sha256(rounds_dir, adaptive["rounds"])
+    prefix = _round_shard_prefix_sha256(rounds_dir, adaptive["rounds"])
     if model_summary.get("round_shard_prefix_sha256") != prefix:
         raise RuntimeError(f"adaptive/{model} round-prefix mismatch")
     behavior = model_summary["behavior_summary"]
@@ -877,84 +914,79 @@ def _validate_controller_trajectory(
     if not isinstance(controller_summary, dict):
         raise RuntimeError(f"adaptive/{model} controller summary is missing")
     if (
-        controller_summary.get("variant") != "SlaClip-Q"
+        controller_summary.get("variant") != SLACLIP_VARIANT
         or controller_summary.get("rounds") != adaptive["rounds"]
         or controller_summary.get("trajectory_sha256")
         != canonical_json_fingerprint(trajectory)
     ):
         raise RuntimeError(f"adaptive/{model} controller trajectory digest mismatch")
-    controller_groups = controller_summary.get("groups")
-    if not isinstance(controller_groups, dict) or tuple(controller_groups) != LORA_GROUPS:
-        raise RuntimeError(f"adaptive/{model} controller group summary is invalid")
+    model_contract = model_summary.get("slaclip")
+    if not isinstance(model_contract, dict):
+        raise RuntimeError(f"adaptive/{model} full-SlaClip model contract is missing")
+    if model_contract.get("contract") != adaptive["slaclip_contract"]:
+        raise RuntimeError(f"adaptive/{model} full-SlaClip contract mismatch")
+    if model_contract.get("controller_summary") != controller_summary:
+        raise RuntimeError(f"adaptive/{model} controller-summary binding mismatch")
+    if (
+        model_contract.get("final_next_clip_threshold_by_group")
+        != expected_thresholds
+    ):
+        raise RuntimeError(f"adaptive/{model} final threshold map mismatch")
+    if "slaclip_q" in model_summary:
+        raise RuntimeError(f"adaptive/{model} unexpectedly contains legacy SlaClip-Q")
+
+    group_results: dict[str, Any] = {}
     for group in LORA_GROUPS:
-        group_summary = controller_groups[group]
-        if (
-            not isinstance(group_summary, dict)
-            or group_summary.get("target_clip_fraction") != targets[group]
-            or group_summary.get("final_next_clip_threshold")
-            != expected_thresholds[group]
-        ):
-            raise RuntimeError(f"adaptive/{model}/{group} controller summary mismatch")
-    model_contract = model_summary.get("slaclip_q")
-    expected_model_contract = {
-        "contract": slaclip_contract,
-        "target_clip_fraction_by_group": dict(targets),
-        "final_next_clip_threshold_by_group": dict(expected_thresholds),
-        "controller_summary": controller_summary,
-    }
-    if model_contract != expected_model_contract:
-        raise RuntimeError(f"adaptive/{model} SlaClip-Q model contract mismatch")
+        accumulator = accumulators[group]
+        actual_values = accumulator.pop("actual_clip_fractions")
+        target_values = accumulator.pop("dynamic_targets")
+        group_results[group] = {
+            "final_clip_norm": expected_thresholds[group],
+            "mean_actual_clip_fraction": sum(actual_values) / len(actual_values),
+            "mean_dynamic_target_clip_fraction": sum(target_values)
+            / len(target_values),
+            **accumulator,
+        }
     return {
         "rounds": adaptive["rounds"],
         "trajectory_sha256": controller_summary["trajectory_sha256"],
-        "initial_clip_threshold": initial,
-        "final_next_clip_threshold_by_group": dict(expected_thresholds),
-        "target_clip_fraction_by_group": dict(targets),
-        "c_min": c_min,
-        "c_max": c_max,
-        "eta": eta,
-        "num_slots": num_slots,
+        "initial_clip_norm": parameters["initial_clip_norm"],
+        "final_clip_norm_by_group": dict(expected_thresholds),
+        "num_slots": parameters["num_slots"],
+        "eta": parameters["eta"],
+        "beta": parameters["beta"],
+        "epsilon": parameters["epsilon"],
+        "near_threshold_index": 0,
+        "near_zero_index": parameters["num_slots"] - 1,
+        "groups": group_results,
     }
 
 
 def build_comparison(
     baseline_dir: str | os.PathLike[str],
     adaptive_dir: str | os.PathLike[str],
-    calibration_path: str | os.PathLike[str],
 ) -> dict[str, Any]:
-    """Validate the two arms and return a fingerprinted comparison core."""
+    """Validate both arms and return a fingerprinted comparison core."""
 
     baseline_path = _absolute_path(baseline_dir)
     adaptive_path = _absolute_path(adaptive_dir)
-    calibration_file = _absolute_path(calibration_path)
     baseline = _load_arm(baseline_path, BASELINE_METHOD, adaptive=False)
     adaptive = _load_arm(adaptive_path, ADAPTIVE_METHOD, adaptive=True)
     normalized_baseline = _normalized_contract(baseline["contract"])
     normalized_adaptive = _normalized_contract(adaptive["contract"])
     if normalized_baseline != normalized_adaptive:
-        raise RuntimeError("baseline and adaptive arms differ outside SlaClip-Q")
+        raise RuntimeError("baseline and adaptive arms differ outside full SlaClip")
     normalized_fingerprint = canonical_json_fingerprint(normalized_baseline)
-
-    calibration = load_and_validate_calibration(
-        calibration_file,
-        expected_models=DEFAULT_MODELS,
-        expected_source_dir=baseline_path,
-    )
-    (
-        calibration_sha,
-        calibration_target_map,
-        active_target_map,
-        active_target_spec,
-    ) = _validate_calibration_binding(
-        calibration_file, calibration, baseline, adaptive
-    )
     baseline_clip_norm = _finite_number(
         baseline["effective_config"].get("clip_norm"), "baseline clip norm"
     )
-    adaptive_clip_norm = _finite_number(
-        adaptive["effective_config"].get("clip_norm"), "adaptive initial clip norm"
-    )
-    if adaptive_clip_norm != baseline_clip_norm:
+    if (
+        _finite_number(
+            adaptive["effective_config"].get("clip_norm"),
+            "adaptive initial clip norm",
+        )
+        != baseline_clip_norm
+    ):
         raise RuntimeError("adaptive initial C differs from baseline C")
 
     model_comparisons: dict[str, Any] = {}
@@ -968,16 +1000,39 @@ def build_comparison(
         ):
             if baseline_model[field] != adaptive_model[field]:
                 raise RuntimeError(f"{model} {label} do not match")
-        if "slaclip_q" in baseline_model["summary"] or "slaclip_controller" in baseline_model[
-            "summary"
-        ].get("behavior_summary", {}):
+        baseline_summary = baseline_model["summary"]
+        if (
+            "slaclip" in baseline_summary
+            or "slaclip_q" in baseline_summary
+            or "slaclip_controller" in baseline_summary.get("behavior_summary", {})
+        ):
             raise RuntimeError(f"baseline/{model} unexpectedly contains SlaClip")
         controller = _validate_controller_trajectory(
             adaptive,
             model=model,
-            targets=active_target_map[model],
             baseline_clip_norm=baseline_clip_norm,
         )
+        baseline_evaluation = baseline_model["evaluation"]
+        adaptive_evaluation = adaptive_model["evaluation"]
+        if baseline_evaluation["initial"] != adaptive_evaluation["initial"]:
+            raise RuntimeError(f"{model} initial evaluations do not match")
+        paired_evaluation = {
+            "metric": baseline_evaluation["metric"],
+            "baseline_initial": baseline_evaluation["initial"],
+            "baseline_final": baseline_evaluation["final"],
+            "adaptive_initial": adaptive_evaluation["initial"],
+            "adaptive_final": adaptive_evaluation["final"],
+            "adaptive_minus_baseline_final": (
+                adaptive_evaluation["final"] - baseline_evaluation["final"]
+            ),
+            "adaptive_minus_baseline_change": (
+                adaptive_evaluation["final_minus_initial"]
+                - baseline_evaluation["final_minus_initial"]
+            ),
+            "adaptive_has_lower_final_loss": (
+                adaptive_evaluation["final"] < baseline_evaluation["final"]
+            ),
+        }
         model_comparisons[model] = {
             "matched_sample_schedule_sha256": baseline_model[
                 "sample_schedule_sha256"
@@ -988,15 +1043,15 @@ def build_comparison(
             "matched_client_partition_sha256": baseline_model[
                 "client_partition_sha256"
             ],
-            "target_clip_fraction_by_group": active_target_map[model],
             "controller": controller,
+            "paired_internal_holdout": paired_evaluation,
             "arms": {
                 BASELINE_METHOD: {
                     "adapter_sha256": baseline_model["adapter_sha256"],
                     "adapter_config_sha256": baseline_model[
                         "adapter_config_sha256"
                     ],
-                    "clipping": baseline_model["summary"].get("clipping"),
+                    "clipping": baseline_summary.get("clipping"),
                     "internal_holdout": baseline_model["evaluation"],
                 },
                 ADAPTIVE_METHOD: {
@@ -1017,17 +1072,11 @@ def build_comparison(
         "paper_result_reproduced": False,
         "paper_benchmarks_evaluated": False,
         "contains_slaclip": True,
+        "slaclip_variant": SLACLIP_VARIANT,
+        "uses_baseline_calibration": False,
+        "uses_fixed_target_clip_fraction": False,
         "methods_in_order": list(EXPECTED_METHODS),
         "normalized_scientific_contract_sha256": normalized_fingerprint,
-        "calibration_evidence": {
-            "path": str(calibration_file),
-            "file_sha256": calibration_sha,
-            "calibration_fingerprint": calibration["calibration_fingerprint"],
-            "privacy_class": CALIBRATION_PRIVACY_CLASS,
-            "reducer": CALIBRATION_REDUCER,
-            "source": calibration["source"],
-            "target_clip_fraction_by_model_and_group": calibration_target_map,
-        },
         "arm_evidence": {
             BASELINE_METHOD: {
                 "directory": str(baseline_path),
@@ -1047,13 +1096,12 @@ def build_comparison(
             "end_to_end_dp_certified": False,
             "epsilon": None,
             "sigma_is_not_epsilon": True,
-            "data_dependent_baseline_calibration_is_non_dp": True,
-            "exact_diagnostics_are_non_dp_private_data": True,
+            "baseline_calibration_consumed": False,
+            "controller_consumes_noisy_cdf_endpoints": True,
+            "exact_cdf_diagnostics_are_non_dp_private_data": True,
             "adaptive_arm_independently_privacy_certified": False,
         },
     }
-    if active_target_spec is not None:
-        core["active_target_spec"] = active_target_spec
     core["comparison_fingerprint"] = canonical_json_fingerprint(core)
     return core
 
@@ -1096,19 +1144,19 @@ def atomic_create_json(path: Path, value: Mapping[str, Any]) -> None:
         while view:
             written = os.write(descriptor, view)
             if written <= 0:
-                raise OSError("failed to write SlaClip comparison")
+                raise OSError("failed to write full-SlaClip comparison")
             view = view[written:]
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = None
         _validate_private_file_metadata(
-            temporary.lstat(), temporary, "temporary SlaClip comparison"
+            temporary.lstat(), temporary, "temporary full-SlaClip comparison"
         )
         os.link(temporary, destination, follow_symlinks=False)
         temporary.unlink()
         _fsync_directory(destination.parent)
         _validate_private_file_metadata(
-            destination.lstat(), destination, "SlaClip comparison"
+            destination.lstat(), destination, "full-SlaClip comparison"
         )
     except FileExistsError as error:
         raise FileExistsError(
@@ -1125,9 +1173,9 @@ def atomic_create_json(path: Path, value: Mapping[str, Any]) -> None:
 def _validate_existing_comparison(
     path: Path, expected: Mapping[str, Any]
 ) -> dict[str, Any]:
-    existing, _ = _load_private_object(path, "existing SlaClip comparison")
+    existing, _ = _load_private_object(path, "existing full-SlaClip comparison")
     if existing.get("created_at_utc") is None:
-        raise RuntimeError("existing SlaClip comparison timestamp is missing")
+        raise RuntimeError("existing full-SlaClip comparison timestamp is missing")
     stored_fingerprint = existing.get("comparison_fingerprint")
     core = {
         key: value
@@ -1136,9 +1184,9 @@ def _validate_existing_comparison(
     }
     expected_fingerprint = canonical_json_fingerprint(core)
     if stored_fingerprint != expected_fingerprint:
-        raise RuntimeError("existing SlaClip comparison fingerprint mismatch")
+        raise RuntimeError("existing full-SlaClip comparison fingerprint mismatch")
     if stored_fingerprint != expected.get("comparison_fingerprint"):
-        raise RuntimeError("existing SlaClip comparison no longer matches the arms")
+        raise RuntimeError("existing full-SlaClip comparison no longer matches the arms")
     return existing
 
 
@@ -1146,7 +1194,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline-dir", type=Path, required=True)
     parser.add_argument("--adaptive-dir", type=Path, required=True)
-    parser.add_argument("--calibration", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--verify-existing", action="store_true")
     return parser.parse_args(argv)
@@ -1155,9 +1202,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> None:
     os.umask(0o077)
     args = parse_args(argv)
-    comparison = build_comparison(
-        args.baseline_dir, args.adaptive_dir, args.calibration
-    )
+    comparison = build_comparison(args.baseline_dir, args.adaptive_dir)
     output = _absolute_path(args.output)
     if args.verify_existing:
         existing = _validate_existing_comparison(output, comparison)
