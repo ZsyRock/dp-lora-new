@@ -40,6 +40,8 @@ def test_slurm_worker_exports_required_cuda_determinism_contract() -> None:
     assert worker.count("export SLURM_EXPORT_ENV=ALL") == 1
     run_step = worker[worker.index("run_step()") : worker.index('echo "job_id=')]
     assert run_step.count("--export=ALL") == 1
+    assert run_step.count("< /dev/null") == 1
+    assert "consume future wave rows" in run_step
 
 
 def test_compute_step_environment_is_validated_fail_closed(

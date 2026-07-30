@@ -156,6 +156,9 @@ request_stop() {
 trap request_stop USR1 TERM INT
 
 run_step() {
+    # The formal-wave loop reads its manifest from a process-substitution
+    # pipe.  Background srun processes must never inherit that descriptor or
+    # they can consume future wave rows and make the loop end early.
     srun \
         --export=ALL \
         --exact \
@@ -165,7 +168,7 @@ run_step() {
         "--cpus-per-task=$lane_cpus" \
         "--mem=$lane_memory" \
         "--gres=$lane_gres" \
-        "$@"
+        "$@" < /dev/null
 }
 
 echo "job_id=$SLURM_JOB_ID"
