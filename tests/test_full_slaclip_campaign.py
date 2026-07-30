@@ -21,12 +21,15 @@ from paper_repro.full_slaclip_campaign import (
     validated_step_environment,
     validate_or_create_key,
     validate_runtime_manifest,
+    write_development_beta_selection,
 )
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 SPEC = REPOSITORY / "hpc" / "full-slaclip-campaign-spec.json"
+BETA5_SPEC = REPOSITORY / "hpc" / "full-slaclip-beta5-screen-spec.json"
 SLURM_WORKER = REPOSITORY / "hpc" / "full_slaclip_campaign.sbatch"
+BETA5_SUBMITTER = REPOSITORY / "hpc" / "submit_full_slaclip_beta5_screen.sh"
 
 
 def test_slurm_worker_exports_required_cuda_determinism_contract() -> None:
@@ -147,6 +150,120 @@ def test_checked_in_matrix_is_exact_and_contains_no_slaclip_q() -> None:
     assert all(arm["evaluation_seed"] == 2718 for arm in arms)
 
 
+def test_beta5_screen_is_full_slaclip_only_and_has_five_base_targets() -> None:
+    spec = load_spec(BETA5_SPEC)
+    arms = expand_spec(spec)
+    assert len(arms) == 30
+    assert Counter(arm["family"] for arm in arms) == {
+        "primary": 10,
+        "sensitivity": 20,
+    }
+    assert Counter(arm["method"] for arm in arms) == {
+        "paper_dp_lora": 5,
+        "slaclip_dp_lora": 25,
+    }
+    assert {arm["seed"] for arm in arms} == {52, 53, 54, 55, 56}
+    adaptive = [arm for arm in arms if arm["method"] == FULL_SLACLIP_METHOD]
+    candidates = {0.01, 0.03, 0.066, 0.146, 0.5}
+    assert {arm["slaclip_base_target_clipped_fraction"] for arm in adaptive} == candidates
+    assert {arm["slaclip_beta"] for arm in adaptive} == candidates
+    assert all(
+        arm["slaclip_base_target_clipped_fraction"] == arm["slaclip_beta"]
+        for arm in adaptive
+    )
+    assert all(arm["slaclip_eta"] == 0.2 for arm in adaptive)
+    assert all(arm["initial_clip_norm"] == 10.0 for arm in arms)
+    assert all(arm["slaclip_num_slots"] == 15 for arm in adaptive)
+    assert all("slaclip_q" not in arm["method"].lower() for arm in arms)
+    boundary = spec["scientific_boundary"]
+    assert boundary["analysis_role"] == (
+        "development_hyperparameter_screen_not_confirmatory_test"
+    )
+    assert boundary["paper_benchmarks_evaluated"] is False
+    assert "SlaClip-Q" in boundary["excluded_method_family"]
+    assert [(arm["index"], arm["wave"], arm["lane"]) for arm in arms] == [
+        (index, index // 2, index % 2) for index in range(30)
+    ]
+
+
+def test_beta5_submitter_uses_two_l4_lanes_and_development_spec() -> None:
+    submitter = BETA5_SUBMITTER.read_text(encoding="utf-8")
+    assert "DPLORA_FULL_SPEC_RELATIVE=hpc/full-slaclip-beta5-screen-spec.json" in submitter
+    assert "DPLORA_FULL_GPU_GRES=gpu:l4:2" in submitter
+    assert "DPLORA_FULL_PARTITION=l4" in submitter
+    assert "DPLORA_FULL_EXPECTED_GPU=L4" in submitter
+    assert "DPLORA_FULL_WALLTIME=1-12:00:00" in submitter
+    assert "slaclip_q" not in submitter.lower()
+
+
+def test_beta5_development_selection_is_per_model_and_explicitly_not_test(
+    tmp_path: Path,
+) -> None:
+    candidates = [0.01, 0.03, 0.066, 0.146, 0.5]
+    seeds = [52, 53]
+    runtime = {
+        "campaign_name": "test-beta5",
+        "manifest_sha256": "a" * 64,
+        "scientific_boundary": {
+            "analysis_role": "development_hyperparameter_screen_not_confirmatory_test",
+            "candidate_base_target_clipped_fractions": candidates,
+            "development_seeds": seeds,
+        },
+    }
+    metric_rows = []
+    paired_rows = []
+    winners = {"bert": 0.03, "gpt2": 0.146}
+    for model, winner in winners.items():
+        for beta in candidates:
+            for seed in seeds:
+                paired_rows.append(
+                    {
+                        "model": model,
+                        "method": FULL_SLACLIP_METHOD,
+                        "seed": seed,
+                        "slaclip_beta": beta,
+                        "final_loss_difference_slaclip_minus_fixed": (
+                            abs(beta - winner)
+                        ),
+                        "normalized_loss_auc_difference_slaclip_minus_fixed": (
+                            abs(beta - winner) + 0.01
+                        ),
+                    }
+                )
+                metric_rows.append(
+                    {
+                        "model": model,
+                        "method": FULL_SLACLIP_METHOD,
+                        "seed": seed,
+                        "slaclip_beta": beta,
+                        **{
+                            f"{name}_{group}": 0
+                            for group in ("A", "B")
+                            for name in (
+                                "gamma_clamped_low_count",
+                                "gamma_clamped_high_count",
+                                "lower_bound_hits",
+                                "upper_bound_hits",
+                            )
+                        },
+                    }
+                )
+    path = write_development_beta_selection(
+        runtime,
+        tmp_path,
+        metric_rows=metric_rows,
+        paired_rows=paired_rows,
+    )
+    assert path == tmp_path / "development_beta_selection.json"
+    selection = json.loads(path.read_text(encoding="utf-8"))
+    assert selection["status"] == "DEVELOPMENT_SELECTION_ONLY_NOT_TEST_EVIDENCE"
+    assert {
+        model: value["selected_base_target_clipped_fraction_for_future_confirmation"]
+        for model, value in selection["models"].items()
+    } == winners
+    assert len(selection["models"]["bert"]["ordered_candidates"]) == 5
+
+
 def test_paired_arms_share_randomness_and_fixed_evaluation_protocol() -> None:
     arms = expand_spec(load_spec(SPEC))
     by_id = {arm["arm_id"]: arm for arm in arms}
@@ -234,7 +351,8 @@ def test_arm_command_uses_full_controller_endpoints_without_q_inputs(tmp_path: P
         output_dir=tmp_path / "adaptive",
         **common,
     )
-    assert "--slaclip-beta" in adaptive_command
+    assert "--slaclip-base-target-clipped-fraction" in adaptive_command
+    assert "--slaclip-beta" not in adaptive_command
     assert "--slaclip-eta" in adaptive_command
     assert adaptive_command[adaptive_command.index("--slaclip-num-slots") + 1] == "15"
     assert adaptive_command[adaptive_command.index("--slaclip-c-max") + 1] == "50.0"
@@ -247,6 +365,7 @@ def test_arm_command_uses_full_controller_endpoints_without_q_inputs(tmp_path: P
         output_dir=tmp_path / "fixed",
         **common,
     )
+    assert "--slaclip-base-target-clipped-fraction" not in fixed_command
     assert "--slaclip-beta" not in fixed_command
     assert "--slaclip-num-slots" not in fixed_command
 

@@ -4,12 +4,14 @@ import math
 import unittest
 
 from paper_repro.slaclip import (
+    DEFAULT_BASE_TARGET_CLIPPED_FRACTION,
     Z_0995,
     automatic_num_slots,
     build_slack_vector,
     check_joint_release_bound,
     full_slaclip_update,
     normalize_noisy_slack,
+    resolve_base_target_clipped_fraction,
 )
 
 
@@ -62,7 +64,7 @@ class FullSlaClipControllerTests(unittest.TestCase):
         **overrides: float,
     ) -> dict:
         values = {
-            "beta": 0.5,
+            "base_target_clipped_fraction": 0.5,
             "eta": 0.2,
             "min_clip_norm": 0.1,
             "max_clip_norm": 100.0,
@@ -79,8 +81,24 @@ class FullSlaClipControllerTests(unittest.TestCase):
         result = self._update()
         expected_adjusted = 5.0 / (10.0 + 1e-6)
         expected_target = 1.0 - 0.5 * (1.0 - expected_adjusted)
+        expected_remaining = 1.0 - expected_adjusted
+        expected_clipped_target = 0.5 * expected_remaining
         expected_step = 0.2 * (expected_target - 0.2)
         self.assertAlmostEqual(result["near_zero_adjusted"], expected_adjusted)
+        self.assertEqual(result["base_target_clipped_fraction"], 0.5)
+        self.assertEqual(result["beta"], 0.5)
+        self.assertAlmostEqual(
+            result["remaining_non_small_gradient_fraction"],
+            expected_remaining,
+        )
+        self.assertAlmostEqual(
+            result["raw_dynamic_target_clipped"],
+            expected_clipped_target,
+        )
+        self.assertAlmostEqual(
+            result["clamped_dynamic_target_clipped"],
+            expected_clipped_target,
+        )
         self.assertAlmostEqual(
             result["raw_dynamic_target_unclipped"], expected_target
         )
@@ -96,6 +114,59 @@ class FullSlaClipControllerTests(unittest.TestCase):
         self.assertFalse(result["gamma_clamped_low"])
         self.assertFalse(result["gamma_clamped_high"])
 
+    def test_beta_is_a_compatible_alias_for_the_canonical_base_target(self) -> None:
+        canonical = self._update()
+        alias = full_slaclip_update(
+            10.0,
+            0.2,
+            5.0,
+            beta=0.5,
+            eta=0.2,
+            min_clip_norm=0.1,
+            max_clip_norm=100.0,
+        )
+        both = full_slaclip_update(
+            10.0,
+            0.2,
+            5.0,
+            base_target_clipped_fraction=0.5,
+            beta=0.5,
+            eta=0.2,
+            min_clip_norm=0.1,
+            max_clip_norm=100.0,
+        )
+        self.assertEqual(alias, canonical)
+        self.assertEqual(both, canonical)
+        with self.assertRaisesRegex(ValueError, "different values"):
+            full_slaclip_update(
+                10.0,
+                0.2,
+                5.0,
+                base_target_clipped_fraction=0.25,
+                beta=0.5,
+                eta=0.2,
+                min_clip_norm=0.1,
+                max_clip_norm=100.0,
+            )
+
+    def test_unspecified_base_target_uses_the_documented_default(self) -> None:
+        self.assertEqual(
+            resolve_base_target_clipped_fraction(),
+            DEFAULT_BASE_TARGET_CLIPPED_FRACTION,
+        )
+        result = full_slaclip_update(
+            10.0,
+            0.2,
+            5.0,
+            eta=0.2,
+            min_clip_norm=0.1,
+            max_clip_norm=100.0,
+        )
+        self.assertEqual(
+            result["base_target_clipped_fraction"],
+            DEFAULT_BASE_TARGET_CLIPPED_FRACTION,
+        )
+
     def test_noisy_endpoints_are_not_preclamped(self) -> None:
         low = self._update(near_threshold=-2.0, near_zero=-100.0)
         high = self._update(near_threshold=3.0, near_zero=100.0)
@@ -103,12 +174,16 @@ class FullSlaClipControllerTests(unittest.TestCase):
         self.assertEqual(low["near_zero_proxy"], -100.0)
         self.assertLess(low["raw_dynamic_target_unclipped"], 0.0)
         self.assertEqual(low["dynamic_target_unclipped"], 0.0)
+        self.assertGreater(low["raw_dynamic_target_clipped"], 1.0)
+        self.assertEqual(low["clamped_dynamic_target_clipped"], 1.0)
         self.assertEqual(low["dynamic_target_clipped"], 1.0)
         self.assertTrue(low["gamma_clamped_low"])
         self.assertEqual(high["near_threshold_proxy"], 3.0)
         self.assertEqual(high["near_zero_proxy"], 100.0)
         self.assertGreater(high["raw_dynamic_target_unclipped"], 1.0)
         self.assertEqual(high["dynamic_target_unclipped"], 1.0)
+        self.assertLess(high["raw_dynamic_target_clipped"], 0.0)
+        self.assertEqual(high["clamped_dynamic_target_clipped"], 0.0)
         self.assertEqual(high["dynamic_target_clipped"], 0.0)
         self.assertTrue(high["gamma_clamped_high"])
 

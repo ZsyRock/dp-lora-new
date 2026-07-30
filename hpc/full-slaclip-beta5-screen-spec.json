@@ -1,0 +1,157 @@
+{
+  "schema_version": 1,
+  "campaign_name": "full_slaclip_base_target_beta5_meddialog_development_v1",
+  "description": "Five-point full-SlaClip base-target-clipped-fraction development screen with matched fixed-C DP-LoRA baselines on MedDialog, BERT-base, and GPT-2 small.",
+  "expected_arm_count": 30,
+  "common": {
+    "models": [
+      "bert",
+      "gpt2"
+    ],
+    "num_clients": 5,
+    "rounds": 50,
+    "batch_size": 8,
+    "noise_multiplier": 2.0,
+    "learning_rate": 0.0005,
+    "rank": 512,
+    "max_seq_length": 128,
+    "max_validation_records": 512,
+    "eval_every": 10,
+    "checkpoint_every": 10,
+    "data_split_seed": 1729,
+    "evaluation_seed": 2718,
+    "delta": 0.00001,
+    "slaclip_num_slots": 15,
+    "slaclip_c_min": 0.1,
+    "slaclip_c_max": 50.0,
+    "default_eta": 0.2,
+    "default_beta": 0.5
+  },
+  "primary": {
+    "initial_clip_norms": [
+      10.0
+    ],
+    "seeds": [
+      52,
+      53,
+      54,
+      55,
+      56
+    ],
+    "methods": [
+      "paper_dp_lora",
+      "slaclip_dp_lora"
+    ]
+  },
+  "threshold_robustness": {
+    "initial_clip_norms": [],
+    "seeds": [],
+    "methods": [
+      "paper_dp_lora",
+      "slaclip_dp_lora"
+    ]
+  },
+  "sensitivity": {
+    "initial_clip_norm": 10.0,
+    "seeds": [
+      52,
+      53,
+      54,
+      55,
+      56
+    ],
+    "etas": [
+      0.2
+    ],
+    "betas": [
+      0.01,
+      0.03,
+      0.066,
+      0.146,
+      0.5
+    ],
+    "method": "slaclip_dp_lora",
+    "exclude_primary_default": true
+  },
+  "noise_sensitivity": {
+    "initial_clip_norm": 10.0,
+    "seeds": [],
+    "noise_multipliers": [],
+    "methods": [
+      "paper_dp_lora",
+      "slaclip_dp_lora"
+    ]
+  },
+  "client_sensitivity": {
+    "initial_clip_norm": 10.0,
+    "seeds": [],
+    "num_clients": [],
+    "methods": [
+      "paper_dp_lora",
+      "slaclip_dp_lora"
+    ]
+  },
+  "controls": {
+    "initial_clip_norm": 10.0,
+    "seeds": [],
+    "methods": [
+      "no_dp_lora_control",
+      "clip_only_control"
+    ]
+  },
+  "scientific_boundary": {
+    "claim_level": 1,
+    "analysis_role": "development_hyperparameter_screen_not_confirmatory_test",
+    "training_dataset": "MedDialog_HealthcareMagic_plus_iCliniq_public_reconstruction",
+    "models": [
+      "bert-base-uncased",
+      "gpt2-small"
+    ],
+    "paper_result_reproduced": false,
+    "paper_benchmarks_evaluated": false,
+    "external_test_set_used_for_selection": false,
+    "end_to_end_dp_certified": false,
+    "exact_diagnostics_privacy_label": "NON_DP_PRIVATE_DIAGNOSTIC",
+    "controller_family": "full_SlaClip_two_noisy_CDF_endpoints_only",
+    "excluded_method_family": "SlaClip-Q_and_all_fixed-target-quantile-controllers",
+    "base_target_clipped_fraction_symbol": "beta",
+    "candidate_base_target_clipped_fractions": [
+      0.01,
+      0.03,
+      0.066,
+      0.146,
+      0.5
+    ],
+    "target_semantics": "round_target_clipped_fraction=clip(beta*(1-s_hat[K-1]/(C_t+1e-6)),0,1)",
+    "paper_default_interpretation": "the_original_one_half_is_beta=0.5_not_a_required_fixed_target",
+    "candidate_note": "positive low-rate values cover the previously observed near-zero-to-14.6-percent clipping regime; beta=0.5 retains the original full-SlaClip reference",
+    "fixed_controller_values": {
+      "initial_clip_norm": 10.0,
+      "eta": 0.2,
+      "num_slots": 15,
+      "c_min": 0.1,
+      "c_max": 50.0
+    },
+    "development_seeds": [
+      52,
+      53,
+      54,
+      55,
+      56
+    ],
+    "selection_unit": "select_beta_separately_for_each_model",
+    "selection_primary_metric": "mean_paired_final_internal_validation_loss_delta_vs_fixed_C10",
+    "selection_tiebreakers": [
+      "mean_paired_normalized_internal_validation_loss_AUC_delta",
+      "lower_controller_bound_hit_and_clamp_rate",
+      "smaller_beta"
+    ],
+    "reporting_rule": "report_all_five_beta_curves_and_matched_baselines; a selected beta must later be frozen before evaluation on independent confirmation data",
+    "k15_policy": "user_requested_for_local_batch_size_below_128",
+    "fixed_evaluation_protocol": {
+      "data_split_seed": 1729,
+      "evaluation_seed": 2718,
+      "holdout_records": 512
+    }
+  }
+}

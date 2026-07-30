@@ -26,6 +26,7 @@ from typing import Any
 Z_0995 = 2.5758293035489004
 _ENDPOINT_DENOMINATOR_EPSILON = 1e-6
 MAX_ABS_LOG_STEP = 50.0
+DEFAULT_BASE_TARGET_CLIPPED_FRACTION = 0.5
 
 
 def _finite_real(name: str, value: Real) -> float:
@@ -224,12 +225,50 @@ def normalize_noisy_slack(
     return normalized
 
 
+def resolve_base_target_clipped_fraction(
+    *,
+    base_target_clipped_fraction: Real | None = None,
+    beta: Real | None = None,
+) -> float:
+    """Resolve full SlaClip's canonical base target and legacy ``beta`` alias.
+
+    ``beta`` is retained solely as a backwards-compatible name.  Supplying
+    both names with different values is rejected so an experiment can never
+    silently choose one controller setting over another.
+    """
+
+    canonical = (
+        None
+        if base_target_clipped_fraction is None
+        else _finite_real(
+            "base_target_clipped_fraction",
+            base_target_clipped_fraction,
+        )
+    )
+    alias = None if beta is None else _finite_real("beta", beta)
+    if canonical is not None and alias is not None and canonical != alias:
+        raise ValueError(
+            "base_target_clipped_fraction and beta specify different values"
+        )
+    value = (
+        canonical
+        if canonical is not None
+        else alias
+        if alias is not None
+        else DEFAULT_BASE_TARGET_CLIPPED_FRACTION
+    )
+    if not 0.0 <= value <= 1.0:
+        raise ValueError("base_target_clipped_fraction must be in [0, 1]")
+    return float(value)
+
+
 def full_slaclip_update(
     current_clip_norm: Real,
     noisy_cdf_near_threshold: Real,
     noisy_cdf_near_zero: Real,
     *,
-    beta: Real,
+    base_target_clipped_fraction: Real | None = None,
+    beta: Real | None = None,
     eta: Real,
     min_clip_norm: Real,
     max_clip_norm: Real,
@@ -243,9 +282,14 @@ def full_slaclip_update(
     zero).  The dynamic target and threshold update are
 
     ``z_hat = r_hat / (C + 1e-6)``,
-    ``gamma_t = clip_[0,1](1 - beta * (1 - z_hat))``, and
+    ``remaining_t = 1 - z_hat``,
+    ``target_clip_t = clip_[0,1](base_target_clip * remaining_t)``,
+    ``gamma_t = 1 - target_clip_t``, and
     ``C_next = clip_[Cmin,Cmax](C * exp(eta * (gamma_t - q_hat)))``.
 
+    The paper/reference name ``beta`` is accepted as a compatibility alias for
+    ``base_target_clipped_fraction``.  It is not a fixed clipping target:
+    every round still modulates it with the noisy near-zero CDF endpoint.
     Both endpoint inputs intentionally remain unclamped because a Gaussian
     release is unbounded.  Only the derived target, numerical log step, and
     public threshold range are bounded.  Exact, non-noisy CDF values must not
@@ -257,13 +301,14 @@ def full_slaclip_update(
         "noisy_cdf_near_threshold", noisy_cdf_near_threshold
     )
     r_hat = _finite_real("noisy_cdf_near_zero", noisy_cdf_near_zero)
-    balance = _finite_real("beta", beta)
+    base_target = resolve_base_target_clipped_fraction(
+        base_target_clipped_fraction=base_target_clipped_fraction,
+        beta=beta,
+    )
     gain = _finite_real("eta", eta)
     lower = _positive_real("min_clip_norm", min_clip_norm)
     upper = _positive_real("max_clip_norm", max_clip_norm)
     denominator_epsilon = _positive_real("epsilon", epsilon)
-    if not 0.0 <= balance <= 1.0:
-        raise ValueError("beta must be in [0, 1]")
     if gain < 0.0:
         raise ValueError("eta must be non-negative")
     if upper < lower:
@@ -277,10 +322,24 @@ def full_slaclip_update(
     z_hat = r_hat / endpoint_denominator
     if not math.isfinite(z_hat):
         raise FloatingPointError("SlaClip normalized near-zero endpoint is not finite")
-    raw_gamma = 1.0 - balance * (1.0 - z_hat)
+    remaining_non_small_gradient_fraction = 1.0 - z_hat
+    if not math.isfinite(remaining_non_small_gradient_fraction):
+        raise FloatingPointError(
+            "SlaClip remaining non-small-gradient fraction is not finite"
+        )
+    raw_dynamic_target_clipped = (
+        base_target * remaining_non_small_gradient_fraction
+    )
+    if not math.isfinite(raw_dynamic_target_clipped):
+        raise FloatingPointError("SlaClip raw clipped target is not finite")
+    clamped_dynamic_target_clipped = max(
+        0.0,
+        min(1.0, raw_dynamic_target_clipped),
+    )
+    raw_gamma = 1.0 - raw_dynamic_target_clipped
     if not math.isfinite(raw_gamma):
         raise FloatingPointError("SlaClip dynamic target is not finite")
-    gamma_t = max(0.0, min(1.0, raw_gamma))
+    gamma_t = 1.0 - clamped_dynamic_target_clipped
 
     controller_error = gamma_t - q_hat
     raw_log_update = gain * controller_error
@@ -299,13 +358,21 @@ def full_slaclip_update(
         "current_clip_norm": float(current),
         "near_threshold_proxy": float(q_hat),
         "near_zero_proxy": float(r_hat),
-        "beta": float(balance),
+        "base_target_clipped_fraction": float(base_target),
+        "beta": float(base_target),
         "epsilon": float(denominator_epsilon),
         "endpoint_denominator": float(endpoint_denominator),
         "near_zero_adjusted": float(z_hat),
+        "remaining_non_small_gradient_fraction": float(
+            remaining_non_small_gradient_fraction
+        ),
+        "raw_dynamic_target_clipped": float(raw_dynamic_target_clipped),
+        "clamped_dynamic_target_clipped": float(
+            clamped_dynamic_target_clipped
+        ),
         "raw_dynamic_target_unclipped": float(raw_gamma),
         "dynamic_target_unclipped": float(gamma_t),
-        "dynamic_target_clipped": float(1.0 - gamma_t),
+        "dynamic_target_clipped": float(clamped_dynamic_target_clipped),
         "gamma_clamped_low": bool(raw_gamma < 0.0),
         "gamma_clamped_high": bool(raw_gamma > 1.0),
         "controller_error": float(controller_error),
@@ -325,9 +392,11 @@ def full_slaclip_update(
 __all__ = [
     "Z_0995",
     "MAX_ABS_LOG_STEP",
+    "DEFAULT_BASE_TARGET_CLIPPED_FRACTION",
     "automatic_num_slots",
     "build_slack_vector",
     "check_joint_release_bound",
     "normalize_noisy_slack",
+    "resolve_base_target_clipped_fraction",
     "full_slaclip_update",
 ]

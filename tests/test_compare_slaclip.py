@@ -121,6 +121,7 @@ def slaclip_contract() -> dict:
         },
         "controller": {
             "eta": ETA,
+            "base_target_clipped_fraction": BETA,
             "beta": BETA,
             "epsilon": EPSILON,
             "num_slots": NUM_SLOTS,
@@ -386,6 +387,7 @@ def controller_round(
         "clients": CLIENTS,
         "num_slots": NUM_SLOTS,
         "eta": ETA,
+        "base_target_clipped_fraction": BETA,
         "beta": BETA,
         "epsilon": EPSILON,
         "near_threshold_index": 0,
@@ -752,6 +754,10 @@ class CompareSlaClipTests(unittest.TestCase):
             self.assertEqual(controller["near_threshold_index"], 0)
             self.assertEqual(controller["near_zero_index"], NUM_SLOTS - 1)
             self.assertEqual(controller["beta"], BETA)
+            self.assertEqual(
+                controller["base_target_clipped_fraction"],
+                BETA,
+            )
             self.assertNotEqual(
                 controller["final_clip_norm_by_group"]["A"], INITIAL_C
             )

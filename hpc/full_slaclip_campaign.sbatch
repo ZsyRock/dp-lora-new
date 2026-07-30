@@ -23,6 +23,9 @@ spec="${10:?missing campaign specification}"
 expected_spec_sha256="${11:?missing specification SHA-256}"
 resume="${12:?missing resume flag}"
 lane_memory="${13:?missing per-lane host memory}"
+lane_gres="${14:?missing typed per-lane GPU GRES}"
+expected_gpu="${15:?missing expected CUDA device-name substring}"
+min_vram_gib="${16:?missing minimum per-lane VRAM GiB}"
 
 python_bin="$env_prefix/bin/python"
 coordinator="$repository/paper_repro/full_slaclip_campaign.py"
@@ -57,6 +60,14 @@ if [[ "$(sha256sum "$spec" | awk '{print $1}')" != "$expected_spec_sha256" ]]; t
 fi
 if [[ "$resume" != 0 && "$resume" != 1 ]]; then
     echo "ERROR: invalid resume flag" >&2
+    exit 2
+fi
+if [[ ! "$lane_gres" =~ ^gpu:[A-Za-z0-9_-]+:1$ ]]; then
+    echo "ERROR: each campaign lane must request exactly one typed GPU" >&2
+    exit 2
+fi
+if [[ -z "$expected_gpu" || ! "$min_vram_gib" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: invalid CUDA device gate" >&2
     exit 2
 fi
 
@@ -153,7 +164,7 @@ run_step() {
         --ntasks=1 \
         "--cpus-per-task=$lane_cpus" \
         "--mem=$lane_memory" \
-        --gres=gpu:h200:1 \
+        "--gres=$lane_gres" \
         "$@"
 }
 
@@ -170,13 +181,19 @@ campaign_stage="runtime_and_input_preflight"
 run_step "$python_bin" -m pip check
 run_step "$python_bin" "$trainer" --check-inputs --input-manifest "$input_manifest"
 
-# Verify both independently scheduled H200 lanes before the formal matrix.
+# Verify both independently scheduled typed-GPU lanes before the formal matrix.
 campaign_stage="cuda_preflight"
 run_step "$python_bin" "$coordinator" cuda-smoke \
-    --lane 0 --output "$campaign_root/preflight/cuda-lane-0.json" &
+    --lane 0 \
+    --output "$campaign_root/preflight/cuda-lane-0.json" \
+    --expected-device-name "$expected_gpu" \
+    --min-vram-gib "$min_vram_gib" &
 smoke_pid_0=$!
 run_step "$python_bin" "$coordinator" cuda-smoke \
-    --lane 1 --output "$campaign_root/preflight/cuda-lane-1.json" &
+    --lane 1 \
+    --output "$campaign_root/preflight/cuda-lane-1.json" \
+    --expected-device-name "$expected_gpu" \
+    --min-vram-gib "$min_vram_gib" &
 smoke_pid_1=$!
 set +e
 wait "$smoke_pid_0"
@@ -191,7 +208,7 @@ if [[ "$smoke_rc_0" -ne 0 || "$smoke_rc_1" -ne 0 ]]; then
     "$python_bin" "$coordinator" aggregate --manifest "$runtime_manifest" || true
     "$python_bin" "$coordinator" archive-small \
         --campaign-root "$campaign_root" --archive-root "$archive_root" || true
-    echo "ERROR: two-lane H200 CUDA preflight failed: lane0=$smoke_rc_0 lane1=$smoke_rc_1" >&2
+    echo "ERROR: two-lane typed-GPU CUDA preflight failed: lane0=$smoke_rc_0 lane1=$smoke_rc_1" >&2
     exit 1
 fi
 

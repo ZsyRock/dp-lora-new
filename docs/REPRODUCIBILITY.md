@@ -224,15 +224,23 @@ it computes
 
 ```text
 z_hat   = r_hat / (C_t + 1e-6)
-gamma_t = clip(1 - beta * (1 - z_hat), 0, 1)
+p_target,t = clip(beta * (1 - z_hat), 0, 1)
+gamma_t = 1 - p_target,t
 C_{t+1} = clip(C_t * exp(eta * (gamma_t - q_hat)), C_min, C_max)
 ```
+
+Here `beta` is the configurable base target clipped fraction after removing
+the noisy near-zero/small-gradient mass.  It is not the realized or fixed
+clipping fraction: `p_target,t` changes every round with `z_hat`.  The
+reference formula's factor `1/2` is the default `beta=0.5`, exposed as
+`--slaclip-base-target-clipped-fraction`; the legacy `--slaclip-beta` spelling
+is only a checked compatibility alias.
 
 All five clients in a round use the same `C_t`; the new threshold takes effect
 only in the next round.  Only the *noisy* endpoints drive the update.  The
 exact CDF proxy, raw gradient norms, and actual clipping fractions are written
 only as `NON_DP_PRIVATE_DIAGNOSTIC` telemetry and must not be presented as DP
-releases.  Full SlaClip has no fixed clipping target, target file, or
+releases.  Full SlaClip has no SlaClip-Q fixed target, target file, or
 baseline-derived calibration stage.
 
 The slack coordinates and clipped gradient form one bounded vector per client

@@ -503,6 +503,12 @@ def _validate_contract(
     num_slots = _positive_integer(controller.get("num_slots"), "SlaClip slots")
     eta = _finite_number(controller.get("eta"), "SlaClip eta")
     beta = _finite_number(controller.get("beta"), "SlaClip beta")
+    base_target = _finite_number(
+        controller.get("base_target_clipped_fraction"),
+        "SlaClip base target clipped fraction",
+    )
+    if base_target != beta:
+        raise RuntimeError("full-SlaClip beta/base-target aliases disagree")
     lower = _finite_number(controller.get("c_min"), "SlaClip lower bound")
     upper = _finite_number(controller.get("c_max"), "SlaClip upper bound")
     epsilon = _finite_number(controller.get("epsilon"), "SlaClip endpoint epsilon")
@@ -647,10 +653,13 @@ def _independent_full_slaclip_update(
     if not math.isfinite(endpoint_denominator) or endpoint_denominator <= 0.0:
         raise RuntimeError("SlaClip endpoint denominator is not finite")
     near_zero_adjusted = near_zero / endpoint_denominator
-    raw_target = 1.0 - balance * (1.0 - near_zero_adjusted)
-    if not math.isfinite(raw_target):
+    remaining_non_small = 1.0 - near_zero_adjusted
+    raw_target_clipped = balance * remaining_non_small
+    if not math.isfinite(raw_target_clipped):
         raise RuntimeError("SlaClip dynamic target is not finite")
-    target_unclipped = max(0.0, min(1.0, raw_target))
+    target_clipped = max(0.0, min(1.0, raw_target_clipped))
+    raw_target = 1.0 - raw_target_clipped
+    target_unclipped = 1.0 - target_clipped
     controller_error = target_unclipped - near_threshold
     raw_log_step = gain * controller_error
     if not math.isfinite(raw_log_step):
@@ -667,13 +676,17 @@ def _independent_full_slaclip_update(
         "current_clip_norm": float(current),
         "near_threshold_proxy": float(near_threshold),
         "near_zero_proxy": float(near_zero),
+        "base_target_clipped_fraction": float(balance),
         "beta": float(balance),
         "epsilon": float(denominator_epsilon),
         "endpoint_denominator": float(endpoint_denominator),
         "near_zero_adjusted": float(near_zero_adjusted),
+        "remaining_non_small_gradient_fraction": float(remaining_non_small),
+        "raw_dynamic_target_clipped": float(raw_target_clipped),
+        "clamped_dynamic_target_clipped": float(target_clipped),
         "raw_dynamic_target_unclipped": float(raw_target),
         "dynamic_target_unclipped": float(target_unclipped),
-        "dynamic_target_clipped": float(1.0 - target_unclipped),
+        "dynamic_target_clipped": float(target_clipped),
         "gamma_clamped_low": bool(raw_target < 0.0),
         "gamma_clamped_high": bool(raw_target > 1.0),
         "controller_error": float(controller_error),
@@ -1246,6 +1259,7 @@ def _validate_controller_trajectory(
         "final_clip_norm_by_group": dict(expected_thresholds),
         "num_slots": parameters["num_slots"],
         "eta": parameters["eta"],
+        "base_target_clipped_fraction": parameters["beta"],
         "beta": parameters["beta"],
         "epsilon": parameters["epsilon"],
         "near_threshold_index": 0,

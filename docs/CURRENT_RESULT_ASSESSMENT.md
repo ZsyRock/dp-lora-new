@@ -57,9 +57,12 @@ BERT B, GPT-2 A, and GPT-2 B.  BERT's across-all-client means were still 6.4%
 for A and 16.0% for B, illustrating how strongly a clipping summary depends on
 its reducer.  These values are neither targets nor calibration inputs for the
 active method.  Full SlaClip derives its dynamic target each round from the
-two endpoints of the *noisy* CDF proxy; it does not consume a fixed target or
-a baseline-derived median.  Any older fixed-target artifact is retained only
-for historical audit and is not evidence for full SlaClip.
+two endpoints of the *noisy* CDF proxy.  Its configurable base fraction
+`beta` is converted each round to
+`clip(beta * (1 - s_hat[K-1]/(C_t+1e-6)), 0, 1)` after discounting the
+near-zero/small-gradient mass; it is not a SlaClip-Q fixed target and does not
+consume a baseline-derived median.  Any older fixed-target artifact is
+retained only for historical audit and is not evidence for full SlaClip.
 
 ## What the current full-SlaClip campaign can establish
 

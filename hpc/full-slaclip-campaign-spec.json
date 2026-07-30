@@ -145,6 +145,9 @@
       "beta": 0.5
     },
     "controller": "full_SlaClip_uses_noisy_CDF_near_threshold_and_near_zero_endpoints",
+    "base_target_clipped_fraction_symbol": "beta",
+    "target_semantics": "round_target_clipped_fraction=clip(beta*(1-s_hat[K-1]/(C_t+1e-6)),0,1)",
+    "paper_default_interpretation": "the_original_one_half_is_beta=0.5_not_a_required_fixed_target",
     "other_initial_thresholds": "pre_registered_initial_C_robustness",
     "other_eta_beta_values": "pre_registered_controller_sensitivity",
     "noise_multiplier_values": "sigma sensitivity only; not an epsilon sweep",
@@ -154,6 +157,6 @@
       "evaluation_seed": 2718,
       "holdout_records": 512
     },
-    "excluded_method_family": "legacy_fixed_target_ablation"
+    "excluded_method_family": "SlaClip-Q_and_all_fixed-target-quantile-controllers"
   }
 }

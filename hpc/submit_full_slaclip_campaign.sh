@@ -7,8 +7,8 @@ usage() {
     cat >&2 <<'USAGE'
 Usage: hpc/submit_full_slaclip_campaign.sh [--resume] [--test-only]
 
-Submit the 108-arm, 54-wave full-SlaClip campaign as exactly one Slurm job.
-The allocation performs its two H200 CUDA smokes before starting the matrix.
+Submit one checked-in full-SlaClip campaign as exactly one two-GPU Slurm job.
+The allocation performs two typed-GPU CUDA smokes before starting the matrix.
 
 --resume requires DPLORA_FULL_RUN_ID to name an existing partial campaign.
 --test-only performs all login-node gates and Slurm scheduler validation but
@@ -21,13 +21,17 @@ Important overrides:
   DPLORA_FULL_ENV_PREFIX      tested Python environment for this code SHA
   DPLORA_FULL_SCRATCH_ROOT    scratch root
   DPLORA_FULL_ARCHIVE_ROOT    persistent incremental-small-artifact archive
+  DPLORA_FULL_SPEC_RELATIVE   spec path inside snapshot
   DPLORA_FULL_ACCOUNT         Slurm account (default: normal)
   DPLORA_FULL_PARTITION       partitions (default: quad_h200,dual_h200)
-  DPLORA_FULL_GPU_GRES        fixed typed allocation (default: gpu:h200:2)
+  DPLORA_FULL_GPU_GRES        typed two-GPU allocation (default: gpu:h200:2)
+  DPLORA_FULL_EXPECTED_GPU    CUDA device-name substring (default from GRES)
+  DPLORA_FULL_MIN_VRAM_GIB    per-lane minimum VRAM GiB (default from GRES)
   DPLORA_FULL_CPUS_PER_TASK   CPU cores per GPU lane (default: 12; max: 12)
   DPLORA_FULL_HOST_MEMORY     parent host RAM (default: 384G)
   DPLORA_FULL_LANE_MEMORY     host RAM per concurrent lane (default: 192G)
-  DPLORA_FULL_WALLTIME        walltime (default/max here: 2-12:00:00)
+  DPLORA_FULL_WALLTIME        walltime (default: 2-12:00:00)
+  DPLORA_FULL_JOB_NAME        safe Slurm job name
 
 The confirmatory paper setting fixes K_clients=5, T=50, B=8, sigma=2,
 lr=5e-4, rank=512, K_slots=15, and full SlaClip C bounds [0.1, 50].
@@ -113,7 +117,12 @@ fi
 
 worker="$snapshot_repo/hpc/full_slaclip_campaign.sbatch"
 submit_snapshot="$snapshot_repo/hpc/submit_full_slaclip_campaign.sh"
-spec="$snapshot_repo/hpc/full-slaclip-campaign-spec.json"
+spec_relative="${DPLORA_FULL_SPEC_RELATIVE:-hpc/full-slaclip-campaign-spec.json}"
+if [[ "$spec_relative" = /* || "$spec_relative" == *".."* ]]; then
+    echo "ERROR: DPLORA_FULL_SPEC_RELATIVE must be a safe path inside the snapshot" >&2
+    exit 1
+fi
+spec="$snapshot_repo/$spec_relative"
 coordinator="$snapshot_repo/paper_repro/full_slaclip_campaign.py"
 trainer="$snapshot_repo/paper_repro/train_federated.py"
 stage_script="$snapshot_repo/scripts/stage_paper_inputs.sh"
@@ -212,16 +221,48 @@ cpus_per_task="${DPLORA_FULL_CPUS_PER_TASK:-12}"
 host_memory="${DPLORA_FULL_HOST_MEMORY:-384G}"
 lane_memory="${DPLORA_FULL_LANE_MEMORY:-192G}"
 walltime="${DPLORA_FULL_WALLTIME:-2-12:00:00}"
-if [[ "$gpu_gres" != "gpu:h200:2" ]]; then
-    echo "ERROR: this two-lane formal campaign requires exactly gpu:h200:2" >&2
+job_name="${DPLORA_FULL_JOB_NAME:-dp-lora-full-slaclip}"
+if [[ "$gpu_gres" =~ ^gpu:([A-Za-z0-9_-]+):2$ ]]; then
+    gpu_type="${BASH_REMATCH[1]}"
+else
+    echo "ERROR: typed allocation must have exactly two GPUs, e.g. gpu:l4:2" >&2
+    exit 1
+fi
+lane_gres="gpu:$gpu_type:1"
+case "${gpu_type,,}" in
+    h200)
+        default_expected_gpu="H200"
+        default_min_vram_gib=100
+        ;;
+    l4)
+        default_expected_gpu="L4"
+        default_min_vram_gib=20
+        ;;
+    a100)
+        default_expected_gpu="A100"
+        default_min_vram_gib=39
+        ;;
+    *)
+        default_expected_gpu="$gpu_type"
+        default_min_vram_gib=1
+        ;;
+esac
+expected_gpu="${DPLORA_FULL_EXPECTED_GPU:-$default_expected_gpu}"
+min_vram_gib="${DPLORA_FULL_MIN_VRAM_GIB:-$default_min_vram_gib}"
+if [[ -z "$expected_gpu" || ! "$min_vram_gib" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: invalid expected GPU name or minimum VRAM gate" >&2
     exit 1
 fi
 if [[ ! "$cpus_per_task" =~ ^[1-9][0-9]*$ || "$cpus_per_task" -gt 12 ]]; then
     echo "ERROR: CPU cores per lane must be 1..12 (24 total QoS maximum)" >&2
     exit 1
 fi
-if [[ "$walltime" != "2-12:00:00" ]]; then
-    echo "ERROR: this formal contract fixes the discovered 60-hour maximum walltime" >&2
+if [[ ! "$walltime" =~ ^([0-9]+-)?[0-9]{1,2}:[0-9]{2}:[0-9]{2}$ ]]; then
+    echo "ERROR: walltime must use Slurm D-HH:MM:SS or HH:MM:SS syntax" >&2
+    exit 1
+fi
+if [[ ! "$job_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    echo "ERROR: unsafe DPLORA_FULL_JOB_NAME: $job_name" >&2
     exit 1
 fi
 
@@ -242,7 +283,7 @@ sbatch_args=(
     "--mem=$host_memory"
     "--time=$walltime"
     --signal=B:USR1@600
-    --job-name=dp-lora-full-slaclip
+    "--job-name=$job_name"
     "--output=$run_root/slurm/%x-%j.out"
     "--error=$run_root/slurm/%x-%j.err"
     --export=NONE
@@ -260,6 +301,7 @@ echo "Input manifest:    $input_manifest"
 echo "Scratch output:    $campaign_root"
 echo "Persistent archive:$archive_root"
 echo "Resources:         account=$account partition=$partition gres=$gpu_gres nodes=1 lanes=2 cpus/lane=$cpus_per_task mem=$host_memory lane_mem=$lane_memory time=$walltime"
+echo "GPU gate:          name_contains=$expected_gpu min_vram_gib=$min_vram_gib"
 
 "$sbatch_bin" "${sbatch_args[@]}" "$worker" \
     "$snapshot_repo" \
@@ -274,4 +316,7 @@ echo "Resources:         account=$account partition=$partition gres=$gpu_gres no
     "$spec" \
     "$spec_sha256" \
     "$resume" \
-    "$lane_memory"
+    "$lane_memory" \
+    "$lane_gres" \
+    "$expected_gpu" \
+    "$min_vram_gib"

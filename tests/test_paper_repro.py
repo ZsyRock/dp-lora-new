@@ -23,6 +23,7 @@ from paper_repro.train_federated import (
     empty_mechanism_components,
     empty_state_like,
     parameter_groups,
+    parse_args,
     partition_indices,
     load_data_protocol,
     round_update_statistics,
@@ -187,6 +188,73 @@ def minimal_valid_input_manifest(root: Path) -> dict:
 
 
 class PaperReproTests(unittest.TestCase):
+    def test_full_slaclip_base_target_cli_and_beta_alias_resolve_fail_closed(
+        self,
+    ) -> None:
+        default = parse_args(["--input-manifest", "inputs.json"])
+        self.assertEqual(default.slaclip_base_target_clipped_fraction, 0.5)
+        self.assertEqual(default.slaclip_beta, 0.5)
+        self.assertEqual(
+            default.slaclip_base_target_clipped_fraction_source,
+            "default",
+        )
+
+        canonical = parse_args(
+            [
+                "--input-manifest",
+                "inputs.json",
+                "--slaclip-base-target-clipped-fraction",
+                "0.125",
+            ]
+        )
+        self.assertEqual(canonical.slaclip_base_target_clipped_fraction, 0.125)
+        self.assertEqual(canonical.slaclip_beta, 0.125)
+        self.assertEqual(
+            canonical.slaclip_base_target_clipped_fraction_source,
+            "canonical_cli",
+        )
+
+        alias = parse_args(
+            [
+                "--input-manifest",
+                "inputs.json",
+                "--slaclip-beta",
+                "0.25",
+            ]
+        )
+        self.assertEqual(alias.slaclip_base_target_clipped_fraction, 0.25)
+        self.assertEqual(alias.slaclip_beta, 0.25)
+        self.assertEqual(
+            alias.slaclip_base_target_clipped_fraction_source,
+            "compatibility_alias",
+        )
+
+        compatible = parse_args(
+            [
+                "--input-manifest",
+                "inputs.json",
+                "--slaclip-base-target-clipped-fraction",
+                "0.75",
+                "--slaclip-beta",
+                "0.75",
+            ]
+        )
+        self.assertEqual(
+            compatible.slaclip_base_target_clipped_fraction_source,
+            "canonical_and_compatible_alias",
+        )
+        with self.assertRaises(SystemExit):
+            parse_args(
+                [
+                    "--input-manifest",
+                    "inputs.json",
+                    "--slaclip-base-target-clipped-fraction",
+                    "0.75",
+                    "--slaclip-beta",
+                    "0.5",
+                ]
+            )
+
     def test_completed_root_summary_validation_rejects_derived_mismatch(self) -> None:
         config = paper_config()
         results = {
@@ -485,6 +553,8 @@ class PaperReproTests(unittest.TestCase):
             c_max=50.0,
         )
         self.assertEqual(summary["variant"], "full_slaclip_cdf_endpoints")
+        self.assertEqual(summary["base_target_clipped_fraction"], 0.5)
+        self.assertEqual(summary["beta"], 0.5)
         self.assertEqual(summary["near_threshold_index"], 0)
         self.assertEqual(summary["near_zero_index"], 1)
         self.assertEqual(summary["A"]["clip_threshold_used"], 2.0)
@@ -498,6 +568,26 @@ class PaperReproTests(unittest.TestCase):
                 controller["near_threshold_proxy"], noisy_cdf[0]
             )
             self.assertAlmostEqual(controller["near_zero_proxy"], noisy_cdf[-1])
+            expected_remaining = (
+                1.0
+                - noisy_cdf[-1] / (threshold + controller["epsilon"])
+            )
+            self.assertEqual(
+                controller["base_target_clipped_fraction"],
+                0.5,
+            )
+            self.assertAlmostEqual(
+                controller["remaining_non_small_gradient_fraction"],
+                expected_remaining,
+            )
+            self.assertAlmostEqual(
+                controller["raw_dynamic_target_clipped"],
+                0.5 * expected_remaining,
+            )
+            self.assertAlmostEqual(
+                controller["clamped_dynamic_target_clipped"],
+                controller["dynamic_target_clipped"],
+            )
             expected_gamma = max(
                 0.0,
                 min(

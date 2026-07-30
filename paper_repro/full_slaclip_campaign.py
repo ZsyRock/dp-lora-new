@@ -299,6 +299,12 @@ def _base_arm(
         "seed": seed,
         "initial_clip_norm": clip_norm,
         "slaclip_eta": eta,
+        # ``beta`` is the full-controller base target clipped fraction.  The
+        # per-round target remains dynamic:
+        # beta * (1 - noisy_near_zero / (C_t + epsilon)).
+        "slaclip_base_target_clipped_fraction": beta,
+        # Retain the mathematical name in manifests for backwards-compatible
+        # analysis of snapshots created before the semantic CLI was added.
         "slaclip_beta": beta,
         "reference_arm_id": reference_arm_id,
         # Common random numbers isolate method/C/noise effects within a seed.
@@ -1017,8 +1023,8 @@ def _arm_command(
             [
                 "--slaclip-eta",
                 str(arm["slaclip_eta"]),
-                "--slaclip-beta",
-                str(arm["slaclip_beta"]),
+                "--slaclip-base-target-clipped-fraction",
+                str(arm["slaclip_base_target_clipped_fraction"]),
                 "--slaclip-num-slots",
                 str(arm["slaclip_num_slots"]),
                 "--slaclip-c-min",
@@ -1243,12 +1249,15 @@ def run_preflight_smoke(args: argparse.Namespace) -> int:
         for arm in runtime["arms"]
         if arm["family"] == "primary"
         and arm["method"] == desired_method
-        and arm["seed"] == 42
         and arm["initial_clip_norm"] == 10.0
     ]
-    if len(candidates) != 1:
-        raise RuntimeError("could not resolve the unique paper-style smoke template")
-    arm = dict(candidates[0])
+    if not candidates:
+        raise RuntimeError("could not resolve a paper-style smoke template")
+    smoke_seed = min(int(arm["seed"]) for arm in candidates)
+    selected = [arm for arm in candidates if int(arm["seed"]) == smoke_seed]
+    if len(selected) != 1:
+        raise RuntimeError("paper-style smoke template is not unique at the first seed")
+    arm = dict(selected[0])
     label = "paper-baseline" if args.lane == 0 else "full-slaclip"
     arm["arm_id"] = f"preflight-{label}"
     arm["rng_domain"] = "full-slaclip-cdf:preflight:c10"
@@ -1441,6 +1450,9 @@ def _model_metrics(
         "noise_multiplier": arm["noise_multiplier"],
         "initial_clip_norm": arm["initial_clip_norm"],
         "slaclip_eta": arm["slaclip_eta"],
+        "slaclip_base_target_clipped_fraction": arm[
+            "slaclip_base_target_clipped_fraction"
+        ],
         "slaclip_beta": arm["slaclip_beta"],
         "reference_arm_id": arm["reference_arm_id"],
         "model": model,
@@ -1471,6 +1483,12 @@ def _model_metrics(
         "cdf_near_threshold_median": ("near_threshold_proxy",),
         "cdf_near_zero_median": ("near_zero_proxy",),
         "near_zero_adjusted_median": ("near_zero_adjusted",),
+        "remaining_non_small_gradient_fraction_median": (
+            "remaining_non_small_gradient_fraction",
+        ),
+        "raw_dynamic_target_clipped_median": (
+            "raw_dynamic_target_clipped",
+        ),
         "dynamic_target_median": ("dynamic_target_unclipped",),
         "dynamic_target_clipped_median": ("dynamic_target_clipped",),
         "controller_error_median": ("controller_error",),
@@ -1562,6 +1580,7 @@ BASE_METRIC_COLUMNS = (
     "noise_multiplier",
     "initial_clip_norm",
     "slaclip_eta",
+    "slaclip_base_target_clipped_fraction",
     "slaclip_beta",
     "reference_arm_id",
     "model",
@@ -1582,6 +1601,8 @@ GROUP_METRIC_COLUMNS = (
     "cdf_near_threshold_median",
     "cdf_near_zero_median",
     "near_zero_adjusted_median",
+    "remaining_non_small_gradient_fraction_median",
+    "raw_dynamic_target_clipped_median",
     "dynamic_target_median",
     "dynamic_target_clipped_median",
     "controller_error_median",
@@ -1769,6 +1790,160 @@ def paired_inference(values: Sequence[float]) -> dict[str, float | int | None]:
         "zero_fraction": sum(value == 0.0 for value in finite) / count,
         "exact_sign_flip_p": extreme / assignments,
     }
+
+
+def write_development_beta_selection(
+    runtime: Mapping[str, Any],
+    root: Path,
+    *,
+    metric_rows: Sequence[Mapping[str, Any]],
+    paired_rows: Sequence[Mapping[str, Any]],
+) -> Path | None:
+    """Freeze a transparent development ranking without calling it test evidence."""
+
+    boundary = runtime.get("scientific_boundary")
+    if (
+        not isinstance(boundary, dict)
+        or boundary.get("analysis_role")
+        != "development_hyperparameter_screen_not_confirmatory_test"
+    ):
+        return None
+    candidate_values = boundary.get("candidate_base_target_clipped_fractions")
+    development_seeds = boundary.get("development_seeds")
+    if (
+        not isinstance(candidate_values, list)
+        or len(candidate_values) != 5
+        or not isinstance(development_seeds, list)
+        or not development_seeds
+    ):
+        raise RuntimeError("beta-development boundary is incomplete")
+    candidates = [require_number(value, "development beta", positive=True) for value in candidate_values]
+    if len(set(candidates)) != 5 or any(value > 1.0 for value in candidates):
+        raise RuntimeError("beta-development candidates must be five unique values in (0,1]")
+    expected_seeds = {
+        require_int(value, "development seed", positive=False)
+        for value in development_seeds
+    }
+    rankings: dict[str, Any] = {}
+    for model in EXPECTED_MODELS:
+        candidate_records: list[dict[str, Any]] = []
+        for beta in candidates:
+            paired = [
+                row
+                for row in paired_rows
+                if row.get("model") == model
+                and row.get("slaclip_beta") == beta
+                and row.get("seed") in expected_seeds
+            ]
+            if {row.get("seed") for row in paired} != expected_seeds:
+                raise RuntimeError(
+                    f"beta-development results are incomplete for {model}/beta={beta}"
+                )
+            final_differences = _finite_values(
+                paired,
+                "final_loss_difference_slaclip_minus_fixed",
+            )
+            auc_differences = _finite_values(
+                paired,
+                "normalized_loss_auc_difference_slaclip_minus_fixed",
+            )
+            if len(final_differences) != len(expected_seeds) or len(
+                auc_differences
+            ) != len(expected_seeds):
+                raise RuntimeError(
+                    f"beta-development loss evidence is non-finite for {model}/beta={beta}"
+                )
+            adaptive = [
+                row
+                for row in metric_rows
+                if row.get("model") == model
+                and row.get("method") == FULL_SLACLIP_METHOD
+                and row.get("slaclip_beta") == beta
+                and row.get("seed") in expected_seeds
+            ]
+            if {row.get("seed") for row in adaptive} != expected_seeds:
+                raise RuntimeError(
+                    f"beta-development controller evidence is incomplete for {model}/beta={beta}"
+                )
+            instability_fields = tuple(
+                f"{name}_{group}"
+                for group in ("A", "B")
+                for name in (
+                    "gamma_clamped_low_count",
+                    "gamma_clamped_high_count",
+                    "lower_bound_hits",
+                    "upper_bound_hits",
+                )
+            )
+            instability_values = [
+                row.get(field)
+                for row in adaptive
+                for field in instability_fields
+            ]
+            if any(
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+                for value in instability_values
+            ):
+                raise RuntimeError(
+                    f"beta-development controller evidence is invalid for {model}/beta={beta}"
+                )
+            candidate_records.append(
+                {
+                    "base_target_clipped_fraction": beta,
+                    "seed_count": len(expected_seeds),
+                    "mean_paired_final_loss_delta_vs_fixed": statistics.fmean(
+                        final_differences
+                    ),
+                    "mean_paired_normalized_loss_auc_delta_vs_fixed": (
+                        statistics.fmean(auc_differences)
+                    ),
+                    "controller_instability_event_count": sum(
+                        int(value) for value in instability_values
+                    ),
+                }
+            )
+        ordered = sorted(
+            candidate_records,
+            key=lambda row: (
+                row["mean_paired_final_loss_delta_vs_fixed"],
+                row["mean_paired_normalized_loss_auc_delta_vs_fixed"],
+                row["controller_instability_event_count"],
+                row["base_target_clipped_fraction"],
+            ),
+        )
+        rankings[model] = {
+            "selected_base_target_clipped_fraction_for_future_confirmation": ordered[
+                0
+            ]["base_target_clipped_fraction"],
+            "ordered_candidates": ordered,
+        }
+    output = root / "development_beta_selection.json"
+    atomic_json(
+        output,
+        {
+            "schema_version": 1,
+            "status": "DEVELOPMENT_SELECTION_ONLY_NOT_TEST_EVIDENCE",
+            "campaign_name": runtime["campaign_name"],
+            "runtime_manifest_sha256": runtime["manifest_sha256"],
+            "models": rankings,
+            "selection_rule": {
+                "primary": "lowest_mean_paired_final_internal_validation_loss_delta",
+                "tiebreakers": [
+                    "lowest_mean_paired_normalized_internal_validation_loss_AUC_delta",
+                    "fewest_controller_clamp_or_threshold-bound-hit_events",
+                    "smaller_base_target_clipped_fraction",
+                ],
+            },
+            "warning": (
+                "The selected values must be frozen before an independent "
+                "confirmation run; this artifact is not test-set evidence."
+            ),
+            "created_at_utc": utc_now(),
+        },
+    )
+    return output
 
 
 def _load_comparison_record(
@@ -2232,6 +2407,16 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
         len(completed_arm_ids) == runtime["expected_arm_count"]
         and len(comparison_records) == expected_comparisons
     )
+    beta_selection_path = (
+        write_development_beta_selection(
+            runtime,
+            root,
+            metric_rows=rows,
+            paired_rows=paired_rows,
+        )
+        if completed
+        else None
+    )
     summary = {
         "schema_version": SCHEMA_VERSION,
         "status": "COMPLETED" if completed else "IN_PROGRESS",
@@ -2260,6 +2445,15 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
                 record["validation"] == "REVERIFIED_THIS_PASS"
                 for record in comparison_records
             )
+        ),
+        "development_beta_selection": (
+            {
+                "path": str(beta_selection_path),
+                "sha256": sha256_file(beta_selection_path),
+                "status": "DEVELOPMENT_SELECTION_ONLY_NOT_TEST_EVIDENCE",
+            }
+            if beta_selection_path is not None
+            else None
         ),
         "comparisons": comparison_records,
         "scientific_boundary": runtime["scientific_boundary"],
@@ -2291,6 +2485,7 @@ def _archive_candidate(path: Path, root: Path) -> bool:
         "paired_metrics.csv",
         "aggregate_metrics.csv",
         "paired_aggregate_metrics.csv",
+        "development_beta_selection.json",
     }:
         return True
     if relative.parts[0] == "arm-status" and relative.suffix == ".json":
@@ -2369,10 +2564,18 @@ def cuda_smoke(args: argparse.Namespace) -> None:
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise RuntimeError("each Slurm smoke lane must expose exactly one CUDA GPU")
     properties = torch.cuda.get_device_properties(0)
-    if "H200" not in properties.name.upper():
-        raise RuntimeError(f"campaign requires an H200 lane, found {properties.name}")
-    if int(properties.total_memory) < 100 * 1024**3:
-        raise RuntimeError("visible H200 reports unexpectedly low VRAM")
+    expected_name = args.expected_device_name.strip().upper()
+    if not expected_name or expected_name not in properties.name.upper():
+        raise RuntimeError(
+            f"campaign requires a {args.expected_device_name} lane, "
+            f"found {properties.name}"
+        )
+    minimum_vram_bytes = int(args.min_vram_gib) * 1024**3
+    if int(properties.total_memory) < minimum_vram_bytes:
+        raise RuntimeError(
+            f"visible {properties.name} reports less than "
+            f"{args.min_vram_gib} GiB VRAM"
+        )
     left = torch.randn(1024, 1024, device="cuda")
     right = torch.randn(1024, 1024, device="cuda")
     checksum = float((left @ right).mean().item())
@@ -2390,6 +2593,8 @@ def cuda_smoke(args: argparse.Namespace) -> None:
             "torch_cuda": torch.version.cuda,
             "device_name": properties.name,
             "total_vram_bytes": int(properties.total_memory),
+            "expected_device_name_substring": args.expected_device_name,
+            "minimum_vram_bytes": minimum_vram_bytes,
             "visible_device_count": torch.cuda.device_count(),
             "step_environment": step_environment,
             "smoke_checksum": checksum,
@@ -2517,6 +2722,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     smoke = subparsers.add_parser("cuda-smoke")
     smoke.add_argument("--lane", type=int, choices=(0, 1), required=True)
     smoke.add_argument("--output", type=Path, required=True)
+    smoke.add_argument("--expected-device-name", required=True)
+    smoke.add_argument("--min-vram-gib", type=int, required=True)
     return parser.parse_args(argv)
 
 
