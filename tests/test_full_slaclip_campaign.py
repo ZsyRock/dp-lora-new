@@ -22,6 +22,14 @@ from paper_repro.full_slaclip_campaign import (
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 SPEC = REPOSITORY / "hpc" / "full-slaclip-campaign-spec.json"
+SLURM_WORKER = REPOSITORY / "hpc" / "full_slaclip_campaign.sbatch"
+
+
+def test_slurm_worker_exports_required_cuda_determinism_contract() -> None:
+    worker = SLURM_WORKER.read_text(encoding="utf-8")
+    required_export = "export CUBLAS_WORKSPACE_CONFIG=:4096:8"
+    assert worker.count(required_export) == 1
+    assert worker.index(required_export) < worker.index("run_step()")
 
 
 def test_checked_in_matrix_is_exact_and_contains_no_slaclip_q() -> None:

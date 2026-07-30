@@ -67,6 +67,7 @@ export HF_DATASETS_OFFLINE=1
 export PYTHONUNBUFFERED=1
 export PYTHONDONTWRITEBYTECODE=1
 export TOKENIZERS_PARALLELISM=false
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export OMP_NUM_THREADS="$lane_cpus"
 export TMPDIR="${SLURM_TMPDIR:-$scratch_root/tmp/dp-lora-full-slaclip-$SLURM_JOB_ID}"
 mkdir -p "$TMPDIR"
