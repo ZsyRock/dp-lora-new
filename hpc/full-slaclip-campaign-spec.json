@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "campaign_name": "full_slaclip_cdf_endpoints_v1",
-  "description": "Matched DP-LoRA and full SlaClip CDF-endpoint controller study; no fixed-target ablation arms.",
-  "expected_arm_count": 60,
+  "campaign_name": "full_slaclip_cdf_endpoints_journal_pilot_v2",
+  "description": "Matched DP-LoRA and full SlaClip journal-pilot study with confirmatory seeds, C0 robustness, controller, noise, and CDF-record-count sensitivity.",
+  "expected_arm_count": 108,
   "common": {
     "models": [
       "bert",
@@ -15,8 +15,12 @@
     "learning_rate": 0.0005,
     "rank": 512,
     "max_seq_length": 128,
+    "max_validation_records": 512,
     "eval_every": 10,
     "checkpoint_every": 10,
+    "data_split_seed": 1729,
+    "evaluation_seed": 2718,
+    "delta": 0.00001,
     "slaclip_num_slots": 15,
     "slaclip_c_min": 0.1,
     "slaclip_c_max": 50.0,
@@ -25,7 +29,27 @@
   },
   "primary": {
     "initial_clip_norms": [
-      10.0,
+      10.0
+    ],
+    "seeds": [
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51
+    ],
+    "methods": [
+      "paper_dp_lora",
+      "slaclip_dp_lora"
+    ]
+  },
+  "threshold_robustness": {
+    "initial_clip_norms": [
       0.1,
       1.0,
       5.0,
@@ -61,12 +85,47 @@
     "method": "slaclip_dp_lora",
     "exclude_primary_default": true
   },
-  "controls": {
+  "noise_sensitivity": {
     "initial_clip_norm": 10.0,
     "seeds": [
       42,
       43,
       44
+    ],
+    "noise_multipliers": [
+      0.5,
+      1.0,
+      4.0
+    ],
+    "methods": [
+      "paper_dp_lora",
+      "slaclip_dp_lora"
+    ]
+  },
+  "client_sensitivity": {
+    "initial_clip_norm": 10.0,
+    "seeds": [
+      42,
+      43,
+      44
+    ],
+    "num_clients": [
+      20,
+      80
+    ],
+    "methods": [
+      "paper_dp_lora",
+      "slaclip_dp_lora"
+    ]
+  },
+  "controls": {
+    "initial_clip_norm": 10.0,
+    "seeds": [
+      42,
+      43,
+      44,
+      45,
+      46
     ],
     "methods": [
       "no_dp_lora_control",
@@ -86,8 +145,15 @@
       "beta": 0.5
     },
     "controller": "full_SlaClip_uses_noisy_CDF_near_threshold_and_near_zero_endpoints",
-    "other_initial_thresholds": "pre_registered_initial_C_sensitivity",
+    "other_initial_thresholds": "pre_registered_initial_C_robustness",
     "other_eta_beta_values": "pre_registered_controller_sensitivity",
+    "noise_multiplier_values": "sigma sensitivity only; not an epsilon sweep",
+    "client_count_values": "CDF protected-record-count sensitivity",
+    "fixed_evaluation_protocol": {
+      "data_split_seed": 1729,
+      "evaluation_seed": 2718,
+      "holdout_records": 512
+    },
     "excluded_method_family": "legacy_fixed_target_ablation"
   }
 }

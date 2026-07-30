@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from dataclasses import asdict
 from pathlib import Path
+from unittest.mock import patch
 
 from paper_repro.compare_slaclip import (
     ADAPTIVE_METHOD,
@@ -15,12 +16,18 @@ from paper_repro.compare_slaclip import (
     COMPARISON_STATUS,
     SLACLIP_CONTRACT_SCHEMA,
     SLACLIP_VARIANT,
+    _independent_full_slaclip_update,
+    _independent_normalize_noisy_slack,
     _round_shard_prefix_sha256,
     _validate_exact_cdf_range,
     build_comparison,
     main,
 )
-from paper_repro.reproducibility import METHOD_SPECS, canonical_json_fingerprint
+from paper_repro.reproducibility import (
+    METHOD_SPECS,
+    canonical_json_fingerprint,
+    safe_quantiles,
+)
 from paper_repro.slaclip import (
     automatic_num_slots,
     full_slaclip_update,
@@ -429,13 +436,46 @@ def controller_round(
         update_fields["c_min"] = update_fields.pop("min_clip_norm")
         update_fields["c_max"] = update_fields.pop("max_clip_norm")
         update_fields.pop("current_clip_norm")
+        oracle_update = full_slaclip_update(
+            thresholds[group],
+            exact[0],
+            exact[-1],
+            beta=BETA,
+            eta=ETA,
+            min_clip_norm=C_MIN,
+            max_clip_norm=C_MAX,
+            epsilon=EPSILON,
+        )
+        cdf_errors = [
+            noisy_value - exact_value
+            for noisy_value, exact_value in zip(noisy, exact)
+        ]
+        cdf_error_mae = math.fsum(abs(value) for value in cdf_errors) / NUM_SLOTS
+        cdf_error_rmse = math.sqrt(
+            math.fsum(value * value for value in cdf_errors) / NUM_SLOTS
+        )
+        normalized_noise = NOISE_MULTIPLIER * math.sqrt(NUM_SLOTS / CLIENTS)
+        noisy_log_step = float(update_fields["raw_log_step"])
+        oracle_log_step = float(oracle_update["raw_log_step"])
+
+        def direction(value: float) -> int:
+            return -1 if value < 0.0 else (1 if value > 0.0 else 0)
+
         actual = ACTUAL_CLIP[group]
         value[group] = {
             "clip_threshold_used": thresholds[group],
             "noisy_cdf_proxy_by_slot": noisy,
             "exact_cdf_proxy_by_slot": exact,
-            "normalized_proxy_noise_std_per_slot": (
-                NOISE_MULTIPLIER * math.sqrt(NUM_SLOTS / CLIENTS)
+            "normalized_proxy_noise_std_per_slot": normalized_noise,
+            "cdf_error_mae": cdf_error_mae,
+            "cdf_error_rmse": cdf_error_rmse,
+            "cdf_error_max_abs": max(abs(value) for value in cdf_errors),
+            "cdf_error_z_rmse": cdf_error_rmse / normalized_noise,
+            "noisy_cdf_out_of_range_count": sum(
+                not 0.0 <= value <= 1.0 for value in noisy
+            ),
+            "noisy_cdf_out_of_range_fraction": (
+                sum(not 0.0 <= value <= 1.0 for value in noisy) / NUM_SLOTS
             ),
             "noisy_near_threshold_minus_exact": noisy[0] - exact[0],
             "noisy_near_zero_minus_exact": noisy[-1] - exact[-1],
@@ -451,9 +491,81 @@ def controller_round(
             "actual_minus_dynamic_target_clipped": (
                 actual - update_fields["dynamic_target_clipped"]
             ),
+            "actual_target_absolute_error": abs(
+                actual - update_fields["dynamic_target_clipped"]
+            ),
+            "oracle_dynamic_target_clipped": oracle_update[
+                "dynamic_target_clipped"
+            ],
+            "oracle_raw_log_step": oracle_log_step,
+            "oracle_next_clip_threshold": oracle_update["next_clip_norm"],
+            "noisy_minus_oracle_raw_log_step": (
+                noisy_log_step - oracle_log_step
+            ),
+            "noisy_oracle_log_threshold_error": math.log(
+                update_fields["next_clip_threshold"]
+                / oracle_update["next_clip_norm"]
+            ),
+            "update_direction_agrees": (
+                direction(noisy_log_step) == direction(oracle_log_step)
+            ),
             **update_fields,
         }
     return value
+
+
+def controller_group_summary(
+    trajectory: list[dict], group: str, final_threshold: float
+) -> dict:
+    rounds = [value[group] for value in trajectory]
+    quantile_fields = (
+        "actual_target_absolute_error",
+        "cdf_error_mae",
+        "cdf_error_rmse",
+        "cdf_error_max_abs",
+        "cdf_error_z_rmse",
+        "oracle_dynamic_target_clipped",
+        "oracle_raw_log_step",
+        "oracle_next_clip_threshold",
+        "noisy_minus_oracle_raw_log_step",
+        "noisy_oracle_log_threshold_error",
+    )
+    raw_steps = [float(value["raw_log_step"]) for value in rounds]
+    nonzero_directions = [
+        -1 if value < 0.0 else 1 for value in raw_steps if value != 0.0
+    ]
+    agreement_count = sum(
+        bool(value["update_direction_agrees"]) for value in rounds
+    )
+    out_of_range_count = sum(
+        int(value["noisy_cdf_out_of_range_count"]) for value in rounds
+    )
+    return {
+        **{
+            key: safe_quantiles(value[key] for value in rounds)
+            for key in quantile_fields
+        },
+        "log_threshold_total_variation": math.fsum(
+            abs(
+                math.log(
+                    value["next_clip_threshold"]
+                    / value["clip_threshold_used"]
+                )
+            )
+            for value in rounds
+        ),
+        "log_step_direction_flip_count": sum(
+            left != right
+            for left, right in zip(nonzero_directions, nonzero_directions[1:])
+        ),
+        "oracle_direction_agreement_count": agreement_count,
+        "oracle_direction_agreement_fraction": agreement_count / len(rounds),
+        "noisy_cdf_out_of_range_count": out_of_range_count,
+        "noisy_cdf_out_of_range_fraction": (
+            out_of_range_count / (len(rounds) * NUM_SLOTS)
+        ),
+        "final_next_clip_threshold": final_threshold,
+    }
 
 
 def write_adaptive(parent: Path) -> Path:
@@ -503,7 +615,9 @@ def write_adaptive(parent: Path) -> Path:
             "rounds": ROUNDS,
             "trajectory_sha256": canonical_json_fingerprint(trajectory),
             "groups": {
-                group: {"final_next_clip_threshold": thresholds[group]}
+                group: controller_group_summary(
+                    trajectory, group, thresholds[group]
+                )
                 for group in GROUPS
             },
         }
@@ -574,10 +688,50 @@ def rewrite_adaptive_contract(adaptive: Path, contract: dict) -> None:
 
 
 class CompareSlaClipTests(unittest.TestCase):
+    def test_independent_controller_math_matches_golden_vector(self) -> None:
+        self.assertEqual(
+            _independent_normalize_noisy_slack(
+                [4.0, 8.0, 12.0, 16.0], 4.0, 4, 2
+            ),
+            (1.0, 2.0, 3.0, 4.0),
+        )
+        update = _independent_full_slaclip_update(
+            10.0,
+            0.72,
+            0.28,
+            beta=0.5,
+            eta=0.2,
+            min_clip_norm=0.1,
+            max_clip_norm=50.0,
+            epsilon=1e-6,
+        )
+        self.assertAlmostEqual(update["near_zero_adjusted"], 0.027999997200000286)
+        self.assertAlmostEqual(
+            update["dynamic_target_clipped"], 0.4860000013999999
+        )
+        self.assertAlmostEqual(update["raw_log_step"], -0.041200000279999975)
+        self.assertAlmostEqual(update["next_clip_norm"], 9.596371830484138)
+
     def test_exact_cdf_allows_only_float32_roundoff(self) -> None:
         _validate_exact_cdf_range([0.0, 1.0 + 5e-8], "exact CDF")
         with self.assertRaisesRegex(RuntimeError, "float32 tolerance"):
             _validate_exact_cdf_range([1.0 + 2e-6], "exact CDF")
+
+    def test_validation_does_not_call_production_controller_helpers(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            baseline, adaptive = build_fixture(Path(raw_root))
+            with (
+                patch(
+                    "paper_repro.slaclip.full_slaclip_update",
+                    side_effect=AssertionError("production update was called"),
+                ),
+                patch(
+                    "paper_repro.slaclip.normalize_noisy_slack",
+                    side_effect=AssertionError("production normalization was called"),
+                ),
+            ):
+                result = build_comparison(baseline, adaptive)
+            self.assertEqual(result["status"], COMPARISON_STATUS)
 
     def test_valid_pair_uses_both_noisy_endpoints_without_fixed_target(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
@@ -676,6 +830,61 @@ class CompareSlaClipTests(unittest.TestCase):
             ][0] -= 0.1
             private_json(shard_path, shard)
             with self.assertRaisesRegex(RuntimeError, "exact CDF does not reconcile"):
+                build_comparison(baseline, adaptive)
+
+    def test_cdf_error_telemetry_tampering_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            baseline, adaptive = build_fixture(Path(raw_root))
+            shard_path = (
+                adaptive
+                / "bert"
+                / "private_diagnostics"
+                / "rounds"
+                / "round-00001.json"
+            )
+            shard = load_json(shard_path)
+            shard["round_summary"]["slaclip_controller"]["A"][
+                "cdf_error_rmse"
+            ] += 0.1
+            private_json(shard_path, shard)
+            with self.assertRaisesRegex(
+                RuntimeError, "endpoint telemetry mismatch: cdf_error_rmse"
+            ):
+                build_comparison(baseline, adaptive)
+
+    def test_oracle_telemetry_tampering_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            baseline, adaptive = build_fixture(Path(raw_root))
+            shard_path = (
+                adaptive
+                / "gpt2"
+                / "private_diagnostics"
+                / "rounds"
+                / "round-00002.json"
+            )
+            shard = load_json(shard_path)
+            shard["round_summary"]["slaclip_controller"]["B"][
+                "oracle_next_clip_threshold"
+            ] += 0.1
+            private_json(shard_path, shard)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "endpoint telemetry mismatch: oracle_next_clip_threshold",
+            ):
+                build_comparison(baseline, adaptive)
+
+    def test_controller_summary_telemetry_tampering_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            baseline, adaptive = build_fixture(Path(raw_root))
+            summary = load_json(adaptive / "bert" / "final_summary.json")
+            controller = summary["behavior_summary"]["slaclip_controller"]
+            controller["groups"]["A"]["cdf_error_mae"]["quantiles"]["0.5"] += 0.1
+            summary["slaclip"]["controller_summary"] = controller
+            rewrite_adaptive_model_and_root(adaptive, "bert", summary)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "controller summary telemetry mismatch: cdf_error_mae",
+            ):
                 build_comparison(baseline, adaptive)
 
     def test_client_slack_release_tampering_fails_closed(self) -> None:

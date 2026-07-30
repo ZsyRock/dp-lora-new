@@ -36,6 +36,7 @@ from typing import Any, Mapping, Sequence
 
 SCHEMA_VERSION = 1
 RUNTIME_MANIFEST_NAME = "runtime-manifest.json"
+JOB_STATUS_NAME = "job-status.json"
 CAMPAIGN_KEY_BYTES = 32
 FULL_SLACLIP_METHOD = "slaclip_dp_lora"
 FIXED_DP_METHOD = "paper_dp_lora"
@@ -44,6 +45,13 @@ ALLOWED_METHODS = {FULL_SLACLIP_METHOD, FIXED_DP_METHOD, *CONTROL_METHODS}
 EXPECTED_MODELS = ("bert", "gpt2")
 SMALL_ARCHIVE_MAX_BYTES = 32 * 1024 * 1024
 FULL_COMPARISON_STATUS = "FULL_SLACLIP_COMPARISON_COMPLETE"
+REQUIRED_STEP_ENVIRONMENT = {
+    "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+    "HF_HUB_OFFLINE": "1",
+    "TRANSFORMERS_OFFLINE": "1",
+    "HF_DATASETS_OFFLINE": "1",
+    "SLURM_EXPORT_ENV": "ALL",
+}
 
 
 def utc_now() -> str:
@@ -164,8 +172,12 @@ def _common_values(spec: Mapping[str, Any]) -> dict[str, Any]:
         "learning_rate",
         "rank",
         "max_seq_length",
+        "max_validation_records",
         "eval_every",
         "checkpoint_every",
+        "data_split_seed",
+        "evaluation_seed",
+        "delta",
         "slaclip_num_slots",
         "slaclip_c_min",
         "slaclip_c_max",
@@ -182,8 +194,11 @@ def _common_values(spec: Mapping[str, Any]) -> dict[str, Any]:
         "batch_size",
         "rank",
         "max_seq_length",
+        "max_validation_records",
         "eval_every",
         "checkpoint_every",
+        "data_split_seed",
+        "evaluation_seed",
         "slaclip_num_slots",
     )
     normalized = dict(common)
@@ -192,6 +207,7 @@ def _common_values(spec: Mapping[str, Any]) -> dict[str, Any]:
     for name in (
         "noise_multiplier",
         "learning_rate",
+        "delta",
         "slaclip_c_min",
         "slaclip_c_max",
         "default_eta",
@@ -200,6 +216,8 @@ def _common_values(spec: Mapping[str, Any]) -> dict[str, Any]:
         normalized[name] = require_number(common[name], f"common.{name}", positive=True)
     if normalized["slaclip_c_max"] < normalized["slaclip_c_min"]:
         raise ValueError("SlaClip threshold bounds are reversed")
+    if not 0 < normalized["delta"] < 1:
+        raise ValueError("common.delta must be in (0, 1)")
     if not 0 < normalized["default_beta"] <= 1:
         raise ValueError("default_beta must be in (0, 1]")
     if normalized["rounds"] != 50 or normalized["batch_size"] != 8:
@@ -220,7 +238,10 @@ def load_spec(path: Path) -> dict[str, Any]:
             "expected_arm_count",
             "common",
             "primary",
+            "threshold_robustness",
             "sensitivity",
+            "noise_sensitivity",
+            "client_sensitivity",
             "controls",
             "scientific_boundary",
         },
@@ -248,18 +269,24 @@ def _base_arm(
     eta: float | None,
     beta: float | None,
     reference_arm_id: str | None,
+    num_clients: int | None = None,
+    noise_multiplier: float | None = None,
 ) -> dict[str, Any]:
     if method not in ALLOWED_METHODS:
         raise ValueError(f"unsupported method: {method}")
     adaptive = method == FULL_SLACLIP_METHOD
     if adaptive != (eta is not None and beta is not None):
         raise ValueError("adaptive controller parameters and method disagree")
-    if family == "primary" and clip_norm == 10.0:
-        analysis_role = "paper_style_primary"
-    elif family == "primary":
-        analysis_role = "pre_registered_initial_threshold_sensitivity"
+    if family == "primary":
+        analysis_role = "paper_setting_confirmatory_seed_replication"
+    elif family == "threshold_robustness":
+        analysis_role = "pre_registered_initial_threshold_robustness"
     elif family == "sensitivity":
         analysis_role = "pre_registered_controller_hyperparameter_sensitivity"
+    elif family == "noise_sensitivity":
+        analysis_role = "pre_registered_noise_multiplier_sensitivity"
+    elif family == "client_sensitivity":
+        analysis_role = "pre_registered_cdf_record_count_sensitivity"
     elif family == "control":
         analysis_role = "mechanism_control"
     else:
@@ -274,17 +301,28 @@ def _base_arm(
         "slaclip_eta": eta,
         "slaclip_beta": beta,
         "reference_arm_id": reference_arm_id,
-        "rng_domain": f"full-slaclip-cdf:s{seed}:c{number_token(clip_norm)}",
+        # Common random numbers isolate method/C/noise effects within a seed.
+        "rng_domain": f"full-slaclip-cdf:s{seed}",
         "models": list(common["models"]),
-        "num_clients": common["num_clients"],
+        "num_clients": (
+            common["num_clients"] if num_clients is None else num_clients
+        ),
         "rounds": common["rounds"],
         "batch_size": common["batch_size"],
-        "noise_multiplier": common["noise_multiplier"],
+        "noise_multiplier": (
+            common["noise_multiplier"]
+            if noise_multiplier is None
+            else noise_multiplier
+        ),
         "learning_rate": common["learning_rate"],
         "rank": common["rank"],
         "max_seq_length": common["max_seq_length"],
+        "max_validation_records": common["max_validation_records"],
         "eval_every": common["eval_every"],
         "checkpoint_every": common["checkpoint_every"],
+        "data_split_seed": common["data_split_seed"],
+        "evaluation_seed": common["evaluation_seed"],
+        "delta": common["delta"],
         "slaclip_num_slots": common["slaclip_num_slots"] if adaptive else None,
         "slaclip_c_min": common["slaclip_c_min"] if adaptive else None,
         "slaclip_c_max": common["slaclip_c_max"] if adaptive else None,
@@ -294,76 +332,161 @@ def _base_arm(
 def expand_spec(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
     common = _common_values(spec)
     primary = spec.get("primary")
+    threshold_robustness = spec.get("threshold_robustness")
     sensitivity = spec.get("sensitivity")
+    noise_sensitivity = spec.get("noise_sensitivity")
+    client_sensitivity = spec.get("client_sensitivity")
     controls = spec.get("controls")
-    if (
-        not isinstance(primary, dict)
-        or not isinstance(sensitivity, dict)
-        or not isinstance(controls, dict)
-    ):
-        raise ValueError("primary, sensitivity, and controls must be objects")
+    named_sections = {
+        "primary": primary,
+        "threshold_robustness": threshold_robustness,
+        "sensitivity": sensitivity,
+        "noise_sensitivity": noise_sensitivity,
+        "client_sensitivity": client_sensitivity,
+        "controls": controls,
+    }
+    if any(not isinstance(value, dict) for value in named_sections.values()):
+        raise ValueError("all campaign matrix sections must be objects")
+    assert isinstance(primary, dict)
+    assert isinstance(threshold_robustness, dict)
+    assert isinstance(sensitivity, dict)
+    assert isinstance(noise_sensitivity, dict)
+    assert isinstance(client_sensitivity, dict)
+    assert isinstance(controls, dict)
     require_exact_keys(primary, {"initial_clip_norms", "seeds", "methods"}, "primary")
+    require_exact_keys(
+        threshold_robustness,
+        {"initial_clip_norms", "seeds", "methods"},
+        "threshold_robustness",
+    )
     require_exact_keys(
         sensitivity,
         {"initial_clip_norm", "seeds", "etas", "betas", "method", "exclude_primary_default"},
         "sensitivity",
     )
+    require_exact_keys(
+        noise_sensitivity,
+        {"initial_clip_norm", "seeds", "noise_multipliers", "methods"},
+        "noise_sensitivity",
+    )
+    require_exact_keys(
+        client_sensitivity,
+        {"initial_clip_norm", "seeds", "num_clients", "methods"},
+        "client_sensitivity",
+    )
     require_exact_keys(controls, {"initial_clip_norm", "seeds", "methods"}, "controls")
 
-    clip_norms = primary["initial_clip_norms"]
+    primary_clip_norms = primary["initial_clip_norms"]
     primary_seeds = primary["seeds"]
     primary_methods = primary["methods"]
     if (
-        not isinstance(clip_norms, list)
+        not isinstance(primary_clip_norms, list)
         or not isinstance(primary_seeds, list)
         or not isinstance(primary_methods, list)
     ):
         raise ValueError("primary axes must be arrays")
-    clip_norms = [
+    primary_clip_norms = [
         require_number(value, "primary.initial_clip_norm", positive=True)
-        for value in clip_norms
+        for value in primary_clip_norms
     ]
     primary_seeds = [require_int(value, "primary.seed", positive=False) for value in primary_seeds]
     if tuple(primary_methods) != (FIXED_DP_METHOD, FULL_SLACLIP_METHOD):
         raise ValueError("primary methods must be fixed DP then full SlaClip")
-    _unique(clip_norms, "primary.initial_clip_norms")
+    if primary_clip_norms != [10.0]:
+        raise ValueError("confirmatory primary must be the paper setting C=10")
+    _unique(primary_clip_norms, "primary.initial_clip_norms")
     _unique(primary_seeds, "primary.seeds")
 
     arms: list[dict[str, Any]] = []
     default_eta = float(common["default_eta"])
     default_beta = float(common["default_beta"])
-    for clip_norm in clip_norms:
+
+    def append_pair(
+        *,
+        family: str,
+        stem: str,
+        seed: int,
+        clip_norm: float,
+        num_clients: int | None = None,
+        noise_multiplier: float | None = None,
+    ) -> None:
+        fixed_id = f"{stem}-fixed"
+        arms.append(
+            _base_arm(
+                common=common,
+                arm_id=fixed_id,
+                family=family,
+                method=FIXED_DP_METHOD,
+                seed=seed,
+                clip_norm=clip_norm,
+                eta=None,
+                beta=None,
+                reference_arm_id=None,
+                num_clients=num_clients,
+                noise_multiplier=noise_multiplier,
+            )
+        )
+        arms.append(
+            _base_arm(
+                common=common,
+                arm_id=f"{stem}-slaclip",
+                family=family,
+                method=FULL_SLACLIP_METHOD,
+                seed=seed,
+                clip_norm=clip_norm,
+                eta=default_eta,
+                beta=default_beta,
+                reference_arm_id=fixed_id,
+                num_clients=num_clients,
+                noise_multiplier=noise_multiplier,
+            )
+        )
+
+    for clip_norm in primary_clip_norms:
         if not common["slaclip_c_min"] <= clip_norm <= common["slaclip_c_max"]:
             raise ValueError("primary initial threshold is outside controller bounds")
         clip_token = number_token(clip_norm)
         for seed in primary_seeds:
-            fixed_id = f"primary-c{clip_token}-s{seed}-fixed"
-            adaptive_id = f"primary-c{clip_token}-s{seed}-slaclip"
-            arms.append(
-                _base_arm(
-                    common=common,
-                    arm_id=fixed_id,
-                    family="primary",
-                    method=FIXED_DP_METHOD,
-                    seed=seed,
-                    clip_norm=clip_norm,
-                    eta=None,
-                    beta=None,
-                    reference_arm_id=None,
-                )
+            append_pair(
+                family="primary",
+                stem=f"primary-c{clip_token}-s{seed}",
+                seed=seed,
+                clip_norm=clip_norm,
             )
-            arms.append(
-                _base_arm(
-                    common=common,
-                    arm_id=adaptive_id,
-                    family="primary",
-                    method=FULL_SLACLIP_METHOD,
-                    seed=seed,
-                    clip_norm=clip_norm,
-                    eta=default_eta,
-                    beta=default_beta,
-                    reference_arm_id=fixed_id,
-                )
+
+    robustness_clips = threshold_robustness["initial_clip_norms"]
+    robustness_seeds = threshold_robustness["seeds"]
+    robustness_methods = threshold_robustness["methods"]
+    if (
+        not isinstance(robustness_clips, list)
+        or not isinstance(robustness_seeds, list)
+        or not isinstance(robustness_methods, list)
+    ):
+        raise ValueError("threshold robustness axes must be arrays")
+    robustness_clips = [
+        require_number(value, "threshold_robustness.initial_clip_norm", positive=True)
+        for value in robustness_clips
+    ]
+    robustness_seeds = [
+        require_int(value, "threshold_robustness.seed", positive=False)
+        for value in robustness_seeds
+    ]
+    if tuple(robustness_methods) != (FIXED_DP_METHOD, FULL_SLACLIP_METHOD):
+        raise ValueError("threshold robustness methods/order is invalid")
+    _unique(robustness_clips, "threshold_robustness.initial_clip_norms")
+    _unique(robustness_seeds, "threshold_robustness.seeds")
+    if set(robustness_clips) & set(primary_clip_norms):
+        raise ValueError("threshold robustness must not duplicate the primary C")
+    for clip_norm in robustness_clips:
+        if not common["slaclip_c_min"] <= clip_norm <= common["slaclip_c_max"]:
+            raise ValueError("robustness threshold is outside controller bounds")
+        clip_token = number_token(clip_norm)
+        for seed in robustness_seeds:
+            append_pair(
+                family="threshold_robustness",
+                stem=f"robust-c{clip_token}-s{seed}",
+                seed=seed,
+                clip_norm=clip_norm,
             )
 
     sensitivity_clip = require_number(
@@ -394,7 +517,9 @@ def expand_spec(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
         or sensitivity["exclude_primary_default"] is not True
     ):
         raise ValueError("sensitivity must be de-duplicated full SlaClip")
-    if sensitivity_clip not in clip_norms or not set(sensitivity_seeds).issubset(primary_seeds):
+    if sensitivity_clip not in primary_clip_norms or not set(
+        sensitivity_seeds
+    ).issubset(primary_seeds):
         raise ValueError("sensitivity references require matching primary baselines")
     clip_token = number_token(sensitivity_clip)
     for seed in sensitivity_seeds:
@@ -421,6 +546,91 @@ def expand_spec(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
                     )
                 )
 
+    noise_clip = require_number(
+        noise_sensitivity["initial_clip_norm"],
+        "noise_sensitivity.initial_clip_norm",
+        positive=True,
+    )
+    noise_seeds = noise_sensitivity["seeds"]
+    noise_values = noise_sensitivity["noise_multipliers"]
+    noise_methods = noise_sensitivity["methods"]
+    if (
+        not isinstance(noise_seeds, list)
+        or not isinstance(noise_values, list)
+        or not isinstance(noise_methods, list)
+    ):
+        raise ValueError("noise sensitivity axes must be arrays")
+    noise_seeds = [
+        require_int(value, "noise_sensitivity.seed", positive=False)
+        for value in noise_seeds
+    ]
+    noise_values = [
+        require_number(
+            value,
+            "noise_sensitivity.noise_multiplier",
+            positive=True,
+        )
+        for value in noise_values
+    ]
+    if tuple(noise_methods) != (FIXED_DP_METHOD, FULL_SLACLIP_METHOD):
+        raise ValueError("noise sensitivity methods/order is invalid")
+    _unique(noise_seeds, "noise_sensitivity.seeds")
+    _unique(noise_values, "noise_sensitivity.noise_multipliers")
+    if float(common["noise_multiplier"]) in noise_values:
+        raise ValueError("noise sensitivity must not duplicate common sigma")
+    for noise_multiplier in noise_values:
+        sigma_token = number_token(noise_multiplier)
+        for seed in noise_seeds:
+            append_pair(
+                family="noise_sensitivity",
+                stem=(
+                    f"noise-sigma{sigma_token}-c{number_token(noise_clip)}-s{seed}"
+                ),
+                seed=seed,
+                clip_norm=noise_clip,
+                noise_multiplier=noise_multiplier,
+            )
+
+    client_clip = require_number(
+        client_sensitivity["initial_clip_norm"],
+        "client_sensitivity.initial_clip_norm",
+        positive=True,
+    )
+    client_seeds = client_sensitivity["seeds"]
+    client_values = client_sensitivity["num_clients"]
+    client_methods = client_sensitivity["methods"]
+    if (
+        not isinstance(client_seeds, list)
+        or not isinstance(client_values, list)
+        or not isinstance(client_methods, list)
+    ):
+        raise ValueError("client sensitivity axes must be arrays")
+    client_seeds = [
+        require_int(value, "client_sensitivity.seed", positive=False)
+        for value in client_seeds
+    ]
+    client_values = [
+        require_int(value, "client_sensitivity.num_clients")
+        for value in client_values
+    ]
+    if tuple(client_methods) != (FIXED_DP_METHOD, FULL_SLACLIP_METHOD):
+        raise ValueError("client sensitivity methods/order is invalid")
+    _unique(client_seeds, "client_sensitivity.seeds")
+    _unique(client_values, "client_sensitivity.num_clients")
+    if int(common["num_clients"]) in client_values:
+        raise ValueError("client sensitivity must not duplicate common N")
+    for num_clients in client_values:
+        for seed in client_seeds:
+            append_pair(
+                family="client_sensitivity",
+                stem=(
+                    f"clients-n{num_clients}-c{number_token(client_clip)}-s{seed}"
+                ),
+                seed=seed,
+                clip_norm=client_clip,
+                num_clients=num_clients,
+            )
+
     control_clip = require_number(
         controls["initial_clip_norm"],
         "controls.initial_clip_norm",
@@ -433,7 +643,9 @@ def expand_spec(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
     control_seeds = [require_int(value, "controls.seed", positive=False) for value in control_seeds]
     if tuple(control_methods) != CONTROL_METHODS:
         raise ValueError("control methods/order is invalid")
-    if control_clip not in clip_norms or not set(control_seeds).issubset(primary_seeds):
+    if control_clip not in primary_clip_norms or not set(control_seeds).issubset(
+        primary_seeds
+    ):
         raise ValueError("controls require matching primary configurations")
     control_token = number_token(control_clip)
     for seed in control_seeds:
@@ -624,6 +836,120 @@ def load_runtime(path: Path) -> dict[str, Any]:
     return value
 
 
+def mark_job_status(args: argparse.Namespace) -> None:
+    """Atomically record the lifecycle of one Slurm campaign allocation.
+
+    ``campaign_summary.json`` is intentionally an incremental scientific
+    aggregate and can therefore remain ``IN_PROGRESS`` after a batch failure.
+    This separate marker is authoritative for the allocation lifecycle.  A
+    job may only terminate its own RUNNING attempt, preventing a late trap from
+    an older allocation from overwriting a newer resumed allocation.
+    """
+
+    campaign_root = args.campaign_root.resolve()
+    runtime_manifest = args.runtime_manifest.resolve()
+    status_path = campaign_root / JOB_STATUS_NAME
+    if not campaign_root.is_dir() or not runtime_manifest.is_file():
+        raise RuntimeError("job status requires a prepared campaign manifest")
+    if args.status not in {"RUNNING", "COMPLETED", "FAILED"}:
+        raise ValueError(f"unsupported campaign job status: {args.status}")
+    if not args.slurm_job_id or any(
+        character not in "0123456789_" for character in args.slurm_job_id
+    ):
+        raise ValueError("Slurm job ID must contain only digits and underscores")
+    if (
+        len(args.repository_sha) != 40
+        or any(character not in "0123456789abcdef" for character in args.repository_sha)
+    ):
+        raise ValueError("repository SHA must be 40 lowercase hexadecimal characters")
+    if not args.reason or any(character in "\r\n" for character in args.reason):
+        raise ValueError("job-status reason must be a non-empty single line")
+    if args.status == "RUNNING":
+        if args.exit_code is not None:
+            raise ValueError("RUNNING job status cannot have an exit code")
+    else:
+        if args.exit_code is None or args.exit_code < 0:
+            raise ValueError("terminal job status requires a non-negative exit code")
+        if args.status == "COMPLETED" and args.exit_code != 0:
+            raise ValueError("COMPLETED job status requires exit code zero")
+        if args.status == "FAILED" and args.exit_code == 0:
+            raise ValueError("FAILED job status requires a nonzero exit code")
+
+    runtime = load_runtime(runtime_manifest)
+    if runtime["repository_sha"] != args.repository_sha:
+        raise RuntimeError("job status repository SHA differs from runtime manifest")
+    manifest_sha256 = sha256_file(runtime_manifest)
+    now = utc_now()
+    existing: dict[str, Any] | None = None
+    if status_path.exists():
+        existing = load_object(status_path, "campaign job status")
+        required_existing = {
+            "schema_version",
+            "status",
+            "attempt_number",
+            "slurm_job_id",
+            "repository_sha",
+            "runtime_manifest_sha256",
+            "started_at_utc",
+        }
+        if not required_existing.issubset(existing):
+            raise RuntimeError("existing campaign job status is incomplete")
+        if (
+            existing["schema_version"] != SCHEMA_VERSION
+            or existing["repository_sha"] != args.repository_sha
+            or existing["runtime_manifest_sha256"] != manifest_sha256
+        ):
+            raise RuntimeError("existing campaign job status identity differs")
+
+    if args.status == "RUNNING":
+        if existing is not None and existing["status"] == "RUNNING":
+            if existing["slurm_job_id"] != args.slurm_job_id:
+                raise RuntimeError("another Slurm allocation already owns this campaign")
+            attempt_number = int(existing["attempt_number"])
+            started_at_utc = str(existing["started_at_utc"])
+        else:
+            attempt_number = (
+                int(existing["attempt_number"]) + 1 if existing is not None else 1
+            )
+            started_at_utc = now
+        terminal_at_utc = None
+        exit_code = None
+        resumable = False
+    else:
+        if (
+            existing is None
+            or existing["status"] != "RUNNING"
+            or existing["slurm_job_id"] != args.slurm_job_id
+        ):
+            raise RuntimeError("only the owning RUNNING allocation may write a terminal status")
+        attempt_number = int(existing["attempt_number"])
+        started_at_utc = str(existing["started_at_utc"])
+        terminal_at_utc = now
+        exit_code = int(args.exit_code)
+        resumable = args.status == "FAILED" and exit_code == 75
+
+    atomic_json(
+        status_path,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "status": args.status,
+            "attempt_number": attempt_number,
+            "slurm_job_id": args.slurm_job_id,
+            "hostname": socket.gethostname(),
+            "repository_sha": args.repository_sha,
+            "runtime_manifest": str(runtime_manifest),
+            "runtime_manifest_sha256": manifest_sha256,
+            "campaign_root": str(campaign_root),
+            "started_at_utc": started_at_utc,
+            "updated_at_utc": now,
+            "terminal_at_utc": terminal_at_utc,
+            "exit_code": exit_code,
+            "reason": args.reason,
+            "resumable": resumable,
+        },
+    )
+
+
 def _arm_command(
     arm: Mapping[str, Any],
     *,
@@ -663,8 +989,16 @@ def _arm_command(
         str(arm["rank"]),
         "--max-seq-length",
         str(arm["max_seq_length"]),
+        "--max-validation-records",
+        str(arm["max_validation_records"]),
         "--seed",
         str(arm["seed"]),
+        "--data-split-seed",
+        str(arm["data_split_seed"]),
+        "--evaluation-seed",
+        str(arm["evaluation_seed"]),
+        "--delta",
+        str(arm["delta"]),
         "--eval-every",
         str(arm["eval_every"]),
         "--checkpoint-every",
@@ -729,6 +1063,11 @@ def run_arm(args: argparse.Namespace) -> int:
     if index < 0 or index >= len(arms):
         raise ValueError(f"arm index is out of range: {index}")
     arm = arms[index]
+    status_identity = {
+        "runtime_manifest_sha256": runtime["manifest_sha256"],
+        "repository_sha": runtime["repository_sha"],
+        "arm_spec_sha256": sha256_bytes(canonical_bytes(arm)),
+    }
     campaign_root = manifest_path.parent
     output_dir = campaign_root / "arms" / arm["arm_id"]
     status_path = campaign_root / "arm-status" / f"{arm['arm_id']}.json"
@@ -749,6 +1088,10 @@ def run_arm(args: argparse.Namespace) -> int:
             and prior_status.get("arm_id") == arm["arm_id"]
             and prior_status.get("index") == arm["index"]
             and prior_status.get("method") == arm["method"]
+            and all(
+                prior_status.get(name) == value
+                for name, value in status_identity.items()
+            )
             and prior_status.get("final_summary_sha256")
             == sha256_file(final_summary_path)
             and final_summary.get("status") == "COMPLETED"
@@ -776,6 +1119,7 @@ def run_arm(args: argparse.Namespace) -> int:
         status_path,
         arm,
         "RUNNING",
+        **status_identity,
         resumed=output_dir.exists(),
         slurm_job_id=os.environ.get("SLURM_JOB_ID"),
         hostname=socket.gethostname(),
@@ -828,6 +1172,16 @@ def run_arm(args: argparse.Namespace) -> int:
                 check=False,
             )
         return_code = int(completed.returncode)
+    except BaseException as error:
+        _write_arm_status(
+            status_path,
+            arm,
+            "FAILED",
+            **status_identity,
+            exit_code=None,
+            exception_type=type(error).__name__,
+        )
+        raise
     finally:
         stop_watcher_done.set()
         watcher.join(timeout=2.0)
@@ -836,6 +1190,14 @@ def run_arm(args: argparse.Namespace) -> int:
         final_summary = output_dir / "final_summary.json"
         summary = load_object(final_summary, "arm final summary")
         if summary.get("status") != "COMPLETED" or summary.get("method") != arm["method"]:
+            _write_arm_status(
+                status_path,
+                arm,
+                "FAILED",
+                **status_identity,
+                exit_code=0,
+                validation_error="zero_exit_without_matching_completed_summary",
+            )
             raise RuntimeError(
                 "arm returned zero without a matching completed summary: "
                 f"{arm['arm_id']}"
@@ -844,13 +1206,26 @@ def run_arm(args: argparse.Namespace) -> int:
             status_path,
             arm,
             "COMPLETED",
+            **status_identity,
             exit_code=0,
             final_summary_sha256=sha256_file(final_summary),
         )
     elif return_code == 75:
-        _write_arm_status(status_path, arm, "CHECKPOINTED_STOP", exit_code=75)
+        _write_arm_status(
+            status_path,
+            arm,
+            "CHECKPOINTED_STOP",
+            **status_identity,
+            exit_code=75,
+        )
     else:
-        _write_arm_status(status_path, arm, "FAILED", exit_code=return_code)
+        _write_arm_status(
+            status_path,
+            arm,
+            "FAILED",
+            **status_identity,
+            exit_code=return_code,
+        )
     return return_code
 
 
@@ -1015,13 +1390,33 @@ def _model_metrics(
     summary: Mapping[str, Any],
 ) -> dict[str, Any]:
     evaluations = summary.get("evaluations")
-    initial_loss = final_loss = None
+    initial_loss = final_loss = best_loss = normalized_loss_auc = None
+    best_round = final_minus_best = None
     if isinstance(evaluations, list) and evaluations:
-        first, last = evaluations[0], evaluations[-1]
-        if isinstance(first, dict) and isinstance(first.get("loss"), (int, float)):
-            initial_loss = float(first["loss"])
-        if isinstance(last, dict) and isinstance(last.get("loss"), (int, float)):
-            final_loss = float(last["loss"])
+        points = [
+            (int(value["round"]), float(value["loss"]))
+            for value in evaluations
+            if isinstance(value, dict)
+            and isinstance(value.get("round"), int)
+            and isinstance(value.get("loss"), (int, float))
+            and not isinstance(value.get("loss"), bool)
+            and math.isfinite(float(value["loss"]))
+        ]
+        if len(points) == len(evaluations) and points:
+            first, last = points[0], points[-1]
+            initial_loss = first[1]
+            final_loss = last[1]
+            best_round, best_loss = min(points, key=lambda item: (item[1], item[0]))
+            final_minus_best = final_loss - best_loss
+            span = last[0] - first[0]
+            if span > 0:
+                normalized_loss_auc = math.fsum(
+                    (right_round - left_round) * (left_loss + right_loss) / 2.0
+                    for (left_round, left_loss), (right_round, right_loss) in zip(
+                        points,
+                        points[1:],
+                    )
+                ) / span
     clipping = summary.get("clipping")
     clipping = clipping if isinstance(clipping, dict) else {}
     any_group = clipping.get("any_group")
@@ -1042,6 +1437,8 @@ def _model_metrics(
         "analysis_role": arm["analysis_role"],
         "method": arm["method"],
         "seed": arm["seed"],
+        "num_clients": arm["num_clients"],
+        "noise_multiplier": arm["noise_multiplier"],
         "initial_clip_norm": arm["initial_clip_norm"],
         "slaclip_eta": arm["slaclip_eta"],
         "slaclip_beta": arm["slaclip_beta"],
@@ -1049,6 +1446,10 @@ def _model_metrics(
         "model": model,
         "initial_loss": initial_loss,
         "final_loss": final_loss,
+        "best_loss": best_loss,
+        "best_round": best_round,
+        "final_minus_best": final_minus_best,
+        "normalized_loss_auc": normalized_loss_auc,
         "loss_delta": (
             final_loss - initial_loss
             if initial_loss is not None and final_loss is not None
@@ -1057,6 +1458,14 @@ def _model_metrics(
         "actual_clipped_fraction": any_group.get("fraction"),
         "would_clip_fraction": any_group.get("would_fraction"),
         "elapsed_seconds": summary.get("elapsed_seconds"),
+        "cdf_endpoint_noise_std_theoretical": (
+            float(
+                arm["noise_multiplier"]
+                * math.sqrt(arm["slaclip_num_slots"] / arm["num_clients"])
+            )
+            if arm["method"] == FULL_SLACLIP_METHOD
+            else None
+        ),
     }
     aliases = {
         "cdf_near_threshold_median": ("near_threshold_proxy",),
@@ -1068,16 +1477,39 @@ def _model_metrics(
         "near_threshold_proxy_error_median": ("near_threshold_proxy_error",),
         "near_zero_proxy_error_median": ("near_zero_proxy_error",),
         "raw_log_step_median": ("raw_log_step",),
+        "cdf_error_mae_median": ("cdf_error_mae",),
+        "cdf_error_rmse_median": ("cdf_error_rmse",),
+        "cdf_error_max_abs_median": ("cdf_error_max_abs",),
+        "cdf_error_z_rmse_median": ("cdf_error_z_rmse",),
+        "oracle_target_clipped_median": ("oracle_dynamic_target_clipped",),
+        "oracle_log_step_median": ("oracle_raw_log_step",),
+        "oracle_next_threshold_median": ("oracle_next_clip_threshold",),
+        "noisy_minus_oracle_log_step_median": (
+            "noisy_minus_oracle_raw_log_step",
+        ),
+        "noisy_oracle_log_threshold_error_median": (
+            "noisy_oracle_log_threshold_error",
+        ),
+        "actual_target_absolute_error_median": (
+            "actual_target_absolute_error",
+        ),
         "threshold_used_median": ("clip_threshold_used",),
         "next_threshold_median": ("next_clip_threshold",),
     }
     behavior_metric_names = (
         "raw_gradient_l2",
+        "raw_to_threshold_ratio",
+        "removed_gradient_l2",
+        "retained_energy_fraction",
         "clipped_signal_gradient_l2",
         "noise_gradient_l2",
         "signal_to_noise_l2_ratio",
         "signal_noise_cosine",
         "global_update_l2",
+        "aggregate_signal_gradient_l2",
+        "aggregate_noise_gradient_l2",
+        "aggregate_signal_to_noise_l2_ratio",
+        "relative_global_update",
     )
     controller_count_names = (
         "gamma_clamped_low_count",
@@ -1087,6 +1519,9 @@ def _model_metrics(
         "upper_bound_hits",
         "noisy_adjacent_monotonicity_violations",
         "exact_adjacent_monotonicity_violations",
+        "log_step_direction_flip_count",
+        "oracle_direction_agreement_count",
+        "noisy_cdf_out_of_range_count",
     )
     for group_name in ("A", "B"):
         group = groups.get(group_name)
@@ -1107,16 +1542,24 @@ def _model_metrics(
         )
         for count_name in controller_count_names:
             result[f"{count_name}_{group_name}"] = group.get(count_name)
+        for scalar_name in (
+            "log_threshold_total_variation",
+            "oracle_direction_agreement_fraction",
+            "noisy_cdf_out_of_range_fraction",
+        ):
+            result[f"{scalar_name}_{group_name}"] = group.get(scalar_name)
         result[f"final_threshold_{group_name}"] = group.get("final_next_clip_threshold")
     return result
 
 
-METRIC_COLUMNS = (
+BASE_METRIC_COLUMNS = (
     "arm_id",
     "family",
     "analysis_role",
     "method",
     "seed",
+    "num_clients",
+    "noise_multiplier",
     "initial_clip_norm",
     "slaclip_eta",
     "slaclip_beta",
@@ -1124,106 +1567,90 @@ METRIC_COLUMNS = (
     "model",
     "initial_loss",
     "final_loss",
+    "best_loss",
+    "best_round",
+    "final_minus_best",
+    "normalized_loss_auc",
     "loss_delta",
     "actual_clipped_fraction",
     "would_clip_fraction",
     "elapsed_seconds",
-    "cdf_near_threshold_median_A",
-    "cdf_near_zero_median_A",
-    "near_zero_adjusted_median_A",
-    "dynamic_target_median_A",
-    "dynamic_target_clipped_median_A",
-    "controller_error_median_A",
-    "near_threshold_proxy_error_median_A",
-    "near_zero_proxy_error_median_A",
-    "raw_log_step_median_A",
-    "threshold_used_median_A",
-    "next_threshold_median_A",
-    "final_threshold_A",
-    "actual_clipped_fraction_A",
-    "would_clip_fraction_A",
-    "raw_gradient_l2_median_A",
-    "clipped_signal_gradient_l2_median_A",
-    "noise_gradient_l2_median_A",
-    "signal_to_noise_l2_ratio_median_A",
-    "signal_noise_cosine_median_A",
-    "global_update_l2_median_A",
-    "gamma_clamped_low_count_A",
-    "gamma_clamped_high_count_A",
-    "log_step_bounded_count_A",
-    "lower_bound_hits_A",
-    "upper_bound_hits_A",
-    "noisy_adjacent_monotonicity_violations_A",
-    "exact_adjacent_monotonicity_violations_A",
-    "cdf_near_threshold_median_B",
-    "cdf_near_zero_median_B",
-    "near_zero_adjusted_median_B",
-    "dynamic_target_median_B",
-    "dynamic_target_clipped_median_B",
-    "controller_error_median_B",
-    "near_threshold_proxy_error_median_B",
-    "near_zero_proxy_error_median_B",
-    "raw_log_step_median_B",
-    "threshold_used_median_B",
-    "next_threshold_median_B",
-    "final_threshold_B",
-    "actual_clipped_fraction_B",
-    "would_clip_fraction_B",
-    "raw_gradient_l2_median_B",
-    "clipped_signal_gradient_l2_median_B",
-    "noise_gradient_l2_median_B",
-    "signal_to_noise_l2_ratio_median_B",
-    "signal_noise_cosine_median_B",
-    "global_update_l2_median_B",
-    "gamma_clamped_low_count_B",
-    "gamma_clamped_high_count_B",
-    "log_step_bounded_count_B",
-    "lower_bound_hits_B",
-    "upper_bound_hits_B",
-    "noisy_adjacent_monotonicity_violations_B",
-    "exact_adjacent_monotonicity_violations_B",
+    "cdf_endpoint_noise_std_theoretical",
+)
+
+GROUP_METRIC_COLUMNS = (
+    "cdf_near_threshold_median",
+    "cdf_near_zero_median",
+    "near_zero_adjusted_median",
+    "dynamic_target_median",
+    "dynamic_target_clipped_median",
+    "controller_error_median",
+    "near_threshold_proxy_error_median",
+    "near_zero_proxy_error_median",
+    "raw_log_step_median",
+    "cdf_error_mae_median",
+    "cdf_error_rmse_median",
+    "cdf_error_max_abs_median",
+    "cdf_error_z_rmse_median",
+    "oracle_target_clipped_median",
+    "oracle_log_step_median",
+    "oracle_next_threshold_median",
+    "noisy_minus_oracle_log_step_median",
+    "noisy_oracle_log_threshold_error_median",
+    "actual_target_absolute_error_median",
+    "threshold_used_median",
+    "next_threshold_median",
+    "final_threshold",
+    "actual_clipped_fraction",
+    "would_clip_fraction",
+    "raw_gradient_l2_median",
+    "raw_to_threshold_ratio_median",
+    "removed_gradient_l2_median",
+    "retained_energy_fraction_median",
+    "clipped_signal_gradient_l2_median",
+    "noise_gradient_l2_median",
+    "signal_to_noise_l2_ratio_median",
+    "signal_noise_cosine_median",
+    "global_update_l2_median",
+    "aggregate_signal_gradient_l2_median",
+    "aggregate_noise_gradient_l2_median",
+    "aggregate_signal_to_noise_l2_ratio_median",
+    "relative_global_update_median",
+    "gamma_clamped_low_count",
+    "gamma_clamped_high_count",
+    "log_step_bounded_count",
+    "lower_bound_hits",
+    "upper_bound_hits",
+    "noisy_adjacent_monotonicity_violations",
+    "exact_adjacent_monotonicity_violations",
+    "log_step_direction_flip_count",
+    "oracle_direction_agreement_count",
+    "noisy_cdf_out_of_range_count",
+    "log_threshold_total_variation",
+    "oracle_direction_agreement_fraction",
+    "noisy_cdf_out_of_range_fraction",
+)
+
+METRIC_COLUMNS = BASE_METRIC_COLUMNS + tuple(
+    f"{metric}_{group}"
+    for group in ("A", "B")
+    for metric in GROUP_METRIC_COLUMNS
 )
 
 AGGREGATED_METRICS = (
     "final_loss",
+    "best_loss",
+    "best_round",
+    "final_minus_best",
+    "normalized_loss_auc",
     "loss_delta",
     "actual_clipped_fraction",
-    "actual_clipped_fraction_A",
-    "actual_clipped_fraction_B",
-    "raw_gradient_l2_median_A",
-    "raw_gradient_l2_median_B",
-    "clipped_signal_gradient_l2_median_A",
-    "clipped_signal_gradient_l2_median_B",
-    "noise_gradient_l2_median_A",
-    "noise_gradient_l2_median_B",
-    "signal_to_noise_l2_ratio_median_A",
-    "signal_to_noise_l2_ratio_median_B",
-    "signal_noise_cosine_median_A",
-    "signal_noise_cosine_median_B",
-    "global_update_l2_median_A",
-    "global_update_l2_median_B",
-    "cdf_near_threshold_median_A",
-    "cdf_near_threshold_median_B",
-    "cdf_near_zero_median_A",
-    "cdf_near_zero_median_B",
-    "dynamic_target_median_A",
-    "dynamic_target_median_B",
-    "controller_error_median_A",
-    "controller_error_median_B",
-    "near_threshold_proxy_error_median_A",
-    "near_threshold_proxy_error_median_B",
-    "near_zero_proxy_error_median_A",
-    "near_zero_proxy_error_median_B",
-    "final_threshold_A",
-    "final_threshold_B",
-    "lower_bound_hits_A",
-    "lower_bound_hits_B",
-    "upper_bound_hits_A",
-    "upper_bound_hits_B",
-    "noisy_adjacent_monotonicity_violations_A",
-    "noisy_adjacent_monotonicity_violations_B",
-    "exact_adjacent_monotonicity_violations_A",
-    "exact_adjacent_monotonicity_violations_B",
+    "elapsed_seconds",
+    "cdf_endpoint_noise_std_theoretical",
+) + tuple(
+    f"{metric}_{group}"
+    for group in ("A", "B")
+    for metric in GROUP_METRIC_COLUMNS
 )
 
 
@@ -1251,6 +1678,97 @@ def _finite_values(rows: Sequence[Mapping[str, Any]], key: str) -> list[float]:
         ):
             values.append(float(value))
     return values
+
+
+def paired_inference(values: Sequence[float]) -> dict[str, float | int | None]:
+    """Return deterministic paired descriptive and exact sign-flip statistics."""
+
+    finite = [float(value) for value in values if math.isfinite(float(value))]
+    count = len(finite)
+    if count == 0:
+        return {
+            "n": 0,
+            "mean": None,
+            "median": None,
+            "sample_std": None,
+            "standard_error": None,
+            "ci95_low": None,
+            "ci95_high": None,
+            "cohens_dz": None,
+            "negative_fraction": None,
+            "zero_fraction": None,
+            "exact_sign_flip_p": None,
+        }
+    mean = statistics.fmean(finite)
+    median = statistics.median(finite)
+    sample_std = statistics.stdev(finite) if count > 1 else None
+    standard_error = sample_std / math.sqrt(count) if sample_std is not None else None
+    t_critical_975 = {
+        1: 12.7062047364,
+        2: 4.30265272975,
+        3: 3.18244630528,
+        4: 2.7764451052,
+        5: 2.57058183564,
+        6: 2.44691184879,
+        7: 2.36462425101,
+        8: 2.3060041352,
+        9: 2.26215716285,
+        10: 2.22813885196,
+        11: 2.20098516008,
+        12: 2.17881282966,
+        13: 2.16036865646,
+        14: 2.14478668792,
+        15: 2.13144954556,
+        16: 2.11990529922,
+        17: 2.10981557783,
+        18: 2.10092204024,
+        19: 2.09302405441,
+        20: 2.08596344727,
+        21: 2.07961384473,
+        22: 2.0738730679,
+        23: 2.06865761042,
+        24: 2.06389856163,
+        25: 2.05953855275,
+        26: 2.05552943864,
+        27: 2.05183051648,
+        28: 2.0484071418,
+        29: 2.04522964213,
+        30: 2.0422724563,
+    }
+    if standard_error is not None:
+        critical = t_critical_975.get(count - 1, 1.95996398454)
+        half_width = critical * standard_error
+        ci_low = mean - half_width
+        ci_high = mean + half_width
+    else:
+        ci_low = ci_high = None
+    observed = abs(mean)
+    extreme = 0
+    assignments = 1 << count
+    for mask in range(assignments):
+        permuted = math.fsum(
+            (-value if mask & (1 << index) else value)
+            for index, value in enumerate(finite)
+        ) / count
+        if abs(permuted) >= observed - 1e-15:
+            extreme += 1
+    return {
+        "n": count,
+        "mean": mean,
+        "median": median,
+        "sample_std": sample_std,
+        "standard_error": standard_error,
+        "ci95_low": ci_low,
+        "ci95_high": ci_high,
+        "cohens_dz": (
+            mean / sample_std
+            if sample_std is not None and sample_std > 0.0
+            else None
+        ),
+        "negative_fraction": sum(value < 0.0 for value in finite) / count,
+        "zero_fraction": sum(value == 0.0 for value in finite) / count,
+        "exact_sign_flip_p": extreme / assignments,
+    }
 
 
 def _load_comparison_record(
@@ -1324,10 +1842,8 @@ def ensure_full_comparisons(
     adaptive_arms = [
         arm for arm in runtime["arms"] if arm["method"] == FULL_SLACLIP_METHOD
     ]
-    if len(adaptive_arms) != 39:
-        raise RuntimeError(
-            f"runtime manifest has {len(adaptive_arms)} adaptive arms, expected 39"
-        )
+    if not adaptive_arms:
+        raise RuntimeError("runtime manifest contains no full-SlaClip arms")
     expected_adaptive_ids = {arm["arm_id"] for arm in adaptive_arms}
     if require_complete and not expected_adaptive_ids.issubset(completed_arm_ids):
         missing = sorted(expected_adaptive_ids - completed_arm_ids)
@@ -1386,7 +1902,8 @@ def ensure_full_comparisons(
         )
     if require_complete and len(records) != len(adaptive_arms):
         raise RuntimeError(
-            f"final comparison evidence count is {len(records)}, expected 39"
+            "final comparison evidence count is "
+            f"{len(records)}, expected {len(adaptive_arms)}"
         )
     return records
 
@@ -1422,6 +1939,51 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
                 raise RuntimeError(f"model summary is missing: {arm_id}/{model}")
             rows.append(_model_metrics(arm, model, model_summary))
 
+    if args.require_complete:
+        for row in rows:
+            required_metrics = [
+                "initial_loss",
+                "final_loss",
+                "best_loss",
+                "normalized_loss_auc",
+                "elapsed_seconds",
+                "actual_clipped_fraction",
+                "raw_gradient_l2_median_A",
+                "raw_gradient_l2_median_B",
+            ]
+            if row["method"] in {FIXED_DP_METHOD, FULL_SLACLIP_METHOD}:
+                required_metrics.extend(
+                    (
+                        "aggregate_signal_to_noise_l2_ratio_median_A",
+                        "aggregate_signal_to_noise_l2_ratio_median_B",
+                    )
+                )
+            if row["method"] == FULL_SLACLIP_METHOD:
+                required_metrics.extend(
+                    f"{name}_{group}"
+                    for group in ("A", "B")
+                    for name in (
+                        "cdf_error_mae_median",
+                        "cdf_error_rmse_median",
+                        "oracle_next_threshold_median",
+                        "actual_target_absolute_error_median",
+                        "log_threshold_total_variation",
+                        "oracle_direction_agreement_fraction",
+                    )
+                )
+            invalid = [
+                name
+                for name in required_metrics
+                if not isinstance(row.get(name), (int, float))
+                or isinstance(row.get(name), bool)
+                or not math.isfinite(float(row[name]))
+            ]
+            if invalid:
+                raise RuntimeError(
+                    f"completed metric row has missing/non-finite evidence: "
+                    f"{row['arm_id']}/{row['model']} {invalid[:4]}"
+                )
+
     comparison_records = ensure_full_comparisons(
         runtime,
         root,
@@ -1444,6 +2006,8 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
                 "reference_arm_id": reference_id,
                 "family": row["family"],
                 "seed": row["seed"],
+                "num_clients": row["num_clients"],
+                "noise_multiplier": row["noise_multiplier"],
                 "initial_clip_norm": row["initial_clip_norm"],
                 "slaclip_eta": row["slaclip_eta"],
                 "slaclip_beta": row["slaclip_beta"],
@@ -1453,6 +2017,52 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
                 "final_loss_difference_slaclip_minus_fixed": (
                     row["final_loss"] - reference["final_loss"]
                     if row["final_loss"] is not None and reference["final_loss"] is not None
+                    else None
+                ),
+                "perplexity_ratio_slaclip_over_fixed": (
+                    math.exp(
+                        max(
+                            -50.0,
+                            min(
+                                50.0,
+                                row["final_loss"] - reference["final_loss"],
+                            ),
+                        )
+                    )
+                    if row["final_loss"] is not None
+                    and reference["final_loss"] is not None
+                    else None
+                ),
+                "slaclip_best_loss": row["best_loss"],
+                "fixed_best_loss": reference["best_loss"],
+                "best_loss_difference_slaclip_minus_fixed": (
+                    row["best_loss"] - reference["best_loss"]
+                    if row["best_loss"] is not None
+                    and reference["best_loss"] is not None
+                    else None
+                ),
+                "slaclip_normalized_loss_auc": row["normalized_loss_auc"],
+                "fixed_normalized_loss_auc": reference["normalized_loss_auc"],
+                "normalized_loss_auc_difference_slaclip_minus_fixed": (
+                    row["normalized_loss_auc"] - reference["normalized_loss_auc"]
+                    if row["normalized_loss_auc"] is not None
+                    and reference["normalized_loss_auc"] is not None
+                    else None
+                ),
+                "slaclip_final_minus_best": row["final_minus_best"],
+                "fixed_final_minus_best": reference["final_minus_best"],
+                "final_minus_best_difference": (
+                    row["final_minus_best"] - reference["final_minus_best"]
+                    if row["final_minus_best"] is not None
+                    and reference["final_minus_best"] is not None
+                    else None
+                ),
+                "slaclip_elapsed_seconds": row["elapsed_seconds"],
+                "fixed_elapsed_seconds": reference["elapsed_seconds"],
+                "elapsed_seconds_difference": (
+                    row["elapsed_seconds"] - reference["elapsed_seconds"]
+                    if isinstance(row["elapsed_seconds"], (int, float))
+                    and isinstance(reference["elapsed_seconds"], (int, float))
                     else None
                 ),
                 "slaclip_actual_clipped_fraction": row["actual_clipped_fraction"],
@@ -1469,6 +2079,8 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
     group_keys = (
         "family",
         "method",
+        "num_clients",
+        "noise_multiplier",
         "initial_clip_norm",
         "slaclip_eta",
         "slaclip_beta",
@@ -1494,6 +2106,8 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
 
     paired_group_keys = (
         "family",
+        "num_clients",
+        "noise_multiplier",
         "initial_clip_norm",
         "slaclip_eta",
         "slaclip_beta",
@@ -1511,25 +2125,50 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
     )
     paired_difference_metrics = (
         "final_loss_difference_slaclip_minus_fixed",
+        "best_loss_difference_slaclip_minus_fixed",
+        "normalized_loss_auc_difference_slaclip_minus_fixed",
+        "final_minus_best_difference",
         "actual_clipped_fraction_difference",
+        "elapsed_seconds_difference",
     )
     for key, group_rows in paired_ordered_groups:
         output = dict(zip(paired_group_keys, key))
         output["seed_count"] = len({row["seed"] for row in group_rows})
         for metric in paired_difference_metrics:
             values = _finite_values(group_rows, metric)
-            output[f"{metric}_n"] = len(values)
-            output[f"{metric}_mean"] = statistics.fmean(values) if values else None
-            output[f"{metric}_sample_std"] = (
-                statistics.stdev(values) if len(values) > 1 else None
-            )
+            for statistic_name, statistic_value in paired_inference(values).items():
+                output[f"{metric}_{statistic_name}"] = statistic_value
         paired_aggregate_rows.append(output)
+
+    p_value_key = (
+        "final_loss_difference_slaclip_minus_fixed_exact_sign_flip_p"
+    )
+    ordered_p_values = sorted(
+        (
+            (index, float(row[p_value_key]))
+            for index, row in enumerate(paired_aggregate_rows)
+            if isinstance(row.get(p_value_key), (int, float))
+        ),
+        key=lambda item: item[1],
+    )
+    running_adjusted = 0.0
+    total_tests = len(ordered_p_values)
+    for rank, (index, p_value) in enumerate(ordered_p_values, start=1):
+        running_adjusted = max(
+            running_adjusted,
+            min(1.0, (total_tests - rank + 1) * p_value),
+        )
+        paired_aggregate_rows[index][
+            "final_loss_difference_slaclip_minus_fixed_holm_p"
+        ] = running_adjusted
 
     paired_columns = (
         "arm_id",
         "reference_arm_id",
         "family",
         "seed",
+        "num_clients",
+        "noise_multiplier",
         "initial_clip_norm",
         "slaclip_eta",
         "slaclip_beta",
@@ -1537,6 +2176,19 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
         "slaclip_final_loss",
         "fixed_final_loss",
         "final_loss_difference_slaclip_minus_fixed",
+        "perplexity_ratio_slaclip_over_fixed",
+        "slaclip_best_loss",
+        "fixed_best_loss",
+        "best_loss_difference_slaclip_minus_fixed",
+        "slaclip_normalized_loss_auc",
+        "fixed_normalized_loss_auc",
+        "normalized_loss_auc_difference_slaclip_minus_fixed",
+        "slaclip_final_minus_best",
+        "fixed_final_minus_best",
+        "final_minus_best_difference",
+        "slaclip_elapsed_seconds",
+        "fixed_elapsed_seconds",
+        "elapsed_seconds_difference",
         "slaclip_actual_clipped_fraction",
         "fixed_actual_clipped_fraction",
         "actual_clipped_fraction_difference",
@@ -1547,8 +2199,24 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
     paired_aggregate_columns = list(paired_group_keys) + ["seed_count"]
     for metric in paired_difference_metrics:
         paired_aggregate_columns.extend(
-            (f"{metric}_n", f"{metric}_mean", f"{metric}_sample_std")
+            f"{metric}_{name}"
+            for name in (
+                "n",
+                "mean",
+                "median",
+                "sample_std",
+                "standard_error",
+                "ci95_low",
+                "ci95_high",
+                "cohens_dz",
+                "negative_fraction",
+                "zero_fraction",
+                "exact_sign_flip_p",
+            )
         )
+    paired_aggregate_columns.append(
+        "final_loss_difference_slaclip_minus_fixed_holm_p"
+    )
     atomic_csv(root / "campaign_metrics.csv", rows, METRIC_COLUMNS)
     atomic_csv(root / "paired_metrics.csv", paired_rows, paired_columns)
     atomic_csv(root / "aggregate_metrics.csv", aggregate_rows, aggregate_columns)
@@ -1617,6 +2285,7 @@ def _archive_candidate(path: Path, root: Path) -> bool:
         return False
     if relative.name in {
         RUNTIME_MANIFEST_NAME,
+        JOB_STATUS_NAME,
         "campaign_summary.json",
         "campaign_metrics.csv",
         "paired_metrics.csv",
@@ -1692,6 +2361,7 @@ def archive_small(args: argparse.Namespace) -> None:
 
 
 def cuda_smoke(args: argparse.Namespace) -> None:
+    step_environment = validated_step_environment()
     try:
         import torch
     except ImportError as error:
@@ -1721,10 +2391,42 @@ def cuda_smoke(args: argparse.Namespace) -> None:
             "device_name": properties.name,
             "total_vram_bytes": int(properties.total_memory),
             "visible_device_count": torch.cuda.device_count(),
+            "step_environment": step_environment,
             "smoke_checksum": checksum,
             "completed_at_utc": utc_now(),
         },
     )
+
+
+def validated_step_environment() -> dict[str, str]:
+    """Fail before model loading if an ``srun`` lost the batch contract."""
+
+    mismatches = {
+        name: {"expected": expected, "actual": os.environ.get(name)}
+        for name, expected in REQUIRED_STEP_ENVIRONMENT.items()
+        if os.environ.get(name) != expected
+    }
+    for name in ("HF_HOME", "TMPDIR"):
+        value = os.environ.get(name)
+        if not value or not Path(value).is_absolute():
+            mismatches[name] = {"expected": "absolute path", "actual": value}
+    threads = os.environ.get("OMP_NUM_THREADS")
+    if not threads or not threads.isdecimal() or int(threads) <= 0:
+        mismatches["OMP_NUM_THREADS"] = {
+            "expected": "positive integer",
+            "actual": threads,
+        }
+    if mismatches:
+        raise RuntimeError(
+            "Slurm step environment contract mismatch: "
+            + json.dumps(mismatches, sort_keys=True)
+        )
+    return {
+        **REQUIRED_STEP_ENVIRONMENT,
+        "HF_HOME": str(Path(os.environ["HF_HOME"]).resolve()),
+        "TMPDIR": str(Path(os.environ["TMPDIR"]).resolve()),
+        "OMP_NUM_THREADS": str(int(os.environ["OMP_NUM_THREADS"])),
+    }
 
 
 def validate_spec_command(args: argparse.Namespace) -> None:
@@ -1792,6 +2494,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     aggregate.add_argument("--manifest", type=Path, required=True)
     aggregate.add_argument("--require-complete", action="store_true")
 
+    job_status = subparsers.add_parser("mark-job-status")
+    job_status.add_argument("--campaign-root", type=Path, required=True)
+    job_status.add_argument("--runtime-manifest", type=Path, required=True)
+    job_status.add_argument(
+        "--status",
+        choices=("RUNNING", "COMPLETED", "FAILED"),
+        required=True,
+    )
+    job_status.add_argument("--slurm-job-id", required=True)
+    job_status.add_argument("--repository-sha", required=True)
+    job_status.add_argument("--reason", required=True)
+    job_status.add_argument("--exit-code", type=int)
+
     archive = subparsers.add_parser("archive-small")
     archive.add_argument("--campaign-root", type=Path, required=True)
     archive.add_argument("--archive-root", type=Path, required=True)
@@ -1820,6 +2535,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_preflight_smoke(args)
     if args.command == "aggregate":
         aggregate_campaign(args)
+        return 0
+    if args.command == "mark-job-status":
+        mark_job_status(args)
         return 0
     if args.command == "archive-small":
         archive_small(args)

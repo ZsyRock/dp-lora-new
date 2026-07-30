@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 from collections import Counter
 from pathlib import Path
 
@@ -10,11 +11,14 @@ import paper_repro.full_slaclip_campaign as campaign_module
 from paper_repro.full_slaclip_campaign import (
     FULL_SLACLIP_METHOD,
     _arm_command,
+    _model_metrics,
     aggregate_campaign,
     atomic_json,
     build_runtime_manifest,
     expand_spec,
     load_spec,
+    paired_inference,
+    validated_step_environment,
     validate_or_create_key,
     validate_runtime_manifest,
 )
@@ -30,25 +34,57 @@ def test_slurm_worker_exports_required_cuda_determinism_contract() -> None:
     required_export = "export CUBLAS_WORKSPACE_CONFIG=:4096:8"
     assert worker.count(required_export) == 1
     assert worker.index(required_export) < worker.index("run_step()")
+    assert worker.count("export SLURM_EXPORT_ENV=ALL") == 1
+    run_step = worker[worker.index("run_step()") : worker.index('echo "job_id=')]
+    assert run_step.count("--export=ALL") == 1
+
+
+def test_compute_step_environment_is_validated_fail_closed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    values = {
+        "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "HF_DATASETS_OFFLINE": "1",
+        "SLURM_EXPORT_ENV": "ALL",
+        "HF_HOME": str(tmp_path / "hf"),
+        "TMPDIR": str(tmp_path / "tmp"),
+        "OMP_NUM_THREADS": "12",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    assert validated_step_environment()["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
+    monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG")
+    try:
+        validated_step_environment()
+    except RuntimeError as error:
+        assert "CUBLAS_WORKSPACE_CONFIG" in str(error)
+    else:
+        raise AssertionError("missing cuBLAS contract was accepted")
 
 
 def test_checked_in_matrix_is_exact_and_contains_no_slaclip_q() -> None:
     arms = expand_spec(load_spec(SPEC))
-    assert len(arms) == 60
+    assert len(arms) == 108
     assert Counter(arm["family"] for arm in arms) == {
-        "primary": 30,
+        "primary": 20,
+        "threshold_robustness": 24,
         "sensitivity": 24,
-        "control": 6,
+        "noise_sensitivity": 18,
+        "client_sensitivity": 12,
+        "control": 10,
     }
     assert Counter(arm["method"] for arm in arms) == {
-        "paper_dp_lora": 15,
-        "slaclip_dp_lora": 39,
-        "no_dp_lora_control": 3,
-        "clip_only_control": 3,
+        "paper_dp_lora": 37,
+        "slaclip_dp_lora": 61,
+        "no_dp_lora_control": 5,
+        "clip_only_control": 5,
     }
     assert all("slaclip_q" not in arm["method"].lower() for arm in arms)
     assert [(arm["index"], arm["wave"], arm["lane"]) for arm in arms] == [
-        (index, index // 2, index % 2) for index in range(60)
+        (index, index // 2, index % 2) for index in range(108)
     ]
 
     primary_full = [
@@ -56,23 +92,28 @@ def test_checked_in_matrix_is_exact_and_contains_no_slaclip_q() -> None:
         for arm in arms
         if arm["family"] == "primary" and arm["method"] == FULL_SLACLIP_METHOD
     ]
-    assert {arm["initial_clip_norm"] for arm in primary_full} == {
+    assert {arm["initial_clip_norm"] for arm in primary_full} == {10.0}
+    assert {arm["seed"] for arm in primary_full} == set(range(42, 52))
+    assert {arm["slaclip_eta"] for arm in primary_full} == {0.2}
+    assert {arm["slaclip_beta"] for arm in primary_full} == {0.5}
+
+    paper_style = [
+        arm
+        for arm in arms
+        if arm["analysis_role"] == "paper_setting_confirmatory_seed_replication"
+    ]
+    assert len(paper_style) == 20
+    assert all(arm["initial_clip_norm"] == 10.0 for arm in paper_style)
+
+    robustness = [arm for arm in arms if arm["family"] == "threshold_robustness"]
+    assert len(robustness) == 24
+    assert {arm["initial_clip_norm"] for arm in robustness} == {
         0.1,
         1.0,
         5.0,
-        10.0,
         20.0,
     }
-    assert {arm["seed"] for arm in primary_full} == {42, 43, 44}
-    assert {arm["slaclip_eta"] for arm in primary_full} == {0.2}
-    assert {arm["slaclip_beta"] for arm in primary_full} == {0.5}
-    assert all(arm["slaclip_num_slots"] == 15 for arm in primary_full)
-    assert all(arm["slaclip_c_min"] == 0.1 for arm in primary_full)
-    assert all(arm["slaclip_c_max"] == 50.0 for arm in primary_full)
-
-    paper_style = [arm for arm in arms if arm["analysis_role"] == "paper_style_primary"]
-    assert len(paper_style) == 6
-    assert all(arm["initial_clip_norm"] == 10.0 for arm in paper_style)
+    assert {arm["seed"] for arm in robustness} == {42, 43, 44}
 
     sensitivity = [arm for arm in arms if arm["family"] == "sensitivity"]
     assert len(sensitivity) == 24
@@ -81,6 +122,64 @@ def test_checked_in_matrix_is_exact_and_contains_no_slaclip_q() -> None:
         for arm in sensitivity
     )
     assert all(arm["reference_arm_id"] for arm in sensitivity)
+
+    noise = [arm for arm in arms if arm["family"] == "noise_sensitivity"]
+    assert len(noise) == 18
+    assert {arm["noise_multiplier"] for arm in noise} == {0.5, 1.0, 4.0}
+    assert {arm["seed"] for arm in noise} == {42, 43, 44}
+
+    clients = [arm for arm in arms if arm["family"] == "client_sensitivity"]
+    assert len(clients) == 12
+    assert {arm["num_clients"] for arm in clients} == {20, 80}
+    assert {arm["seed"] for arm in clients} == {42, 43, 44}
+
+    controls = [arm for arm in arms if arm["family"] == "control"]
+    assert len(controls) == 10
+    assert {arm["seed"] for arm in controls} == {42, 43, 44, 45, 46}
+
+    adaptive = [arm for arm in arms if arm["method"] == FULL_SLACLIP_METHOD]
+    assert len(adaptive) == 61
+    assert all(arm["batch_size"] < 128 for arm in adaptive)
+    assert all(arm["slaclip_num_slots"] == 15 for arm in adaptive)
+    assert all(arm["slaclip_c_min"] == 0.1 for arm in adaptive)
+    assert all(arm["slaclip_c_max"] == 50.0 for arm in adaptive)
+    assert all(arm["data_split_seed"] == 1729 for arm in arms)
+    assert all(arm["evaluation_seed"] == 2718 for arm in arms)
+
+
+def test_paired_arms_share_randomness_and_fixed_evaluation_protocol() -> None:
+    arms = expand_spec(load_spec(SPEC))
+    by_id = {arm["arm_id"]: arm for arm in arms}
+
+    # The campaign deliberately applies common random numbers across method,
+    # initial-C, and sigma variations for each training seed.
+    for seed in {arm["seed"] for arm in arms}:
+        seeded = [arm for arm in arms if arm["seed"] == seed]
+        assert {arm["rng_domain"] for arm in seeded} == {
+            f"full-slaclip-cdf:s{seed}"
+        }
+        assert {arm["data_split_seed"] for arm in seeded} == {1729}
+        assert {arm["evaluation_seed"] for arm in seeded} == {2718}
+
+    seed_42 = [arm for arm in arms if arm["seed"] == 42]
+    assert len({arm["initial_clip_norm"] for arm in seed_42}) > 1
+    assert len({arm["noise_multiplier"] for arm in seed_42}) > 1
+    assert {arm["method"] for arm in seed_42} >= {
+        "paper_dp_lora",
+        FULL_SLACLIP_METHOD,
+    }
+
+    for arm in arms:
+        reference_id = arm["reference_arm_id"]
+        if reference_id is None:
+            continue
+        reference = by_id[reference_id]
+        assert arm["seed"] == reference["seed"]
+        assert arm["rng_domain"] == reference["rng_domain"]
+        assert arm["data_split_seed"] == reference["data_split_seed"] == 1729
+        assert arm["evaluation_seed"] == reference["evaluation_seed"] == 2718
+        if arm["method"] == FULL_SLACLIP_METHOD:
+            assert arm["slaclip_num_slots"] == 15
 
 
 def test_runtime_manifest_is_self_hashing(tmp_path: Path) -> None:
@@ -93,7 +192,7 @@ def test_runtime_manifest_is_self_hashing(tmp_path: Path) -> None:
         created_at_utc="2026-07-29T00:00:00+00:00",
     )
     validate_runtime_manifest(runtime)
-    assert runtime["expected_arm_count"] == 60
+    assert runtime["expected_arm_count"] == 108
     mutated = json.loads(json.dumps(runtime))
     mutated["arms"][0]["seed"] = 999
     try:
@@ -180,6 +279,11 @@ def test_completed_arm_fast_path_avoids_python_and_key_reload(
             "arm_id": arm["arm_id"],
             "index": arm["index"],
             "method": arm["method"],
+            "runtime_manifest_sha256": runtime["manifest_sha256"],
+            "repository_sha": runtime["repository_sha"],
+            "arm_spec_sha256": campaign_module.sha256_bytes(
+                campaign_module.canonical_bytes(arm)
+            ),
             "final_summary_sha256": campaign_module.sha256_file(final_path),
         },
     )
@@ -253,8 +357,8 @@ def test_comparisons_are_created_incrementally_and_all_reverified(
         completed_arm_ids={arm["arm_id"] for arm in runtime["arms"]},
         require_complete=False,
     )
-    assert len(records) == 39
-    assert len(calls) == 38
+    assert len(records) == 61
+    assert len(calls) == 60
     assert all(verify is False for _, verify in calls)
 
     calls.clear()
@@ -264,10 +368,44 @@ def test_comparisons_are_created_incrementally_and_all_reverified(
         completed_arm_ids={arm["arm_id"] for arm in runtime["arms"]},
         require_complete=True,
     )
-    assert len(records) == 39
-    assert len(calls) == 39
+    assert len(records) == 61
+    assert len(calls) == 61
     assert all(verify is True for _, verify in calls)
     assert all(record["validation"] == "REVERIFIED_THIS_PASS" for record in records)
+
+
+def test_model_metrics_reports_trapezoid_auc_and_best_checkpoint() -> None:
+    arm = expand_spec(load_spec(SPEC))[0]
+    summary = _fake_model_summary(adaptive=False, final_loss=3.0)
+    summary["evaluations"] = [
+        {"round": 0, "loss": 4.0},
+        {"round": 10, "loss": 2.0},
+        {"round": 50, "loss": 3.0},
+    ]
+    metrics = _model_metrics(arm, "bert", summary)
+    assert metrics["best_loss"] == 2.0
+    assert metrics["best_round"] == 10
+    assert metrics["final_minus_best"] == 1.0
+    assert math.isclose(metrics["normalized_loss_auc"], 2.6)
+
+
+def test_paired_inference_reports_effect_size_interval_and_exact_sign_flip() -> None:
+    result = paired_inference([-0.3, -0.2, -0.1])
+    assert result["n"] == 3
+    assert math.isclose(float(result["mean"]), -0.2)
+    assert math.isclose(float(result["median"]), -0.2)
+    assert math.isclose(float(result["sample_std"]), 0.1)
+    assert math.isclose(float(result["standard_error"]), 0.1 / math.sqrt(3))
+    assert float(result["ci95_low"]) < -0.2 < float(result["ci95_high"])
+    assert math.isclose(float(result["cohens_dz"]), -2.0)
+    assert result["negative_fraction"] == 1.0
+    assert result["zero_fraction"] == 0.0
+    assert result["exact_sign_flip_p"] == 0.25
+
+    empty = paired_inference([])
+    assert empty["n"] == 0
+    assert empty["mean"] is None
+    assert empty["exact_sign_flip_p"] is None
 
 
 def _fake_model_summary(*, adaptive: bool, final_loss: float) -> dict[str, object]:

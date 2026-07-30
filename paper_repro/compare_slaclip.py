@@ -27,23 +27,13 @@ try:
     from paper_repro.reproducibility import (
         METHOD_SPECS,
         canonical_json_fingerprint,
-    )
-    from paper_repro.slaclip import (
-        MAX_ABS_LOG_STEP,
-        automatic_num_slots,
-        full_slaclip_update,
-        normalize_noisy_slack,
+        safe_quantiles,
     )
 except ModuleNotFoundError:  # Support direct execution.
     from reproducibility import (  # type: ignore[no-redef]
         METHOD_SPECS,
         canonical_json_fingerprint,
-    )
-    from slaclip import (  # type: ignore[no-redef]
-        MAX_ABS_LOG_STEP,
-        automatic_num_slots,
-        full_slaclip_update,
-        normalize_noisy_slack,
+        safe_quantiles,
     )
 
 
@@ -58,6 +48,8 @@ SLACLIP_CONTRACT_SCHEMA = "full_slaclip_contract_v1"
 SLACLIP_VARIANT = "full_slaclip_cdf_endpoints"
 ROUND_PREFIX_DOMAIN = b"dp-lora-round-shard-prefix-v1\0"
 EXACT_CDF_FLOAT32_TOLERANCE = 1e-6
+SLACLIP_Z_0995 = 2.5758293035489004
+MAX_ABS_LOG_STEP = 50.0
 
 
 def utc_now() -> str:
@@ -200,6 +192,22 @@ def _positive_integer(value: Any, description: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise RuntimeError(f"{description} must be a positive integer")
     return value
+
+
+def _independent_automatic_num_slots(
+    expected_records: Any, noise_multiplier: Any
+) -> int:
+    """Recompute the paper's automatic K rule without production helpers."""
+
+    records = _finite_number(expected_records, "SlaClip expected records")
+    sigma = _finite_number(noise_multiplier, "SlaClip noise multiplier")
+    if records <= 0.0 or sigma <= 0.0:
+        raise RuntimeError("SlaClip K-rule inputs must be positive")
+    ratio = records / (2.0 * SLACLIP_Z_0995 * sigma)
+    upper_bound = ratio ** (2.0 / 3.0)
+    if not math.isfinite(upper_bound):
+        raise RuntimeError("SlaClip automatic slot bound is not finite")
+    return max(1, math.floor(upper_bound))
 
 
 def _require_claims(
@@ -525,7 +533,9 @@ def _validate_contract(
     noise_multiplier = _finite_number(
         effective.get("noise_multiplier"), "SlaClip noise multiplier"
     )
-    automatic_slots = automatic_num_slots(adaptive["clients"], noise_multiplier)
+    automatic_slots = _independent_automatic_num_slots(
+        adaptive["clients"], noise_multiplier
+    )
     theoretical_noise = noise_multiplier * math.sqrt(
         num_slots / adaptive["clients"]
     )
@@ -569,6 +579,115 @@ def _finite_vector(value: Any, length: int, description: str) -> list[float]:
     if not isinstance(value, list) or len(value) != length:
         raise RuntimeError(f"{description} must contain exactly {length} values")
     return [_finite_number(item, description) for item in value]
+
+
+def _independent_normalize_noisy_slack(
+    summed_slack: Sequence[Any],
+    clip_norm: Any,
+    num_slots: int,
+    expected_records: Any,
+) -> tuple[float, ...]:
+    """Normalize the joint slack release using an independent specification."""
+
+    threshold = _finite_number(clip_norm, "SlaClip normalization threshold")
+    records = _finite_number(expected_records, "SlaClip normalization records")
+    slots = _positive_integer(num_slots, "SlaClip normalization slots")
+    if threshold <= 0.0 or records <= 0.0:
+        raise RuntimeError("SlaClip normalization inputs must be positive")
+    if len(summed_slack) != slots:
+        raise RuntimeError(
+            f"SlaClip summed slack must contain exactly {slots} values"
+        )
+    values = [
+        _finite_number(value, f"SlaClip summed slack[{index}]")
+        for index, value in enumerate(summed_slack)
+    ]
+    denominator = (threshold / math.sqrt(slots)) * records
+    if not math.isfinite(denominator) or denominator <= 0.0:
+        raise RuntimeError("SlaClip normalization denominator is not finite")
+    normalized = tuple(value / denominator for value in values)
+    if not all(math.isfinite(value) for value in normalized):
+        raise RuntimeError("SlaClip normalized CDF proxy is not finite")
+    return normalized
+
+
+def _independent_full_slaclip_update(
+    current_clip_norm: Any,
+    noisy_cdf_near_threshold: Any,
+    noisy_cdf_near_zero: Any,
+    *,
+    beta: Any,
+    eta: Any,
+    min_clip_norm: Any,
+    max_clip_norm: Any,
+    epsilon: Any,
+) -> dict[str, Any]:
+    """Recompute the endpoint controller without importing production code."""
+
+    current = _finite_number(current_clip_norm, "SlaClip current threshold")
+    near_threshold = _finite_number(
+        noisy_cdf_near_threshold, "SlaClip near-threshold endpoint"
+    )
+    near_zero = _finite_number(
+        noisy_cdf_near_zero, "SlaClip near-zero endpoint"
+    )
+    balance = _finite_number(beta, "SlaClip beta")
+    gain = _finite_number(eta, "SlaClip eta")
+    lower = _finite_number(min_clip_norm, "SlaClip lower threshold")
+    upper = _finite_number(max_clip_norm, "SlaClip upper threshold")
+    denominator_epsilon = _finite_number(epsilon, "SlaClip endpoint epsilon")
+    if current <= 0.0 or lower <= 0.0 or denominator_epsilon <= 0.0:
+        raise RuntimeError("SlaClip positive controller inputs are invalid")
+    if not 0.0 <= balance <= 1.0 or gain < 0.0:
+        raise RuntimeError("SlaClip beta/eta inputs are invalid")
+    if upper < lower or not lower <= current <= upper:
+        raise RuntimeError("SlaClip threshold bounds are invalid")
+
+    endpoint_denominator = current + denominator_epsilon
+    if not math.isfinite(endpoint_denominator) or endpoint_denominator <= 0.0:
+        raise RuntimeError("SlaClip endpoint denominator is not finite")
+    near_zero_adjusted = near_zero / endpoint_denominator
+    raw_target = 1.0 - balance * (1.0 - near_zero_adjusted)
+    if not math.isfinite(raw_target):
+        raise RuntimeError("SlaClip dynamic target is not finite")
+    target_unclipped = max(0.0, min(1.0, raw_target))
+    controller_error = target_unclipped - near_threshold
+    raw_log_step = gain * controller_error
+    if not math.isfinite(raw_log_step):
+        raise RuntimeError("SlaClip log update is not finite")
+    bounded_log_step = max(
+        -MAX_ABS_LOG_STEP, min(MAX_ABS_LOG_STEP, raw_log_step)
+    )
+    unbounded_next = current * math.exp(bounded_log_step)
+    if not math.isfinite(unbounded_next) or unbounded_next <= 0.0:
+        raise RuntimeError("SlaClip candidate threshold is not finite")
+    next_threshold = max(lower, min(upper, unbounded_next))
+
+    return {
+        "current_clip_norm": float(current),
+        "near_threshold_proxy": float(near_threshold),
+        "near_zero_proxy": float(near_zero),
+        "beta": float(balance),
+        "epsilon": float(denominator_epsilon),
+        "endpoint_denominator": float(endpoint_denominator),
+        "near_zero_adjusted": float(near_zero_adjusted),
+        "raw_dynamic_target_unclipped": float(raw_target),
+        "dynamic_target_unclipped": float(target_unclipped),
+        "dynamic_target_clipped": float(1.0 - target_unclipped),
+        "gamma_clamped_low": bool(raw_target < 0.0),
+        "gamma_clamped_high": bool(raw_target > 1.0),
+        "controller_error": float(controller_error),
+        "eta": float(gain),
+        "raw_log_step": float(raw_log_step),
+        "bounded_log_step": float(bounded_log_step),
+        "log_step_was_bounded": bool(raw_log_step != bounded_log_step),
+        "unbounded_next_clip_norm": float(unbounded_next),
+        "next_clip_norm": float(next_threshold),
+        "min_clip_norm": float(lower),
+        "max_clip_norm": float(upper),
+        "hit_min_clip_norm": bool(unbounded_next < lower),
+        "hit_max_clip_norm": bool(unbounded_next > upper),
+    }
 
 
 def _validate_exact_cdf_range(values: Sequence[float], description: str) -> None:
@@ -657,10 +776,14 @@ def _reconstruct_round_release(
         for slot in range(num_slots)
     ]
     noisy = list(
-        normalize_noisy_slack(noisy_sum, threshold, num_slots, client_count)
+        _independent_normalize_noisy_slack(
+            noisy_sum, threshold, num_slots, client_count
+        )
     )
     exact = list(
-        normalize_noisy_slack(signal_sum, threshold, num_slots, client_count)
+        _independent_normalize_noisy_slack(
+            signal_sum, threshold, num_slots, client_count
+        )
     )
     if any(value < 0.0 for value in slack_noise_stds) or len(
         set(slack_noise_stds)
@@ -717,6 +840,7 @@ def _validate_controller_trajectory(
         group: {
             "actual_clip_fractions": [],
             "dynamic_targets": [],
+            "validated_round_telemetry": [],
             "gamma_clamped_rounds": 0,
             "threshold_bound_hit_rounds": 0,
         }
@@ -825,7 +949,7 @@ def _validate_controller_trajectory(
                     f"adaptive/{model}/{group} clipping fraction does not "
                     "reconcile with client releases"
                 )
-            recomputed = full_slaclip_update(
+            recomputed = _independent_full_slaclip_update(
                 used,
                 noisy[0],
                 noisy[-1],
@@ -840,26 +964,16 @@ def _validate_controller_trajectory(
                 recomputed,
                 f"adaptive/{model}/{group}",
             )
-            expected_endpoint_telemetry = {
-                "noisy_near_threshold_minus_exact": noisy[0] - exact[0],
-                "noisy_near_zero_minus_exact": noisy[-1] - exact[-1],
-                "noisy_adjacent_monotonicity_violations": sum(
-                    noisy[index + 1] > noisy[index]
-                    for index in range(num_slots - 1)
-                ),
-                "exact_adjacent_monotonicity_violations": sum(
-                    exact[index + 1] > exact[index]
-                    for index in range(num_slots - 1)
-                ),
-                "actual_minus_dynamic_target_clipped": (
-                    actual - float(recorded_update["dynamic_target_clipped"])
-                ),
-            }
-            for key, expected in expected_endpoint_telemetry.items():
-                if group_value.get(key) != expected:
-                    raise RuntimeError(
-                        f"adaptive/{model}/{group} endpoint telemetry mismatch: {key}"
-                    )
+            oracle = _independent_full_slaclip_update(
+                used,
+                exact[0],
+                exact[-1],
+                beta=parameters["beta"],
+                eta=parameters["eta"],
+                min_clip_norm=parameters["min_clip_norm"],
+                max_clip_norm=parameters["max_clip_norm"],
+                epsilon=parameters["epsilon"],
+            )
             normalized_noise = _finite_number(
                 group_value.get("normalized_proxy_noise_std_per_slot"),
                 f"adaptive/{model}/{group} normalized endpoint noise",
@@ -887,6 +1001,77 @@ def _validate_controller_trajectory(
                 raise RuntimeError(
                     f"adaptive/{model}/{group} endpoint noise audit mismatch"
                 )
+
+            cdf_errors = [
+                noisy_value - exact_value
+                for noisy_value, exact_value in zip(noisy, exact)
+            ]
+            cdf_error_mae = math.fsum(
+                abs(error) for error in cdf_errors
+            ) / num_slots
+            cdf_error_rmse = math.sqrt(
+                math.fsum(error * error for error in cdf_errors) / num_slots
+            )
+            noisy_out_of_range_count = sum(
+                not 0.0 <= value <= 1.0 for value in noisy
+            )
+            noisy_log_step = float(recomputed["raw_log_step"])
+            oracle_log_step = float(oracle["raw_log_step"])
+
+            def update_direction(value: float) -> int:
+                return -1 if value < 0.0 else (1 if value > 0.0 else 0)
+
+            expected_endpoint_telemetry = {
+                "cdf_error_mae": cdf_error_mae,
+                "cdf_error_rmse": cdf_error_rmse,
+                "cdf_error_max_abs": max(abs(error) for error in cdf_errors),
+                "cdf_error_z_rmse": (
+                    cdf_error_rmse / normalized_noise
+                    if normalized_noise > 0.0
+                    else None
+                ),
+                "noisy_cdf_out_of_range_count": noisy_out_of_range_count,
+                "noisy_cdf_out_of_range_fraction": (
+                    noisy_out_of_range_count / num_slots
+                ),
+                "noisy_near_threshold_minus_exact": noisy[0] - exact[0],
+                "noisy_near_zero_minus_exact": noisy[-1] - exact[-1],
+                "noisy_adjacent_monotonicity_violations": sum(
+                    noisy[index + 1] > noisy[index]
+                    for index in range(num_slots - 1)
+                ),
+                "exact_adjacent_monotonicity_violations": sum(
+                    exact[index + 1] > exact[index]
+                    for index in range(num_slots - 1)
+                ),
+                "actual_minus_dynamic_target_clipped": (
+                    actual - float(recorded_update["dynamic_target_clipped"])
+                ),
+                "actual_target_absolute_error": abs(
+                    actual - float(recorded_update["dynamic_target_clipped"])
+                ),
+                "oracle_dynamic_target_clipped": float(
+                    oracle["dynamic_target_clipped"]
+                ),
+                "oracle_raw_log_step": oracle_log_step,
+                "oracle_next_clip_threshold": float(oracle["next_clip_norm"]),
+                "noisy_minus_oracle_raw_log_step": (
+                    noisy_log_step - oracle_log_step
+                ),
+                "noisy_oracle_log_threshold_error": math.log(
+                    float(recomputed["next_clip_norm"])
+                    / float(oracle["next_clip_norm"])
+                ),
+                "update_direction_agrees": (
+                    update_direction(noisy_log_step)
+                    == update_direction(oracle_log_step)
+                ),
+            }
+            for key, expected in expected_endpoint_telemetry.items():
+                if key not in group_value or group_value[key] != expected:
+                    raise RuntimeError(
+                        f"adaptive/{model}/{group} endpoint telemetry mismatch: {key}"
+                    )
             expected_thresholds[group] = _finite_number(
                 recorded_update["next_clip_threshold"],
                 f"adaptive/{model}/{group} next threshold",
@@ -898,6 +1083,14 @@ def _validate_controller_trajectory(
                     recomputed["dynamic_target_clipped"],
                     f"adaptive/{model}/{group} dynamic clipped target",
                 )
+            )
+            accumulator["validated_round_telemetry"].append(
+                {
+                    **expected_endpoint_telemetry,
+                    "clip_threshold_used": used,
+                    "next_clip_threshold": float(recomputed["next_clip_norm"]),
+                    "raw_log_step": noisy_log_step,
+                }
             )
             if recomputed["gamma_clamped_low"] or recomputed["gamma_clamped_high"]:
                 accumulator["gamma_clamped_rounds"] += 1
@@ -935,16 +1128,115 @@ def _validate_controller_trajectory(
     if "slaclip_q" in model_summary:
         raise RuntimeError(f"adaptive/{model} unexpectedly contains legacy SlaClip-Q")
 
+    summary_groups = controller_summary.get("groups")
+    if (
+        not isinstance(summary_groups, dict)
+        or tuple(summary_groups) != LORA_GROUPS
+    ):
+        raise RuntimeError(f"adaptive/{model} controller summary groups are invalid")
+    quantile_telemetry = (
+        "actual_target_absolute_error",
+        "cdf_error_mae",
+        "cdf_error_rmse",
+        "cdf_error_max_abs",
+        "cdf_error_z_rmse",
+        "oracle_dynamic_target_clipped",
+        "oracle_raw_log_step",
+        "oracle_next_clip_threshold",
+        "noisy_minus_oracle_raw_log_step",
+        "noisy_oracle_log_threshold_error",
+    )
+    for group in LORA_GROUPS:
+        recorded_summary = summary_groups[group]
+        if not isinstance(recorded_summary, dict):
+            raise RuntimeError(
+                f"adaptive/{model}/{group} controller summary is invalid"
+            )
+        validated_rounds = accumulators[group]["validated_round_telemetry"]
+        raw_steps = [float(value["raw_log_step"]) for value in validated_rounds]
+        nonzero_directions = [
+            -1 if value < 0.0 else 1 for value in raw_steps if value != 0.0
+        ]
+        agreement_count = sum(
+            bool(value["update_direction_agrees"]) for value in validated_rounds
+        )
+        out_of_range_count = sum(
+            int(value["noisy_cdf_out_of_range_count"])
+            for value in validated_rounds
+        )
+        expected_summary_telemetry: dict[str, Any] = {
+            key: safe_quantiles(value[key] for value in validated_rounds)
+            for key in quantile_telemetry
+        }
+        expected_summary_telemetry.update(
+            {
+                "log_threshold_total_variation": math.fsum(
+                    abs(
+                        math.log(
+                            float(value["next_clip_threshold"])
+                            / float(value["clip_threshold_used"])
+                        )
+                    )
+                    for value in validated_rounds
+                ),
+                "log_step_direction_flip_count": sum(
+                    left != right
+                    for left, right in zip(
+                        nonzero_directions, nonzero_directions[1:]
+                    )
+                ),
+                "oracle_direction_agreement_count": agreement_count,
+                "oracle_direction_agreement_fraction": (
+                    agreement_count / len(validated_rounds)
+                ),
+                "noisy_cdf_out_of_range_count": out_of_range_count,
+                "noisy_cdf_out_of_range_fraction": (
+                    out_of_range_count / (len(validated_rounds) * num_slots)
+                ),
+                "final_next_clip_threshold": expected_thresholds[group],
+            }
+        )
+        for key, expected in expected_summary_telemetry.items():
+            if key not in recorded_summary or recorded_summary[key] != expected:
+                raise RuntimeError(
+                    f"adaptive/{model}/{group} controller summary telemetry "
+                    f"mismatch: {key}"
+                )
+
     group_results: dict[str, Any] = {}
     for group in LORA_GROUPS:
         accumulator = accumulators[group]
         actual_values = accumulator.pop("actual_clip_fractions")
         target_values = accumulator.pop("dynamic_targets")
+        telemetry = accumulator.pop("validated_round_telemetry")
         group_results[group] = {
             "final_clip_norm": expected_thresholds[group],
             "mean_actual_clip_fraction": sum(actual_values) / len(actual_values),
             "mean_dynamic_target_clip_fraction": sum(target_values)
             / len(target_values),
+            "mean_actual_target_absolute_error": math.fsum(
+                value["actual_target_absolute_error"] for value in telemetry
+            )
+            / len(telemetry),
+            "mean_cdf_error_mae": math.fsum(
+                value["cdf_error_mae"] for value in telemetry
+            )
+            / len(telemetry),
+            "mean_cdf_error_rmse": math.fsum(
+                value["cdf_error_rmse"] for value in telemetry
+            )
+            / len(telemetry),
+            "oracle_direction_agreement_fraction": (
+                sum(bool(value["update_direction_agrees"]) for value in telemetry)
+                / len(telemetry)
+            ),
+            "noisy_cdf_out_of_range_fraction": (
+                sum(
+                    int(value["noisy_cdf_out_of_range_count"])
+                    for value in telemetry
+                )
+                / (len(telemetry) * num_slots)
+            ),
             **accumulator,
         }
     return {

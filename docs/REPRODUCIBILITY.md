@@ -253,30 +253,40 @@ or launched as evidence for the full-SlaClip extension.
 
 ## Current single-job Level-1 campaign
 
-The checked-in campaign specification contains 60 resumable runner arms in one
-Slurm allocation on one node.  Two GPU lanes consume the manifest without job
+The checked-in campaign specification contains 108 resumable runner arms in
+one Slurm allocation on one node.  Two GPU lanes consume 54 waves without job
 arrays or nested submissions.  Each runner arm trains both BERT-base and GPT-2
-small, producing 120 model-level training executions:
+small, producing 216 model-level training executions:
 
 | Family | Runner-arm matrix | Count |
 | --- | --- | ---: |
-| Primary matched study | `paper_dp_lora` and `slaclip_dp_lora`; paper initialization sweep `C_0 in {0.1, 1, 5, 10, 20}`; seeds `42, 43, 44` | 30 |
+| Confirmatory primary | `paper_dp_lora` and `slaclip_dp_lora`; paper setting `C_0=10`; paired seeds `42..51` | 20 |
+| Initial-threshold robustness | Both methods; `C_0 in {0.1, 1, 5, 20}`; seeds `42..44` | 24 |
 | Full-SlaClip sensitivity | `C_0=10`; seeds `42..44`; `eta in {0.05, 0.1, 0.2}` x `beta in {0.5, 0.9, 0.99}`, excluding the primary default `(0.2, 0.5)` | 24 |
-| Mechanism controls | `no_dp_lora_control` and `clip_only_control`; `C_0=10`; seeds `42..44` | 6 |
+| Noise sensitivity | Both methods; `C_0=10`; `sigma in {0.5, 1, 4}`; seeds `42..44` | 18 |
+| Protected-record-count sensitivity | Both methods; `C_0=10`; `K_clients in {20, 80}`; seeds `42..44` | 12 |
+| Mechanism controls | `no_dp_lora_control` and `clip_only_control`; `C_0=10`; seeds `42..46` | 10 |
 
-The common formal settings remain five clients, 50 rounds, batch size 8,
-`sigma=2`, learning rate `5e-4`, and LoRA rank 512.  Full SlaClip uses
-`K_slots=15`, `C_min=0.1`, and `C_max=50`.  Checkpointed per-arm state,
-incremental compact archives, and strict completed-arm validation make the
-same immutable campaign resumable after a wall-time stop.
+The confirmatory setting remains five clients, 50 rounds, batch size 8,
+`sigma=2`, learning rate `5e-4`, and LoRA rank 512; only explicitly labelled
+sensitivity arms vary client count or sigma.  Full SlaClip uses `K_slots=15`,
+`C_min=0.1`, and `C_max=50`.  The content-disjoint validation split, evaluation
+seed, and holdout size are fixed across methods and training seeds.
+Checkpointed per-arm state, incremental compact archives, strict completed-arm
+validation, and an atomic allocation-level `job-status.json` make the same
+immutable campaign resumable after a wall-time stop.
 
-This matrix measures execution behavior, initialization sensitivity,
-controller sensitivity, and paired internal-loss/clipping trajectories.  It
-does **not** implement the paper's BoolQ, PIQA, WinoGrande, MedQuAD, LiveQA, or
-MEDIQA-Ans evaluators; it does not add ChatGLM2-6B or Llama2-7B; and it does not
-resolve the privacy-accounting omissions.  Until those gates are implemented,
-even a clean campaign completion remains Level 1 rather than a paper benchmark
-reproduction or evidence of an end-to-end certified privacy guarantee.
+This matrix measures execution behavior, initialization/controller/noise/
+client-count sensitivity, paired internal-loss/clipping trajectories, full-CDF
+error and controller-oracle diagnostics, threshold stability, gradient
+retention, FedAvg signal/noise, and paired inferential statistics.  Exact CDF
+and oracle values remain `NON_DP_PRIVATE_DIAGNOSTIC`.  It does **not** implement
+the paper's BoolQ, PIQA, WinoGrande, MedQuAD, LiveQA, or MEDIQA-Ans evaluators;
+it does not add ChatGLM2-6B or Llama2-7B; and it does not resolve the
+privacy-accounting omissions.  Until those gates are implemented, even a clean
+campaign completion remains Level 1 rather than a paper benchmark
+reproduction, a journal-complete result package, or evidence of an end-to-end
+certified privacy guarantee.
 
 ## Minimum result package
 

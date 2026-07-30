@@ -122,6 +122,8 @@ class EffectiveConfig:
     rank: int
     max_seq_length: int
     seed: int
+    data_split_seed: int
+    evaluation_seed: int
     max_validation_records: int
     eval_every: int
     checkpoint_every: int
@@ -1016,7 +1018,7 @@ def load_data_protocol(
         config.max_validation_records,
         4 if config.smoke else len(validation),
     )
-    validation_permutation = np.random.default_rng(config.seed + 17).permutation(
+    validation_permutation = np.random.default_rng(config.data_split_seed).permutation(
         len(validation)
     )
     all_validation_indices = np.arange(len(validation), dtype=np.int64)
@@ -1063,6 +1065,7 @@ def load_data_protocol(
         "training_rows_before_holdout": len(training),
         "training_rows_after_holdout": len(training_pool),
         "holdout_source_split": "validation",
+        "data_split_seed": config.data_split_seed,
         "holdout_requested_rows": requested_validation_count,
         "holdout_rows": len(validation_indices),
         "holdout_unique_normalized_contents": len(selected_content_keys),
@@ -1144,6 +1147,8 @@ def make_effective_config(args: argparse.Namespace) -> EffectiveConfig:
             rank=args.rank,
             max_seq_length=args.max_seq_length,
             seed=args.seed,
+            data_split_seed=args.data_split_seed,
+            evaluation_seed=args.evaluation_seed,
             max_validation_records=args.batch_size,
             eval_every=1,
             checkpoint_every=1,
@@ -1163,6 +1168,8 @@ def make_effective_config(args: argparse.Namespace) -> EffectiveConfig:
         rank=args.rank,
         max_seq_length=args.max_seq_length,
         seed=args.seed,
+        data_split_seed=args.data_split_seed,
+        evaluation_seed=args.evaluation_seed,
         max_validation_records=args.max_validation_records,
         eval_every=args.eval_every,
         checkpoint_every=args.checkpoint_every,
@@ -1192,6 +1199,8 @@ def validate_config(config: EffectiveConfig) -> None:
         raise ValueError("learning_rate and clip_norm must be positive")
     if config.max_validation_records <= 0 or config.eval_every <= 0:
         raise ValueError("validation size and eval interval must be positive")
+    if config.data_split_seed < 0 or config.evaluation_seed < 0:
+        raise ValueError("data and evaluation seeds must be non-negative")
     if not 0 < config.delta < 1:
         raise ValueError("delta must be between zero and one")
 
@@ -1380,7 +1389,12 @@ def clip_noise_and_step(
             "clip_threshold": group_clip_norm,
             "noise_std_per_coordinate": noise_multiplier * group_clip_norm,
             "raw_norm": raw_norm,
+            "raw_to_threshold_ratio": raw_norm / group_clip_norm,
             "clip_factor": factor,
+            "removed_gradient_l2": max(raw_norm - group_clip_norm, 0.0)
+            if apply_clipping
+            else 0.0,
+            "retained_energy_fraction": factor * factor,
             "counterfactual_clip_factor": counterfactual_factor,
             "clipping_applied": apply_clipping,
             "would_clip": counterfactual_factor < 1.0,
@@ -1803,7 +1817,9 @@ def evaluate(
     seed: int,
 ) -> dict[str, float | int | str]:
     model.eval()
-    losses: list[float] = []
+    weighted_loss_sum = 0.0
+    evaluated_records = 0
+    batches = 0
     with torch.no_grad():
         for offset in range(0, len(validation_indices), config.batch_size):
             indices = validation_indices[offset : offset + config.batch_size]
@@ -1819,13 +1835,18 @@ def evaluate(
             value = float(loss.detach().float().item())
             if not math.isfinite(value):
                 raise FloatingPointError("non-finite validation loss")
-            losses.append(value)
-    mean_loss = float(np.mean(losses))
+            batch_records = int(len(indices))
+            weighted_loss_sum += value * batch_records
+            evaluated_records += batch_records
+            batches += 1
+    if evaluated_records != len(validation_indices) or evaluated_records <= 0:
+        raise RuntimeError("validation record accounting mismatch")
+    mean_loss = float(weighted_loss_sum / evaluated_records)
     model.train()
     return {
         "objective": "masked_lm" if model_kind == "bert" else "causal_lm",
         "records": int(len(validation_indices)),
-        "batches": len(losses),
+        "batches": batches,
         "loss": mean_loss,
         "exp_loss": math.exp(min(mean_loss, 20.0)),
         "exp_loss_capped_at_20": mean_loss > 20.0,
@@ -2056,6 +2077,14 @@ def slaclip_round_controller_summary(
             * math.sqrt(len(records))
             / (slack_lambda * len(records))
         )
+        cdf_errors = [
+            float(noisy - exact)
+            for noisy, exact in zip(noisy_indicator, exact_indicator)
+        ]
+        cdf_error_mae = math.fsum(abs(value) for value in cdf_errors) / num_slots
+        cdf_error_rmse = math.sqrt(
+            math.fsum(value * value for value in cdf_errors) / num_slots
+        )
         update = full_slaclip_update(
             threshold,
             float(noisy_indicator[0]),
@@ -2074,6 +2103,24 @@ def slaclip_round_controller_summary(
         update_fields["c_min"] = update_fields.pop("min_clip_norm")
         update_fields["c_max"] = update_fields.pop("max_clip_norm")
         update_fields.pop("current_clip_norm", None)
+        oracle_update = full_slaclip_update(
+            threshold,
+            float(exact_indicator[0]),
+            float(exact_indicator[-1]),
+            beta=beta,
+            eta=eta,
+            min_clip_norm=c_min,
+            max_clip_norm=c_max,
+            epsilon=epsilon,
+        )
+        oracle_next = float(oracle_update["next_clip_norm"])
+        noisy_next = float(update_fields["next_clip_threshold"])
+        noisy_log_step = float(update_fields["raw_log_step"])
+        oracle_log_step = float(oracle_update["raw_log_step"])
+
+        def direction(value: float) -> int:
+            return -1 if value < 0.0 else (1 if value > 0.0 else 0)
+
         actual_fraction = safe_ratio(
             sum(bool(record["gradient_groups"][group]["clipped"]) for record in records),
             len(records),
@@ -2087,6 +2134,21 @@ def slaclip_round_controller_summary(
                 float(value) for value in exact_indicator
             ],
             "normalized_proxy_noise_std_per_slot": normalized_proxy_noise_std,
+            "cdf_error_mae": float(cdf_error_mae),
+            "cdf_error_rmse": float(cdf_error_rmse),
+            "cdf_error_max_abs": float(max(abs(value) for value in cdf_errors)),
+            "cdf_error_z_rmse": (
+                float(cdf_error_rmse / normalized_proxy_noise_std)
+                if normalized_proxy_noise_std > 0.0
+                else None
+            ),
+            "noisy_cdf_out_of_range_count": sum(
+                not 0.0 <= value <= 1.0 for value in noisy_indicator
+            ),
+            "noisy_cdf_out_of_range_fraction": safe_ratio(
+                sum(not 0.0 <= value <= 1.0 for value in noisy_indicator),
+                num_slots,
+            ),
             "noisy_near_threshold_minus_exact": float(
                 noisy_indicator[0] - exact_indicator[0]
             ),
@@ -2106,6 +2168,28 @@ def slaclip_round_controller_summary(
                 None
                 if actual_fraction is None
                 else actual_fraction - float(update_fields["dynamic_target_clipped"])
+            ),
+            "actual_target_absolute_error": (
+                None
+                if actual_fraction is None
+                else abs(
+                    actual_fraction
+                    - float(update_fields["dynamic_target_clipped"])
+                )
+            ),
+            "oracle_dynamic_target_clipped": float(
+                oracle_update["dynamic_target_clipped"]
+            ),
+            "oracle_raw_log_step": oracle_log_step,
+            "oracle_next_clip_threshold": oracle_next,
+            "noisy_minus_oracle_raw_log_step": float(
+                noisy_log_step - oracle_log_step
+            ),
+            "noisy_oracle_log_threshold_error": float(
+                math.log(noisy_next / oracle_next)
+            ),
+            "update_direction_agrees": (
+                direction(noisy_log_step) == direction(oracle_log_step)
             ),
             **update_fields,
         }
@@ -2303,6 +2387,15 @@ def behavior_summary(shards: Sequence[dict[str, Any]]) -> dict[str, Any]:
             if clipped_rounds
             else None,
             "raw_gradient_l2": safe_quantiles(value["raw_norm"] for value in values),
+            "raw_to_threshold_ratio": safe_quantiles(
+                value["raw_to_threshold_ratio"] for value in values
+            ),
+            "removed_gradient_l2": safe_quantiles(
+                value["removed_gradient_l2"] for value in values
+            ),
+            "retained_energy_fraction": safe_quantiles(
+                value["retained_energy_fraction"] for value in values
+            ),
             "clipped_signal_gradient_l2": safe_quantiles(
                 value["clipped_norm"] for value in values
             ),
@@ -2333,6 +2426,28 @@ def behavior_summary(shards: Sequence[dict[str, Any]]) -> dict[str, Any]:
             ),
             "global_update_l2": safe_quantiles(
                 round_record["federated_update"][group]["actual_global_update_l2"]
+                for round_record in rounds
+            ),
+            "aggregate_signal_gradient_l2": safe_quantiles(
+                round_record["federated_update"][group][
+                    "aggregate_signal_gradient_l2"
+                ]
+                for round_record in rounds
+            ),
+            "aggregate_noise_gradient_l2": safe_quantiles(
+                round_record["federated_update"][group][
+                    "aggregate_noise_gradient_l2"
+                ]
+                for round_record in rounds
+            ),
+            "aggregate_signal_to_noise_l2_ratio": safe_quantiles(
+                round_record["federated_update"][group][
+                    "signal_to_noise_l2_ratio"
+                ]
+                for round_record in rounds
+            ),
+            "relative_global_update": safe_quantiles(
+                round_record["federated_update"][group]["relative_global_update"]
                 for round_record in rounds
             ),
             "fedavg_relative_residual": safe_quantiles(
@@ -2388,98 +2503,159 @@ def behavior_summary(shards: Sequence[dict[str, Any]]) -> dict[str, Any]:
     if any(value is not None for value in controller_rounds):
         if not all(isinstance(value, dict) for value in controller_rounds):
             raise RuntimeError("SlaClip controller telemetry is incomplete")
+        controller_groups: dict[str, Any] = {}
+        for group in ("A", "B"):
+            group_rounds = [value[group] for value in controller_rounds]
+            raw_steps = [float(value["raw_log_step"]) for value in group_rounds]
+            nonzero_directions = [
+                -1 if value < 0.0 else 1 for value in raw_steps if value != 0.0
+            ]
+            direction_flips = sum(
+                left != right
+                for left, right in zip(
+                    nonzero_directions,
+                    nonzero_directions[1:],
+                )
+            )
+            controller_groups[group] = {
+                    "clip_threshold_used": safe_quantiles(
+                        value["clip_threshold_used"] for value in group_rounds
+                    ),
+                    "next_clip_threshold": safe_quantiles(
+                        value["next_clip_threshold"] for value in group_rounds
+                    ),
+                    "near_threshold_proxy": safe_quantiles(
+                        value["near_threshold_proxy"] for value in group_rounds
+                    ),
+                    "near_zero_proxy": safe_quantiles(
+                        value["near_zero_proxy"] for value in group_rounds
+                    ),
+                    "near_zero_adjusted": safe_quantiles(
+                        value["near_zero_adjusted"] for value in group_rounds
+                    ),
+                    "dynamic_target_unclipped": safe_quantiles(
+                        value["dynamic_target_unclipped"] for value in group_rounds
+                    ),
+                    "dynamic_target_clipped": safe_quantiles(
+                        value["dynamic_target_clipped"] for value in group_rounds
+                    ),
+                    "controller_error": safe_quantiles(
+                        value["controller_error"] for value in group_rounds
+                    ),
+                    "actual_clip_fraction": safe_quantiles(
+                        value["actual_clip_fraction"] for value in group_rounds
+                    ),
+                    "actual_minus_dynamic_target_clipped": safe_quantiles(
+                        value["actual_minus_dynamic_target_clipped"]
+                        for value in group_rounds
+                    ),
+                    "actual_target_absolute_error": safe_quantiles(
+                        value["actual_target_absolute_error"] for value in group_rounds
+                    ),
+                    "near_threshold_proxy_error": safe_quantiles(
+                        value["noisy_near_threshold_minus_exact"]
+                        for value in group_rounds
+                    ),
+                    "near_zero_proxy_error": safe_quantiles(
+                        value["noisy_near_zero_minus_exact"] for value in group_rounds
+                    ),
+                    "cdf_error_mae": safe_quantiles(
+                        value["cdf_error_mae"] for value in group_rounds
+                    ),
+                    "cdf_error_rmse": safe_quantiles(
+                        value["cdf_error_rmse"] for value in group_rounds
+                    ),
+                    "cdf_error_max_abs": safe_quantiles(
+                        value["cdf_error_max_abs"] for value in group_rounds
+                    ),
+                    "cdf_error_z_rmse": safe_quantiles(
+                        value["cdf_error_z_rmse"] for value in group_rounds
+                    ),
+                    "oracle_dynamic_target_clipped": safe_quantiles(
+                        value["oracle_dynamic_target_clipped"]
+                        for value in group_rounds
+                    ),
+                    "oracle_raw_log_step": safe_quantiles(
+                        value["oracle_raw_log_step"] for value in group_rounds
+                    ),
+                    "oracle_next_clip_threshold": safe_quantiles(
+                        value["oracle_next_clip_threshold"] for value in group_rounds
+                    ),
+                    "noisy_minus_oracle_raw_log_step": safe_quantiles(
+                        value["noisy_minus_oracle_raw_log_step"]
+                        for value in group_rounds
+                    ),
+                    "noisy_oracle_log_threshold_error": safe_quantiles(
+                        value["noisy_oracle_log_threshold_error"]
+                        for value in group_rounds
+                    ),
+                    "raw_log_step": safe_quantiles(raw_steps),
+                    "log_threshold_total_variation": float(
+                        math.fsum(
+                            abs(
+                                math.log(
+                                    float(value["next_clip_threshold"])
+                                    / float(value["clip_threshold_used"])
+                                )
+                            )
+                            for value in group_rounds
+                        )
+                    ),
+                    "log_step_direction_flip_count": direction_flips,
+                    "oracle_direction_agreement_count": sum(
+                        bool(value["update_direction_agrees"])
+                        for value in group_rounds
+                    ),
+                    "oracle_direction_agreement_fraction": safe_ratio(
+                        sum(
+                            bool(value["update_direction_agrees"])
+                            for value in group_rounds
+                        ),
+                        len(group_rounds),
+                    ),
+                    "noisy_cdf_out_of_range_count": sum(
+                        int(value["noisy_cdf_out_of_range_count"])
+                        for value in group_rounds
+                    ),
+                    "noisy_cdf_out_of_range_fraction": safe_ratio(
+                        sum(
+                            int(value["noisy_cdf_out_of_range_count"])
+                            for value in group_rounds
+                        ),
+                        len(group_rounds) * int(controller_rounds[0]["num_slots"]),
+                    ),
+                    "gamma_clamped_low_count": sum(
+                        bool(value["gamma_clamped_low"]) for value in group_rounds
+                    ),
+                    "gamma_clamped_high_count": sum(
+                        bool(value["gamma_clamped_high"]) for value in group_rounds
+                    ),
+                    "log_step_bounded_count": sum(
+                        bool(value["log_step_was_bounded"]) for value in group_rounds
+                    ),
+                    "lower_bound_hits": sum(
+                        bool(value["hit_min_clip_norm"]) for value in group_rounds
+                    ),
+                    "upper_bound_hits": sum(
+                        bool(value["hit_max_clip_norm"]) for value in group_rounds
+                    ),
+                    "noisy_adjacent_monotonicity_violations": sum(
+                        int(value["noisy_adjacent_monotonicity_violations"])
+                        for value in group_rounds
+                    ),
+                    "exact_adjacent_monotonicity_violations": sum(
+                        int(value["exact_adjacent_monotonicity_violations"])
+                        for value in group_rounds
+                    ),
+                    "final_next_clip_threshold": group_rounds[-1][
+                        "next_clip_threshold"
+                    ],
+                }
         result["slaclip_controller"] = {
             "variant": "full_slaclip_cdf_endpoints",
             "rounds": len(controller_rounds),
             "trajectory_sha256": canonical_json_fingerprint(controller_rounds),
-            "groups": {
-                group: {
-                    "clip_threshold_used": safe_quantiles(
-                        value[group]["clip_threshold_used"]
-                        for value in controller_rounds
-                    ),
-                    "next_clip_threshold": safe_quantiles(
-                        value[group]["next_clip_threshold"]
-                        for value in controller_rounds
-                    ),
-                    "near_threshold_proxy": safe_quantiles(
-                        value[group]["near_threshold_proxy"]
-                        for value in controller_rounds
-                    ),
-                    "near_zero_proxy": safe_quantiles(
-                        value[group]["near_zero_proxy"]
-                        for value in controller_rounds
-                    ),
-                    "near_zero_adjusted": safe_quantiles(
-                        value[group]["near_zero_adjusted"]
-                        for value in controller_rounds
-                    ),
-                    "dynamic_target_unclipped": safe_quantiles(
-                        value[group]["dynamic_target_unclipped"]
-                        for value in controller_rounds
-                    ),
-                    "dynamic_target_clipped": safe_quantiles(
-                        value[group]["dynamic_target_clipped"]
-                        for value in controller_rounds
-                    ),
-                    "controller_error": safe_quantiles(
-                        value[group]["controller_error"]
-                        for value in controller_rounds
-                    ),
-                    "actual_clip_fraction": safe_quantiles(
-                        value[group]["actual_clip_fraction"]
-                        for value in controller_rounds
-                    ),
-                    "actual_minus_dynamic_target_clipped": safe_quantiles(
-                        value[group]["actual_minus_dynamic_target_clipped"]
-                        for value in controller_rounds
-                    ),
-                    "near_threshold_proxy_error": safe_quantiles(
-                        value[group]["noisy_near_threshold_minus_exact"]
-                        for value in controller_rounds
-                    ),
-                    "near_zero_proxy_error": safe_quantiles(
-                        value[group]["noisy_near_zero_minus_exact"]
-                        for value in controller_rounds
-                    ),
-                    "raw_log_step": safe_quantiles(
-                        value[group]["raw_log_step"]
-                        for value in controller_rounds
-                    ),
-                    "gamma_clamped_low_count": sum(
-                        bool(value[group]["gamma_clamped_low"])
-                        for value in controller_rounds
-                    ),
-                    "gamma_clamped_high_count": sum(
-                        bool(value[group]["gamma_clamped_high"])
-                        for value in controller_rounds
-                    ),
-                    "log_step_bounded_count": sum(
-                        bool(value[group]["log_step_was_bounded"])
-                        for value in controller_rounds
-                    ),
-                    "lower_bound_hits": sum(
-                        bool(value[group]["hit_min_clip_norm"])
-                        for value in controller_rounds
-                    ),
-                    "upper_bound_hits": sum(
-                        bool(value[group]["hit_max_clip_norm"])
-                        for value in controller_rounds
-                    ),
-                    "noisy_adjacent_monotonicity_violations": sum(
-                        int(value[group]["noisy_adjacent_monotonicity_violations"])
-                        for value in controller_rounds
-                    ),
-                    "exact_adjacent_monotonicity_violations": sum(
-                        int(value[group]["exact_adjacent_monotonicity_violations"])
-                        for value in controller_rounds
-                    ),
-                    "final_next_clip_threshold": controller_rounds[-1][group][
-                        "next_clip_threshold"
-                    ],
-                }
-                for group in ("A", "B")
-            },
+            "groups": controller_groups,
         }
     return result
 
@@ -2970,6 +3146,9 @@ def train_one_model(
         if resume
         else None
     )
+    evaluation_seed = config.evaluation_seed + (
+        0 if model_kind == "bert" else 1_000_000
+    )
     if checkpoint is None:
         if resume:
             archive_round_shards_after(rounds_directory, completed_round=0)
@@ -2982,7 +3161,7 @@ def train_one_model(
             data.validation_indices,
             config,
             device,
-            model_seed + 20_000,
+            evaluation_seed,
         )
         evaluations.append(
             {
@@ -3296,7 +3475,7 @@ def train_one_model(
                 data.validation_indices,
                 config,
                 device,
-                model_seed + 20_000,
+                evaluation_seed,
             )
             evaluation["effective_lora"] = effective_lora_statistics(groups)
             evaluation["elapsed_seconds"] = (
@@ -3687,6 +3866,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rank", type=int, default=512)
     parser.add_argument("--max-seq-length", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--data-split-seed", type=int, default=1729)
+    parser.add_argument("--evaluation-seed", type=int, default=2718)
     parser.add_argument("--max-validation-records", type=int, default=128)
     parser.add_argument("--eval-every", type=int, default=10)
     parser.add_argument("--checkpoint-every", type=int, default=10)
@@ -3804,6 +3985,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         automatic_release_num_slots = automatic_num_slots(
             config.num_clients, config.noise_multiplier
         )
+        normalized_proxy_noise_std = float(
+            config.noise_multiplier
+            * math.sqrt(num_slots / config.num_clients)
+        )
+        exceeds_automatic_release_bound = bool(
+            args.slaclip_num_slots > 0
+            and num_slots > automatic_release_num_slots
+        )
         if (
             not math.isfinite(args.slaclip_eta)
             or args.slaclip_eta < 0
@@ -3845,13 +4034,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "num_clients": config.num_clients,
                 "expected_release_records": config.num_clients,
                 "automatic_release_num_slots": automatic_release_num_slots,
-                "explicit_num_slots_exceeds_automatic_release_bound": bool(
-                    args.slaclip_num_slots > 0
-                    and num_slots > automatic_release_num_slots
+                "explicit_num_slots_exceeds_automatic_release_bound": (
+                    exceeds_automatic_release_bound
                 ),
-                "normalized_proxy_noise_std_per_slot_theoretical": float(
-                    config.noise_multiplier
-                    * math.sqrt(num_slots / config.num_clients)
+                "normalized_proxy_noise_std_per_slot_theoretical": (
+                    normalized_proxy_noise_std
                 ),
                 "normalized_proxy_noise_std_formula": (
                     "noise_multiplier*sqrt(num_slots/num_clients)"
@@ -3878,9 +4065,17 @@ def main(argv: Sequence[str] | None = None) -> None:
             },
             "exact_cdf_and_clipping_diagnostics": PRIVACY_LABEL,
             "k15_release_noise_warning": (
-                "With five client contributions and sigma=2, K=15 gives "
-                "normalized endpoint noise sd sqrt(12); this exceeds the "
-                "paper central-batch monotonicity-rule choice."
+                f"With {config.num_clients} client contributions, "
+                f"sigma={config.noise_multiplier:g}, and K={num_slots}, the "
+                "normalized endpoint noise standard deviation is "
+                f"{normalized_proxy_noise_std:.12g}. "
+                + (
+                    "This K exceeds the paper central-batch monotonicity-rule "
+                    f"choice K={automatic_release_num_slots}."
+                    if exceeds_automatic_release_bound
+                    else "This K does not exceed the automatic monotonicity-rule "
+                    f"choice K={automatic_release_num_slots}."
+                )
             ),
             "independently_privacy_certified": False,
         }
@@ -3916,7 +4111,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "The full SlaClip controller uses the first and final noisy CDF-proxy slots to derive a dynamic target; no fixed clipping target or baseline calibration is used.",
                 "SlaClip is adapted to the paper-literal federated mechanism by releasing one joint gradient/slack vector per client and LoRA group, then updating each A/B threshold once after FedAvg.",
                 "The controller consumes only noisy endpoints; exact endpoint values and actual clipping fractions are retained solely as explicitly labelled non-DP private diagnostics.",
-                "The requested K=15 small-batch policy exceeds the paper monotonicity-rule K for five releases at sigma=2, so this exploratory federated adaptation is not end-to-end DP certified.",
+                (
+                    f"The requested K={num_slots} policy with "
+                    f"N={config.num_clients} and sigma={config.noise_multiplier:g} "
+                    "is retained exactly as specified by the experiment plan; "
+                    f"its theoretical normalized endpoint noise standard "
+                    f"deviation is {normalized_proxy_noise_std:.12g}, and the "
+                    "exploratory federated adaptation is not independently "
+                    "end-to-end DP certified."
+                ),
             ]
         )
     dependency_versions = package_versions()

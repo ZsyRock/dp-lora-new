@@ -7,7 +7,7 @@ usage() {
     cat >&2 <<'USAGE'
 Usage: hpc/submit_full_slaclip_campaign.sh [--resume] [--test-only]
 
-Submit the 60-arm, two-lane full-SlaClip campaign as exactly one Slurm job.
+Submit the 108-arm, 54-wave full-SlaClip campaign as exactly one Slurm job.
 The allocation performs its two H200 CUDA smokes before starting the matrix.
 
 --resume requires DPLORA_FULL_RUN_ID to name an existing partial campaign.
@@ -29,9 +29,10 @@ Important overrides:
   DPLORA_FULL_LANE_MEMORY     host RAM per concurrent lane (default: 192G)
   DPLORA_FULL_WALLTIME        walltime (default/max here: 2-12:00:00)
 
-The checked-in experiment contract fixes K_clients=5, T=50, B=8, sigma=2,
+The confirmatory paper setting fixes K_clients=5, T=50, B=8, sigma=2,
 lr=5e-4, rank=512, K_slots=15, and full SlaClip C bounds [0.1, 50].
-Exact gradient/CDF diagnostics are non-DP private artifacts.
+Pre-registered sensitivity arms vary sigma and client count while retaining
+K_slots=15. Exact gradient/CDF diagnostics are non-DP private artifacts.
 USAGE
 }
 

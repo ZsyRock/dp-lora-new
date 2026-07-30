@@ -63,26 +63,26 @@ for historical audit and is not evidence for full SlaClip.
 
 ## What the current full-SlaClip campaign can establish
 
-The current plan is a single resumable Slurm allocation containing 60 runner
-arms, with every arm training both BERT-base and GPT-2 small.  Its primary
-matched comparison crosses fixed DP-LoRA and full `slaclip_dp_lora` over the
-paper's initialization sweep `C_0 in {0.1, 1, 5, 10, 20}` and seeds
-`42, 43, 44` (30 arms).  It adds 24 full-SlaClip
-controller-sensitivity arms at `C_0=10` over seeds `42..44`,
-`eta in {0.05, 0.1, 0.2}`, and `beta in {0.5, 0.9, 0.99}`, excluding the
-already-covered default pair.  Six no-DP/clip-only arms at `C_0=10` and seeds
-`42..44` complete the mechanism controls.  Two GPU lanes execute this manifest
-inside the same job; checkpointed state and compact incremental archives make
-it resumable without splitting the work into separately queued jobs.
+The current plan is one resumable Slurm allocation containing 108 runner arms
+(54 two-GPU waves), with every arm training both BERT-base and GPT-2 small.
+Its confirmatory comparison is fixed DP-LoRA versus full `slaclip_dp_lora` at
+the paper's `C_0=10` over ten paired seeds `42..51` (20 arms).  It adds 24
+matched initial-threshold robustness arms at `C_0 in {0.1, 1, 5, 20}`; 24
+controller-sensitivity arms; 18 matched `sigma in {0.5, 1, 4}` arms; 12
+matched `K_clients in {20, 80}` arms; and ten no-DP/clip-only controls.  Two
+GPU lanes execute the manifest inside one job; checkpoints and compact
+incremental archives make it resumable without separately queued jobs.
 
 This design is materially stronger than one seed at the paper's default
 `C=10`: it can test whether an apparent gain is paired across seeds, robust to
 the initial threshold, and stable under controller settings while separating
-clipping from Gaussian-noise effects.  The most useful outputs are the
-per-round internal loss, actual clipping fraction, raw/clipped/noisy norms,
-signal-to-noise and cosine statistics, both noisy CDF endpoints, exact CDF
-diagnostics, dynamic `gamma_t`, threshold trajectories, bound hits, paired
-per-seed deltas, and aggregate mean/standard deviation.
+clipping from Gaussian-noise effects.  Evaluation split and masks are fixed
+across methods and training seeds.  Outputs include best/final/AUC loss,
+actual clipping, raw/clipped/noisy and removed-gradient norms, retained energy,
+FedAvg signal/noise, full-CDF error and out-of-range slots, dynamic `gamma_t`,
+threshold stability, and non-private exact-oracle update error/direction
+agreement.  Paired summaries add 95% confidence intervals, Cohen's `dz`, exact
+sign-flip tests, and Holm-adjusted p-values.
 
 No effectiveness result follows from the specification alone.  Such a claim
 requires all scheduled arms to complete (or be explicitly reported missing),
@@ -94,3 +94,9 @@ implement the paper's ChatGLM2-6B or Llama2-7B protocols; and its adaptation of
 full SlaClip to five client aggregate-gradient records has no independently
 certified end-to-end privacy accountant.  Those are the next gates before a
 paper benchmark reproduction or privacy claim is justified.
+
+`campaign_summary.json` is incremental and may legitimately remain
+`IN_PROGRESS` after a batch failure.  The authoritative allocation lifecycle
+is the separately archived atomic `job-status.json`; it records
+`RUNNING`/`COMPLETED`/`FAILED`, Slurm job ID, exit code, failure stage,
+immutable manifest hash, and whether checkpoint exit 75 is resumable.

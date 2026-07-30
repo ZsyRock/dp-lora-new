@@ -100,36 +100,50 @@ final adapter and final summaries all reconcile.
 
 `hpc/submit_full_slaclip_campaign.sh` submits
 `hpc/full_slaclip_campaign.sbatch` as one Slurm job on one node.  Inside that
-single allocation, two independent GPU lanes consume a resumable 60-arm
-manifest; no array or nested child job is submitted.  Every arm runs both
-BERT-base and GPT-2 small, so the manifest represents 120 model-level training
-executions:
+single allocation, two independent GPU lanes consume a resumable 108-arm,
+54-wave manifest; no array or nested child job is submitted.  Every arm runs
+both BERT-base and GPT-2 small, so the manifest represents 216 model-level
+training executions:
 
-- 30 primary arms: fixed DP-LoRA and full SlaClip, the paper's initialization
-  sweep `C_0 in {0.1, 1, 5, 10, 20}`, seeds `42, 43, 44`;
+- 20 confirmatory primary arms: fixed DP-LoRA and full SlaClip at the paper's
+  `C_0=10`, using ten paired seeds `42..51`;
+- 24 initial-threshold robustness arms: both methods at
+  `C_0 in {0.1, 1, 5, 20}`, seeds `42..44`;
 - 24 full-SlaClip controller-sensitivity arms at `C_0=10`, seeds `42..44`,
   crossing `eta in {0.05, 0.1, 0.2}` with
   `beta in {0.5, 0.9, 0.99}` and excluding the already-covered
-  `(eta=0.2, beta=0.5)` default; and
-- 6 mechanism controls at `C_0=10`: no-DP and clip-only, seeds `42..44`.
+  `(eta=0.2, beta=0.5)` default;
+- 18 noise-sensitivity arms: both methods at
+  `sigma in {0.5, 1, 4}`, seeds `42..44`;
+- 12 protected-record-count arms: both methods at
+  `K_clients in {20, 80}`, seeds `42..44`; and
+- 10 mechanism controls at `C_0=10`: no-DP and clip-only, seeds `42..46`.
 
 The wrapper accepts `--test-only` for scheduler validation without submission
 and `--resume` for an existing `DPLORA_FULL_RUN_ID`; the two flags may be
 combined.
 
-All formal arms retain `K_clients=5`, `T=50`, `B=8`, `sigma=2`, `lr=5e-4`,
-and LoRA rank `512`.  Full SlaClip uses `K_slots=15`, bounds `[0.1, 50]`, and
-defaults `eta=0.2`, `beta=0.5`.  The `K_slots=15` choice follows the requested
-small-batch policy but exceeds the automatic bound implied by only five
-released client records; the override and its noise consequence are recorded
-in every controller contract.
+The confirmatory setting retains `K_clients=5`, `T=50`, `B=8`, `sigma=2`,
+`lr=5e-4`, and LoRA rank `512`; only explicitly labelled sensitivity arms vary
+`K_clients` or `sigma`.  Full SlaClip uses `K_slots=15`, bounds `[0.1, 50]`,
+and defaults `eta=0.2`, `beta=0.5`.  The requested `K_slots=15` small-batch
+policy exceeds the automatic bound implied by only five released client
+records at the primary setting; its noise consequence is recorded.
 
-Periodic checkpoints, per-arm status, incremental compact archives, and
-completed-arm revalidation allow the same immutable campaign to resume after
-a wall-time stop without rerunning valid arms.  Scheduler-only validation does
-not create a training job.  The campaign remains Level 1: it does not add the
-paper's downstream benchmarks or 6B/7B model protocols, and it cannot by itself
-establish a paper score or a certified privacy budget.
+Evaluation fixes a content-disjoint split (`data_split_seed=1729`), supervision
+masks (`evaluation_seed=2718`), and a 512-record holdout across training seeds
+and methods.  New outputs include full-CDF error and out-of-range slots,
+non-private exact-oracle update error/direction agreement, threshold stability,
+removed-gradient norm and retained energy, FedAvg signal/noise, best/final/AUC
+loss, and paired confidence, effect-size, exact sign-flip, and Holm statistics.
+
+Periodic checkpoints, per-arm status, incremental compact archives, strict
+revalidation, and an atomic `job-status.json`
+(`RUNNING`/`COMPLETED`/`FAILED`) make the campaign resumable without confusing
+an incremental `IN_PROGRESS` summary with a live allocation.  The campaign
+remains Level 1: it lacks the paper's downstream benchmarks, 6B/7B protocols,
+and an end-to-end privacy certificate, so it is not by itself a
+journal-complete result package.
 
 See `docs/CURRENT_RESULT_ASSESSMENT.md` for the evidence-based interpretation
 of legacy job `1298681` and its 7-minute-31-second wall time.

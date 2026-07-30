@@ -68,6 +68,10 @@ export PYTHONUNBUFFERED=1
 export PYTHONDONTWRITEBYTECODE=1
 export TOKENIZERS_PARALLELISM=false
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
+# sbatch --export=NONE deliberately sanitizes the submission environment.
+# Override its inherited step policy only after defining the exact environment
+# above so every exclusive srun lane receives the reproducibility contract.
+export SLURM_EXPORT_ENV=ALL
 export OMP_NUM_THREADS="$lane_cpus"
 export TMPDIR="${SLURM_TMPDIR:-$scratch_root/tmp/dp-lora-full-slaclip-$SLURM_JOB_ID}"
 mkdir -p "$TMPDIR"
@@ -87,6 +91,52 @@ if [[ "$resume" -eq 1 ]]; then
 fi
 "$python_bin" "$coordinator" "${prepare_args[@]}"
 
+campaign_stage="prepared"
+campaign_completed=0
+finalize_campaign() {
+    local original_rc=$?
+    local final_rc="$original_rc"
+    local terminal_status="FAILED"
+    local terminal_reason="batch_exit_at_${campaign_stage}"
+    trap - EXIT
+    set +e
+    if [[ "$original_rc" -eq 0 && "$campaign_completed" -eq 1 ]]; then
+        terminal_status="COMPLETED"
+        terminal_reason="all_arms_revalidated_and_archived"
+    elif [[ "$original_rc" -eq 0 ]]; then
+        final_rc=1
+        terminal_reason="batch_exited_without_completion_at_${campaign_stage}"
+    elif [[ "$original_rc" -eq 75 ]]; then
+        terminal_reason="checkpointed_stop_at_${campaign_stage}"
+    fi
+    "$python_bin" "$coordinator" mark-job-status \
+        --campaign-root "$campaign_root" \
+        --runtime-manifest "$runtime_manifest" \
+        --status "$terminal_status" \
+        --slurm-job-id "$SLURM_JOB_ID" \
+        --repository-sha "$expected_sha" \
+        --reason "$terminal_reason" \
+        --exit-code "$final_rc"
+    marker_rc=$?
+    if [[ "$marker_rc" -ne 0 ]]; then
+        echo "ERROR: failed to write terminal campaign job status (rc=$marker_rc)" >&2
+        if [[ "$final_rc" -eq 0 ]]; then
+            final_rc=1
+        fi
+    fi
+    "$python_bin" "$coordinator" archive-small \
+        --campaign-root "$campaign_root" --archive-root "$archive_root" || true
+    exit "$final_rc"
+}
+trap finalize_campaign EXIT
+"$python_bin" "$coordinator" mark-job-status \
+    --campaign-root "$campaign_root" \
+    --runtime-manifest "$runtime_manifest" \
+    --status RUNNING \
+    --slurm-job-id "$SLURM_JOB_ID" \
+    --repository-sha "$expected_sha" \
+    --reason allocation_started
+
 request_stop() {
     mkdir -p "$(dirname "$global_stop")"
     touch "$global_stop"
@@ -96,6 +146,7 @@ trap request_stop USR1 TERM INT
 
 run_step() {
     srun \
+        --export=ALL \
         --exact \
         --exclusive \
         --nodes=1 \
@@ -115,10 +166,12 @@ nvidia-smi
 
 # A single-task step prevents the two-task parent allocation from confusing
 # single-process input/runtime checks.
+campaign_stage="runtime_and_input_preflight"
 run_step "$python_bin" -m pip check
 run_step "$python_bin" "$trainer" --check-inputs --input-manifest "$input_manifest"
 
 # Verify both independently scheduled H200 lanes before the formal matrix.
+campaign_stage="cuda_preflight"
 run_step "$python_bin" "$coordinator" cuda-smoke \
     --lane 0 --output "$campaign_root/preflight/cuda-lane-0.json" &
 smoke_pid_0=$!
@@ -146,6 +199,7 @@ fi
 # full CDF-endpoint controller, checkpoint writer, and final validation.  Both
 # smokes share their private RNG domain and run concurrently on the two lanes.
 # On resume, train_federated.py --resume deeply revalidates completed smokes.
+campaign_stage="real_model_preflight"
 run_step "$python_bin" "$coordinator" run-smoke \
     --manifest "$runtime_manifest" \
     --lane 0 \
@@ -190,6 +244,7 @@ if [[ -e "$global_stop" ]]; then
     exit 75
 fi
 
+campaign_stage="formal_matrix"
 while IFS=$'\t' read -r arm_index_0 arm_index_1; do
     echo "starting_wave=$((arm_index_0 / 2)) arm_indices=$arm_index_0,$arm_index_1"
     run_step "$python_bin" "$coordinator" run-arm \
@@ -231,10 +286,13 @@ while IFS=$'\t' read -r arm_index_0 arm_index_1; do
     fi
 done < <("$python_bin" "$coordinator" waves --manifest "$runtime_manifest")
 
+campaign_stage="final_revalidation"
 "$python_bin" "$coordinator" aggregate \
     --manifest "$runtime_manifest" --require-complete
 "$python_bin" "$coordinator" archive-small \
     --campaign-root "$campaign_root" --archive-root "$archive_root"
+campaign_completed=1
+campaign_stage="completed"
 echo "campaign_status=COMPLETED"
 echo "campaign_summary=$campaign_root/campaign_summary.json"
 echo "persistent_small_artifact_archive=$archive_root"
