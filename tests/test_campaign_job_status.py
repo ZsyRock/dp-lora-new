@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
+import paper_repro.full_slaclip_campaign as campaign_module
 from paper_repro.full_slaclip_campaign import (
     JOB_STATUS_NAME,
     _archive_candidate,
     atomic_json,
     canonical_bytes,
     mark_job_status,
+    recover_stale_job_status,
     sha256_bytes,
 )
 
@@ -151,6 +154,80 @@ def test_stale_allocation_cannot_overwrite_new_owner(tmp_path: Path) -> None:
             reason="late_exit",
             exit_code=1,
         )
+
+
+def test_resume_recovers_stale_owner_only_after_scheduler_terminal_evidence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    campaign_root, runtime_path = _prepared_campaign(tmp_path)
+    _mark(
+        campaign_root,
+        runtime_path,
+        status="RUNNING",
+        job_id="300",
+        reason="allocation_started",
+    )
+    monkeypatch.setattr(
+        "paper_repro.full_slaclip_campaign._confirmed_terminal_slurm_state",
+        lambda job_id: "CANCELLED" if job_id == "300" else None,
+    )
+    common = {
+        "campaign_root": campaign_root,
+        "runtime_manifest": runtime_path,
+        "repository_sha": REPOSITORY_SHA,
+    }
+    recover_stale_job_status(argparse.Namespace(**common, check_only=True))
+    checked = json.loads(
+        (campaign_root / JOB_STATUS_NAME).read_text(encoding="utf-8")
+    )
+    assert checked["status"] == "RUNNING"
+
+    recover_stale_job_status(argparse.Namespace(**common, check_only=False))
+    recovered = json.loads(
+        (campaign_root / JOB_STATUS_NAME).read_text(encoding="utf-8")
+    )
+    assert recovered["status"] == "FAILED"
+    assert recovered["exit_code"] == 75
+    assert recovered["resumable"] is True
+    assert recovered["reason"] == "scheduler_confirmed_cancelled_before_resume"
+
+
+def test_scheduler_terminal_confirmation_checks_squeue_then_exact_sacct_row(
+    monkeypatch,
+) -> None:
+    responses = iter(
+        [
+            subprocess.CompletedProcess(
+                [],
+                1,
+                stdout="",
+                stderr="slurm_load_jobs error: Invalid job id specified\n",
+            ),
+            subprocess.CompletedProcess(
+                [],
+                0,
+                stdout="300|CANCELLED by 49537\n300.batch|CANCELLED\n",
+                stderr="",
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        "paper_repro.full_slaclip_campaign.subprocess.run",
+        lambda *_args, **_kwargs: next(responses),
+    )
+    assert campaign_module._confirmed_terminal_slurm_state("300") == "CANCELLED"
+
+
+def test_scheduler_terminal_confirmation_refuses_an_active_owner(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "paper_repro.full_slaclip_campaign.subprocess.run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, stdout="300|RUNNING\n", stderr=""
+        ),
+    )
+    with pytest.raises(RuntimeError, match="still present in squeue"):
+        campaign_module._confirmed_terminal_slurm_state("300")
 
 
 def test_job_status_is_included_in_incremental_archive(tmp_path: Path) -> None:

@@ -274,6 +274,13 @@ permits one GPU per job.  It retains the previous MedDialog, BERT/GPT-2,
 five-client, 50-round, batch-8, `sigma=2`, learning-rate, LoRA-rank,
 evaluation, and seed settings.
 
+The development partition may cancel a job when higher-priority work arrives;
+it does not automatically requeue.  Completed arms and ten-round checkpoints
+remain reusable.  A later explicit `--resume` first checks that the old owner
+is absent from `squeue` and has exactly one terminal allocation row in `sacct`,
+then atomically closes a stale `RUNNING` marker before a new allocation can
+take ownership.  Active or unverifiable owners fail closed.
+
 The candidate base target clipped fractions are
 `{0, 0.19, 0.38, 0.57, 0.76}`.  They are the five equally spaced endpoints of
 the BERT baseline's roundwise-five-seed-mean any-group clipping interval

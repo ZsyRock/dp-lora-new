@@ -52,6 +52,21 @@ REQUIRED_STEP_ENVIRONMENT = {
     "HF_DATASETS_OFFLINE": "1",
     "SLURM_EXPORT_ENV": "ALL",
 }
+TERMINAL_SLURM_STATES = frozenset(
+    {
+        "BOOT_FAIL",
+        "CANCELLED",
+        "COMPLETED",
+        "DEADLINE",
+        "FAILED",
+        "NODE_FAIL",
+        "OUT_OF_MEMORY",
+        "PREEMPTED",
+        "REVOKED",
+        "SPECIAL_EXIT",
+        "TIMEOUT",
+    }
+)
 
 
 def utc_now() -> str:
@@ -953,6 +968,168 @@ def mark_job_status(args: argparse.Namespace) -> None:
             "reason": args.reason,
             "resumable": resumable,
         },
+    )
+
+
+def _confirmed_terminal_slurm_state(slurm_job_id: str) -> str:
+    """Return a scheduler-confirmed terminal state or fail closed.
+
+    ``squeue`` is checked first so an active owner can never be taken over.
+    ``sacct -X`` then supplies allocation-level terminal evidence.  A state in
+    transition, missing accounting row, or scheduler command failure requires
+    the operator to retry rather than guessing that the owner is stale.
+    """
+
+    try:
+        queued = subprocess.run(
+            [
+                "squeue",
+                "--noheader",
+                f"--jobs={slurm_job_id}",
+                "--format=%i|%T",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        raise RuntimeError("could not query squeue for stale-owner recovery") from error
+    queue_reports_absent = (
+        queued.returncode != 0
+        and not queued.stdout.strip()
+        and "invalid job id" in queued.stderr.lower()
+    )
+    if queued.returncode != 0 and not queue_reports_absent:
+        raise RuntimeError(
+            "squeue failed during stale-owner recovery: "
+            + queued.stderr.strip()
+        )
+    active_rows = [line.strip() for line in queued.stdout.splitlines() if line.strip()]
+    if active_rows:
+        raise RuntimeError(
+            "the existing RUNNING campaign owner is still present in squeue: "
+            + ";".join(active_rows)
+        )
+
+    try:
+        accounted = subprocess.run(
+            [
+                "sacct",
+                "-X",
+                f"--jobs={slurm_job_id}",
+                "--noheader",
+                "--parsable2",
+                "--format=JobIDRaw,State",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        raise RuntimeError("could not query sacct for stale-owner recovery") from error
+    if accounted.returncode != 0:
+        raise RuntimeError(
+            "sacct failed during stale-owner recovery: "
+            + accounted.stderr.strip()
+        )
+    exact_states: list[str] = []
+    for raw_line in accounted.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        fields = line.split("|", 1)
+        if len(fields) != 2 or fields[0] != slurm_job_id:
+            continue
+        state = fields[1].strip().split()[0].rstrip("+") if fields[1].strip() else ""
+        if state:
+            exact_states.append(state)
+    if len(exact_states) != 1:
+        raise RuntimeError(
+            "sacct did not return exactly one allocation-level stale-owner row"
+        )
+    state = exact_states[0]
+    if state not in TERMINAL_SLURM_STATES:
+        raise RuntimeError(
+            f"the previous Slurm owner is not terminal in sacct: {state}"
+        )
+    return state
+
+
+def recover_stale_job_status(args: argparse.Namespace) -> None:
+    """Close a stale RUNNING marker only after scheduler terminal evidence."""
+
+    campaign_root = args.campaign_root.resolve()
+    runtime_manifest = args.runtime_manifest.resolve()
+    status_path = campaign_root / JOB_STATUS_NAME
+    if not campaign_root.is_dir() or not runtime_manifest.is_file():
+        raise RuntimeError("stale-owner recovery requires a prepared campaign")
+    runtime = load_runtime(runtime_manifest)
+    if runtime["repository_sha"] != args.repository_sha:
+        raise RuntimeError(
+            "stale-owner recovery repository SHA differs from runtime manifest"
+        )
+    runtime_manifest_sha256 = sha256_file(runtime_manifest)
+    if not status_path.exists():
+        print(json.dumps({"status": "NO_EXISTING_JOB_STATUS"}, sort_keys=True))
+        return
+    existing = load_object(status_path, "campaign job status")
+    if (
+        existing.get("schema_version") != SCHEMA_VERSION
+        or existing.get("repository_sha") != args.repository_sha
+        or existing.get("runtime_manifest_sha256") != runtime_manifest_sha256
+    ):
+        raise RuntimeError("stale campaign owner identity differs")
+    if existing.get("status") != "RUNNING":
+        print(
+            json.dumps(
+                {
+                    "status": "NO_STALE_RUNNING_OWNER",
+                    "existing_status": existing.get("status"),
+                },
+                sort_keys=True,
+            )
+        )
+        return
+    stale_job_id = existing.get("slurm_job_id")
+    if not isinstance(stale_job_id, str) or not stale_job_id or any(
+        character not in "0123456789_" for character in stale_job_id
+    ):
+        raise RuntimeError("stale campaign owner has an invalid Slurm job ID")
+    scheduler_state = _confirmed_terminal_slurm_state(stale_job_id)
+    reason = f"scheduler_confirmed_{scheduler_state.lower()}_before_resume"
+    if args.check_only:
+        print(
+            json.dumps(
+                {
+                    "status": "STALE_RUNNING_OWNER_TERMINAL_CONFIRMED",
+                    "stale_slurm_job_id": stale_job_id,
+                    "scheduler_state": scheduler_state,
+                },
+                sort_keys=True,
+            )
+        )
+        return
+    mark_job_status(
+        argparse.Namespace(
+            campaign_root=campaign_root,
+            runtime_manifest=runtime_manifest,
+            status="FAILED",
+            slurm_job_id=stale_job_id,
+            repository_sha=args.repository_sha,
+            reason=reason,
+            exit_code=75,
+        )
+    )
+    print(
+        json.dumps(
+            {
+                "status": "STALE_RUNNING_OWNER_RECOVERED",
+                "stale_slurm_job_id": stale_job_id,
+                "scheduler_state": scheduler_state,
+                "job_status": str(status_path),
+            },
+            sort_keys=True,
+        )
     )
 
 
@@ -2712,6 +2889,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     job_status.add_argument("--reason", required=True)
     job_status.add_argument("--exit-code", type=int)
 
+    stale_status = subparsers.add_parser("recover-stale-job-status")
+    stale_status.add_argument("--campaign-root", type=Path, required=True)
+    stale_status.add_argument("--runtime-manifest", type=Path, required=True)
+    stale_status.add_argument("--repository-sha", required=True)
+    stale_status.add_argument("--check-only", action="store_true")
+
     archive = subparsers.add_parser("archive-small")
     archive.add_argument("--campaign-root", type=Path, required=True)
     archive.add_argument("--archive-root", type=Path, required=True)
@@ -2745,6 +2928,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "mark-job-status":
         mark_job_status(args)
+        return 0
+    if args.command == "recover-stale-job-status":
+        recover_stale_job_status(args)
         return 0
     if args.command == "archive-small":
         archive_small(args)

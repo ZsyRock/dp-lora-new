@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import math
+import subprocess
 from collections import Counter
 from pathlib import Path
 
@@ -30,6 +31,7 @@ SPEC = REPOSITORY / "hpc" / "full-slaclip-campaign-spec.json"
 BETA5_SPEC = REPOSITORY / "hpc" / "full-slaclip-beta5-screen-spec.json"
 K5_RANGE_SPEC = REPOSITORY / "hpc" / "full-slaclip-k5-baseline-range-spec.json"
 SLURM_WORKER = REPOSITORY / "hpc" / "full_slaclip_campaign.sbatch"
+EXIT_POLICY = REPOSITORY / "hpc" / "full_slaclip_exit_policy.sh"
 BETA5_SUBMITTER = REPOSITORY / "hpc" / "submit_full_slaclip_beta5_screen.sh"
 K5_RANGE_SUBMITTER = (
     REPOSITORY / "hpc" / "submit_full_slaclip_k5_baseline_range.sh"
@@ -49,6 +51,61 @@ def test_slurm_worker_exports_required_cuda_determinism_contract() -> None:
     assert 'parent_lanes="${SLURM_NTASKS:-0}"' in worker
     assert '[[ "$parent_lanes" -eq 2 ]]' in worker
     assert "starting_sequential_wave=" in worker
+
+
+def test_shell_exit_policy_makes_hard_failures_dominate_checkpoint_stops() -> None:
+    cases = {
+        (0,): "SUCCESS",
+        (0, 0): "SUCCESS",
+        (75,): "CHECKPOINTED_STOP",
+        (0, 75): "CHECKPOINTED_STOP",
+        (1,): "HARD_FAILURE",
+        (1, 75): "HARD_FAILURE",
+        (75, 1): "HARD_FAILURE",
+    }
+    for return_codes, expected in cases.items():
+        completed = subprocess.run(
+            [str(EXIT_POLICY), *[str(value) for value in return_codes]],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.stdout.strip() == expected
+
+
+def test_shell_wait_policy_retries_a_trap_interrupted_wait() -> None:
+    script = r'''
+set -u
+source "$1"
+full_slaclip_stop_generation=0
+trap 'full_slaclip_stop_generation=$((full_slaclip_stop_generation + 1))' USR1
+(sleep 0.05; kill -USR1 "$$") &
+notifier_pid=$!
+(sleep 0.20; exit 75) &
+child_pid=$!
+set +e
+wait_for_full_slaclip_child "$child_pid"
+child_rc=$?
+wait "$notifier_pid"
+notifier_rc=$?
+set -e
+printf 'child_rc=%s notifier_rc=%s generation=%s\n' \
+    "$child_rc" "$notifier_rc" "$full_slaclip_stop_generation"
+[[ "$child_rc" -eq 75 && "$notifier_rc" -eq 0 && "$full_slaclip_stop_generation" -eq 1 ]]
+'''
+    completed = subprocess.run(
+        ["bash", "-c", script, "bash", str(EXIT_POLICY)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.stdout.strip() == "child_rc=75 notifier_rc=0 generation=1"
+
+
+def test_slurm_worker_uses_signal_safe_wait_for_every_background_child() -> None:
+    worker = SLURM_WORKER.read_text(encoding="utf-8")
+    assert '\nwait "$' not in worker
+    assert worker.count("wait_for_full_slaclip_child") == 8
 
 
 def test_compute_step_environment_is_validated_fail_closed(

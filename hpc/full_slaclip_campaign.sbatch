@@ -30,6 +30,7 @@ min_vram_gib="${16:?missing minimum per-lane VRAM GiB}"
 python_bin="$env_prefix/bin/python"
 coordinator="$repository/paper_repro/full_slaclip_campaign.py"
 trainer="$repository/paper_repro/train_federated.py"
+exit_policy="$repository/hpc/full_slaclip_exit_policy.sh"
 runtime_manifest="$campaign_root/runtime-manifest.json"
 global_stop="$campaign_root/control/stop.request"
 lane_cpus="${SLURM_CPUS_PER_TASK:-0}"
@@ -43,7 +44,7 @@ if [[ ! "$lane_cpus" =~ ^[1-9][0-9]*$ || "$lane_cpus" -gt 12 ]]; then
     echo "ERROR: invalid per-lane CPU allocation: $lane_cpus" >&2
     exit 2
 fi
-if [[ ! -x "$python_bin" || ! -f "$coordinator" || ! -f "$trainer" ]]; then
+if [[ ! -x "$python_bin" || ! -f "$coordinator" || ! -f "$trainer" || ! -f "$exit_policy" ]]; then
     echo "ERROR: pinned runtime or repository entry point is missing" >&2
     exit 2
 fi
@@ -71,6 +72,8 @@ if [[ -z "$expected_gpu" || ! "$min_vram_gib" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: invalid CUDA device gate" >&2
     exit 2
 fi
+source "$exit_policy"
+full_slaclip_stop_generation=0
 
 export HF_HOME="$hf_home"
 export HF_HUB_OFFLINE=1
@@ -150,6 +153,7 @@ trap finalize_campaign EXIT
     --reason allocation_started
 
 request_stop() {
+    full_slaclip_stop_generation=$((full_slaclip_stop_generation + 1))
     mkdir -p "$(dirname "$global_stop")"
     touch "$global_stop"
     echo "checkpoint_stop_requested_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -204,13 +208,13 @@ if [[ "$parent_lanes" -eq 2 ]]; then
     smoke_pid_1=$!
 fi
 set +e
-wait "$smoke_pid_0"
+wait_for_full_slaclip_child "$smoke_pid_0"
 smoke_rc_0=$?
 if [[ "$smoke_rc_0" -ne 0 ]]; then
     request_stop
 fi
 if [[ "$parent_lanes" -eq 2 ]]; then
-    wait "$smoke_pid_1"
+    wait_for_full_slaclip_child "$smoke_pid_1"
     smoke_rc_1=$?
 fi
 set -e
@@ -247,13 +251,13 @@ if [[ "$parent_lanes" -eq 2 ]]; then
     model_smoke_pid_1=$!
 fi
 set +e
-wait "$model_smoke_pid_0"
+wait_for_full_slaclip_child "$model_smoke_pid_0"
 model_smoke_rc_0=$?
 if [[ "$model_smoke_rc_0" -ne 0 ]]; then
     request_stop
 fi
 if [[ "$parent_lanes" -eq 2 ]]; then
-    wait "$model_smoke_pid_1"
+    wait_for_full_slaclip_child "$model_smoke_pid_1"
     model_smoke_rc_1=$?
 elif [[ "$model_smoke_rc_0" -eq 0 ]]; then
     run_step "$python_bin" "$coordinator" run-smoke \
@@ -263,21 +267,28 @@ elif [[ "$model_smoke_rc_0" -eq 0 ]]; then
         --python-bin "$python_bin" \
         --private-key "$private_key" &
     model_smoke_pid_1=$!
-    wait "$model_smoke_pid_1"
+    wait_for_full_slaclip_child "$model_smoke_pid_1"
     model_smoke_rc_1=$?
 else
-    model_smoke_rc_1=125
+    model_smoke_rc_1=0
 fi
 set -e
 if [[ "$model_smoke_rc_0" -ne 0 || "$model_smoke_rc_1" -ne 0 ]]; then
     "$python_bin" "$coordinator" aggregate --manifest "$runtime_manifest" || true
     "$python_bin" "$coordinator" archive-small \
         --campaign-root "$campaign_root" --archive-root "$archive_root" || true
-    if [[ "$model_smoke_rc_0" -eq 75 || "$model_smoke_rc_1" -eq 75 ]]; then
+    model_smoke_classification="$(
+        classify_full_slaclip_exit_codes "$model_smoke_rc_0" "$model_smoke_rc_1"
+    )"
+    if [[ "$model_smoke_classification" == "HARD_FAILURE" ]]; then
+        echo "ERROR: paired real-model preflight failed: baseline=$model_smoke_rc_0 full_slaclip=$model_smoke_rc_1" >&2
+        exit 1
+    fi
+    if [[ "$model_smoke_classification" == "CHECKPOINTED_STOP" ]]; then
         echo "Real-model preflight stopped at a checkpoint boundary; resume the same run ID."
         exit 75
     fi
-    echo "ERROR: paired real-model preflight failed: baseline=$model_smoke_rc_0 full_slaclip=$model_smoke_rc_1" >&2
+    echo "ERROR: real-model preflight reached an unclassified failure state" >&2
     exit 1
 fi
 
@@ -310,12 +321,12 @@ if [[ "$parent_lanes" -eq 2 ]]; then
         arm_pid_1=$!
 
         set +e
-        wait "$arm_pid_0"
+        wait_for_full_slaclip_child "$arm_pid_0"
         arm_rc_0=$?
         if [[ "$arm_rc_0" -ne 0 ]]; then
             request_stop
         fi
-        wait "$arm_pid_1"
+        wait_for_full_slaclip_child "$arm_pid_1"
         arm_rc_1=$?
         set -e
 
@@ -323,13 +334,14 @@ if [[ "$parent_lanes" -eq 2 ]]; then
         "$python_bin" "$coordinator" archive-small \
             --campaign-root "$campaign_root" --archive-root "$archive_root"
 
-        if [[ "$arm_rc_0" -eq 75 || "$arm_rc_1" -eq 75 || -e "$global_stop" ]]; then
-            echo "Campaign stopped at a checkpoint boundary; resume the same run ID."
-            exit 75
-        fi
-        if [[ "$arm_rc_0" -ne 0 || "$arm_rc_1" -ne 0 ]]; then
+        arm_classification="$(classify_full_slaclip_exit_codes "$arm_rc_0" "$arm_rc_1")"
+        if [[ "$arm_classification" == "HARD_FAILURE" ]]; then
             echo "ERROR: campaign wave failed: lane0=$arm_rc_0 lane1=$arm_rc_1" >&2
             exit 1
+        fi
+        if [[ "$arm_classification" == "CHECKPOINTED_STOP" || -e "$global_stop" ]]; then
+            echo "Campaign stopped at a checkpoint boundary; resume the same run ID."
+            exit 75
         fi
     done < <("$python_bin" "$coordinator" waves --manifest "$runtime_manifest")
 else
@@ -344,24 +356,21 @@ else
                 --private-key "$private_key" &
             arm_pid=$!
             set +e
-            wait "$arm_pid"
+            wait_for_full_slaclip_child "$arm_pid"
             arm_rc=$?
             set -e
-            if [[ "$arm_rc" -ne 0 ]]; then
-                request_stop
-            fi
-
             "$python_bin" "$coordinator" aggregate --manifest "$runtime_manifest"
             "$python_bin" "$coordinator" archive-small \
                 --campaign-root "$campaign_root" --archive-root "$archive_root"
 
-            if [[ "$arm_rc" -eq 75 || -e "$global_stop" ]]; then
-                echo "Campaign stopped at a checkpoint boundary; resume the same run ID."
-                exit 75
-            fi
-            if [[ "$arm_rc" -ne 0 ]]; then
+            arm_classification="$(classify_full_slaclip_exit_codes "$arm_rc")"
+            if [[ "$arm_classification" == "HARD_FAILURE" ]]; then
                 echo "ERROR: sequential campaign arm failed: index=$arm_index rc=$arm_rc" >&2
                 exit 1
+            fi
+            if [[ "$arm_classification" == "CHECKPOINTED_STOP" || -e "$global_stop" ]]; then
+                echo "Campaign stopped at a checkpoint boundary; resume the same run ID."
+                exit 75
             fi
         done
     done < <("$python_bin" "$coordinator" waves --manifest "$runtime_manifest")

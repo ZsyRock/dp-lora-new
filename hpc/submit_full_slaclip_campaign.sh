@@ -115,6 +115,7 @@ if [[ ! -x "$python_bin" ]]; then
 fi
 
 worker="$snapshot_repo/hpc/full_slaclip_campaign.sbatch"
+exit_policy="$snapshot_repo/hpc/full_slaclip_exit_policy.sh"
 submit_snapshot="$snapshot_repo/hpc/submit_full_slaclip_campaign.sh"
 spec_relative="${DPLORA_FULL_SPEC_RELATIVE:-hpc/full-slaclip-campaign-spec.json}"
 if [[ "$spec_relative" = /* || "$spec_relative" == *".."* ]]; then
@@ -126,10 +127,10 @@ coordinator="$snapshot_repo/paper_repro/full_slaclip_campaign.py"
 trainer="$snapshot_repo/paper_repro/train_federated.py"
 stage_script="$snapshot_repo/scripts/stage_paper_inputs.sh"
 runtime_lock="$snapshot_repo/environment/paper-repro-runtime.lock"
-for required in "$worker" "$submit_snapshot" "$spec" "$coordinator" "$trainer" "$stage_script" "$runtime_lock"; do
+for required in "$worker" "$exit_policy" "$submit_snapshot" "$spec" "$coordinator" "$trainer" "$stage_script" "$runtime_lock"; do
     [[ -f "$required" ]] || { echo "ERROR: pinned snapshot is missing $required" >&2; exit 1; }
 done
-bash -n "$submit_snapshot" "$worker"
+bash -n "$submit_snapshot" "$worker" "$exit_policy"
 "$python_bin" - "$coordinator" <<'PY'
 import sys
 from pathlib import Path
@@ -205,6 +206,18 @@ private_key="$private_key_root/$run_id.key"
 if [[ "$resume" -eq 1 ]]; then
     [[ -d "$campaign_root" ]] || { echo "ERROR: resume campaign is missing: $campaign_root" >&2; exit 1; }
     [[ -f "$private_key" ]] || { echo "ERROR: persistent resume RNG key is missing: $private_key" >&2; exit 1; }
+    runtime_manifest="$campaign_root/runtime-manifest.json"
+    [[ -f "$runtime_manifest" ]] || { echo "ERROR: resume runtime manifest is missing: $runtime_manifest" >&2; exit 1; }
+    stale_status_args=(
+        recover-stale-job-status
+        --campaign-root "$campaign_root"
+        --runtime-manifest "$runtime_manifest"
+        --repository-sha "$expected_sha"
+    )
+    if [[ "$test_only" -eq 1 ]]; then
+        stale_status_args+=(--check-only)
+    fi
+    "$python_bin" "$coordinator" "${stale_status_args[@]}"
 else
     [[ ! -e "$campaign_root" ]] || { echo "ERROR: refusing to overwrite campaign: $campaign_root" >&2; exit 1; }
     [[ ! -e "$archive_root" ]] || { echo "ERROR: refusing to overwrite archive: $archive_root" >&2; exit 1; }
