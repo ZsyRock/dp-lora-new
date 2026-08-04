@@ -256,8 +256,8 @@ def test_k5_range_submitter_uses_two_l4_lanes_and_right_sized_resources() -> Non
         "DPLORA_FULL_SPEC_RELATIVE=hpc/full-slaclip-k5-baseline-range-spec.json"
         in submitter
     )
-    assert "DPLORA_FULL_GPU_GRES=gpu:l4swarm:2" in submitter
-    assert "DPLORA_FULL_PARTITION=scavenger_l4" in submitter
+    assert "DPLORA_FULL_GPU_GRES=gpu:l4:2" in submitter
+    assert "DPLORA_FULL_PARTITION=l4" in submitter
     assert "DPLORA_FULL_HOST_MEMORY=24G" in submitter
     assert "DPLORA_FULL_LANE_MEMORY=12G" in submitter
     assert "DPLORA_FULL_WALLTIME=01:00:00" in submitter
