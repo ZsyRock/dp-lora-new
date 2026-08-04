@@ -28,6 +28,7 @@ class MethodContractTests(unittest.TestCase):
                 "clip_only_control",
                 "paper_dp_lora",
                 "slaclip_dp_lora",
+                "oracle_slaclip_control",
             },
         )
         self.assertFalse(METHOD_SPECS["no_dp_lora_control"].clipping_enabled)
@@ -44,6 +45,12 @@ class MethodContractTests(unittest.TestCase):
             "cdf_endpoint",
             METHOD_SPECS["slaclip_dp_lora"].release_class,
         )
+        oracle = METHOD_SPECS["oracle_slaclip_control"]
+        self.assertTrue(oracle.clipping_enabled)
+        self.assertTrue(oracle.gaussian_noise_enabled)
+        self.assertTrue(oracle.is_control)
+        self.assertFalse(oracle.independently_accounted)
+        self.assertIn("non_private_exact_cdf", oracle.release_class)
 
 
 class PrivateKeyTests(unittest.TestCase):

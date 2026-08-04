@@ -37,6 +37,8 @@ from paper_repro.train_federated import (
     validate_private_directory,
     read_round_shards,
     save_final_adapter_atomically,
+    SLACLIP_PAIRED_SLACK_NOISE_SCOPE,
+    slaclip_slack_noise_method_scope,
     slaclip_round_controller_summary,
     validate_completed_root_summary,
 )
@@ -201,6 +203,54 @@ class PaperReproTests(unittest.TestCase):
         )
         self.assertTrue(any("K=5" in reason for reason in diagnostic["reasons"]))
         self.assertFalse(any("K=15" in reason for reason in diagnostic["reasons"]))
+        self.assertEqual(diagnostic["controller_input"], "noisy_endpoints")
+        oracle = illustrative_accounting_diagnostic(
+            client_partition_sizes=[10] * 5,
+            batch_size=8,
+            rounds=50,
+            noise_multiplier=2.0,
+            delta=1e-5,
+            contains_slaclip=True,
+            slaclip_num_slots=5,
+            controller_input="exact_endpoints",
+        )
+        self.assertEqual(oracle["controller_input"], "exact_endpoints")
+        self.assertTrue(any("explicitly NON-DP" in reason for reason in oracle["reasons"]))
+        self.assertFalse(
+            any("are not controller inputs" in reason for reason in oracle["reasons"])
+        )
+        self.assertEqual(
+            SLACLIP_PAIRED_SLACK_NOISE_SCOPE,
+            "slaclip_dp_lora",
+        )
+        self.assertEqual(
+            slaclip_slack_noise_method_scope(
+                "slaclip_dp_lora", pair_noise_across_methods=True
+            ),
+            "slaclip_dp_lora",
+        )
+        self.assertEqual(
+            slaclip_slack_noise_method_scope(
+                "slaclip_dp_lora", pair_noise_across_methods=False
+            ),
+            "slaclip_dp_lora",
+        )
+        self.assertEqual(
+            slaclip_slack_noise_method_scope(
+                "oracle_slaclip_control", pair_noise_across_methods=True
+            ),
+            "slaclip_dp_lora",
+        )
+        self.assertEqual(
+            slaclip_slack_noise_method_scope(
+                "oracle_slaclip_control", pair_noise_across_methods=False
+            ),
+            "oracle_slaclip_control",
+        )
+        with self.assertRaisesRegex(ValueError, "no SlaClip slack-noise domain"):
+            slaclip_slack_noise_method_scope(
+                "paper_dp_lora", pair_noise_across_methods=True
+            )
         with self.assertRaisesRegex(ValueError, "requires at least two slots"):
             illustrative_accounting_diagnostic(
                 client_partition_sizes=[10] * 5,
@@ -634,6 +684,63 @@ class PaperReproTests(unittest.TestCase):
                 controller["next_clip_threshold"], expected_next
             )
 
+        oracle = slaclip_round_controller_summary(
+            records,
+            clip_thresholds={"A": 2.0, "B": 1.0},
+            num_slots=2,
+            eta=0.2,
+            controller_input="exact_endpoints",
+            beta=0.5,
+            c_min=0.1,
+            c_max=50.0,
+        )
+        self.assertEqual(oracle["controller_input"], "exact_endpoints")
+        self.assertTrue(oracle["controller_input_is_non_dp_exact"])
+        for group, threshold in (("A", 2.0), ("B", 1.0)):
+            controller = oracle[group]
+            exact_cdf = controller["exact_cdf_proxy_by_slot"]
+            self.assertEqual(controller["controller_input"], "exact_endpoints")
+            self.assertTrue(controller["controller_input_is_non_dp_exact"])
+            self.assertAlmostEqual(
+                controller["near_threshold_proxy"], exact_cdf[0]
+            )
+            self.assertAlmostEqual(controller["near_zero_proxy"], exact_cdf[-1])
+            expected_gamma = max(
+                0.0,
+                min(
+                    1.0,
+                    1.0
+                    - 0.5
+                    * (1.0 - exact_cdf[-1] / (threshold + controller["epsilon"])),
+                ),
+            )
+            expected_next = threshold * np.exp(
+                0.2 * (expected_gamma - exact_cdf[0])
+            )
+            self.assertAlmostEqual(
+                controller["next_clip_threshold"], expected_next
+            )
+            self.assertAlmostEqual(
+                controller["next_clip_threshold"],
+                controller["oracle_next_clip_threshold"],
+            )
+            self.assertNotAlmostEqual(
+                controller["next_clip_threshold"],
+                controller["noisy_next_clip_threshold"],
+            )
+
+        with self.assertRaisesRegex(ValueError, "unsupported controller input"):
+            slaclip_round_controller_summary(
+                records,
+                clip_thresholds={"A": 2.0, "B": 1.0},
+                num_slots=2,
+                eta=0.2,
+                controller_input="unlabelled",
+                beta=0.5,
+                c_min=0.1,
+                c_max=50.0,
+            )
+
     def test_recorded_signal_and_noise_reconstruct_fedavg_update(self) -> None:
         model = TinyLoRA()
         groups = parameter_groups(model)
@@ -715,6 +822,7 @@ class PaperReproTests(unittest.TestCase):
         contract = {
             "schema_version": "full_slaclip_contract_v1",
             "variant": "full_slaclip_cdf_endpoints",
+            "controller_input": "noisy_endpoints",
             "controller": {
                 "eta": 0.2,
                 "beta": 0.5,
@@ -725,6 +833,7 @@ class PaperReproTests(unittest.TestCase):
         }
         state["slaclip_controller_state"] = {
             "controller_contract_sha256": canonical_json_fingerprint(contract),
+            "controller_input": "noisy_endpoints",
             "updates_completed": 2,
             "next_clip_threshold_by_group": {"A": 11.0, "B": 12.0},
         }
@@ -755,6 +864,61 @@ class PaperReproTests(unittest.TestCase):
                 clients=[np.array([0]), np.array([1])],
                 slaclip_contract=contract,
             )
+        wrong_input = copy.deepcopy(state)
+        wrong_input["slaclip_controller_state"]["controller_input"] = (
+            "exact_endpoints"
+        )
+        with self.assertRaisesRegex(RuntimeError, "controller_input"):
+            validate_checkpoint_trainer_state(
+                wrong_input,
+                completed_round=2,
+                model_kind="bert",
+                config=config,
+                run_config_fingerprint="run-fingerprint",
+                private_key_commitment="key-commitment",
+                rng_domain="rng-domain",
+                clients=[np.array([0]), np.array([1])],
+                slaclip_contract=contract,
+            )
+
+    def test_checkpoint_accepts_explicit_exact_endpoint_oracle_control(self) -> None:
+        config = replace(paper_config(rounds=2), method="oracle_slaclip_control")
+        state = valid_checkpoint_state(config, completed_round=2)
+        state["last_round_summary"]["slaclip_controller"] = {
+            "A": {"next_clip_threshold": 4.0},
+            "B": {"next_clip_threshold": 5.0},
+        }
+        contract = {
+            "schema_version": "full_slaclip_contract_v1",
+            "variant": "full_slaclip_cdf_endpoints",
+            "controller_input": "exact_endpoints",
+            "non_private_oracle_control": True,
+            "controller": {
+                "controller_input": "exact_endpoints",
+                "eta": 0.05,
+                "beta": 0.76,
+                "num_slots": 5,
+                "c_min": 0.1,
+                "c_max": 50.0,
+            },
+        }
+        state["slaclip_controller_state"] = {
+            "controller_contract_sha256": canonical_json_fingerprint(contract),
+            "controller_input": "exact_endpoints",
+            "updates_completed": 2,
+            "next_clip_threshold_by_group": {"A": 4.0, "B": 5.0},
+        }
+        validate_checkpoint_trainer_state(
+            state,
+            completed_round=2,
+            model_kind="bert",
+            config=config,
+            run_config_fingerprint="run-fingerprint",
+            private_key_commitment="key-commitment",
+            rng_domain="rng-domain",
+            clients=[np.array([0]), np.array([1])],
+            slaclip_contract=contract,
+        )
 
     def test_checkpoint_rejects_wrong_evaluation_round_sequence(self) -> None:
         config = paper_config()

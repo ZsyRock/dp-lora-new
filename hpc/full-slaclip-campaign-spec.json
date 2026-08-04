@@ -132,6 +132,13 @@
       "clip_only_control"
     ]
   },
+  "oracle_controls": {
+    "initial_clip_norm": 10.0,
+    "seeds": [],
+    "etas": [],
+    "betas": [],
+    "method": "oracle_slaclip_control"
+  },
   "scientific_boundary": {
     "claim_level": 1,
     "paper_result_reproduced": false,

@@ -39,9 +39,43 @@ RUNTIME_MANIFEST_NAME = "runtime-manifest.json"
 JOB_STATUS_NAME = "job-status.json"
 CAMPAIGN_KEY_BYTES = 32
 FULL_SLACLIP_METHOD = "slaclip_dp_lora"
+ORACLE_SLACLIP_METHOD = "oracle_slaclip_control"
 FIXED_DP_METHOD = "paper_dp_lora"
 CONTROL_METHODS = ("no_dp_lora_control", "clip_only_control")
-ALLOWED_METHODS = {FULL_SLACLIP_METHOD, FIXED_DP_METHOD, *CONTROL_METHODS}
+ADAPTIVE_METHODS = frozenset({FULL_SLACLIP_METHOD, ORACLE_SLACLIP_METHOD})
+NOISY_CONTROLLER_INPUT = "noisy_endpoints"
+EXACT_CONTROLLER_INPUT = "exact_endpoints"
+CONTROLLER_INPUT_BY_METHOD = {
+    FULL_SLACLIP_METHOD: NOISY_CONTROLLER_INPUT,
+    ORACLE_SLACLIP_METHOD: EXACT_CONTROLLER_INPUT,
+}
+ORACLE_NOISY_MATCH_FIELDS = (
+    "seed",
+    "reference_arm_id",
+    "rng_domain",
+    "models",
+    "num_clients",
+    "rounds",
+    "batch_size",
+    "noise_multiplier",
+    "learning_rate",
+    "initial_clip_norm",
+    "rank",
+    "max_seq_length",
+    "max_validation_records",
+    "eval_every",
+    "checkpoint_every",
+    "data_split_seed",
+    "evaluation_seed",
+    "delta",
+    "slaclip_num_slots",
+    "slaclip_c_min",
+    "slaclip_c_max",
+    "slaclip_eta",
+    "slaclip_base_target_clipped_fraction",
+    "slaclip_beta",
+)
+ALLOWED_METHODS = {*ADAPTIVE_METHODS, FIXED_DP_METHOD, *CONTROL_METHODS}
 EXPECTED_MODELS = ("bert", "gpt2")
 SMALL_ARCHIVE_MAX_BYTES = 32 * 1024 * 1024
 FULL_COMPARISON_STATUS = "FULL_SLACLIP_COMPARISON_COMPLETE"
@@ -258,6 +292,7 @@ def load_spec(path: Path) -> dict[str, Any]:
             "noise_sensitivity",
             "client_sensitivity",
             "controls",
+            "oracle_controls",
             "scientific_boundary",
         },
         "campaign specification",
@@ -289,7 +324,7 @@ def _base_arm(
 ) -> dict[str, Any]:
     if method not in ALLOWED_METHODS:
         raise ValueError(f"unsupported method: {method}")
-    adaptive = method == FULL_SLACLIP_METHOD
+    adaptive = method in ADAPTIVE_METHODS
     if adaptive != (eta is not None and beta is not None):
         raise ValueError("adaptive controller parameters and method disagree")
     if family == "primary":
@@ -304,6 +339,8 @@ def _base_arm(
         analysis_role = "pre_registered_cdf_record_count_sensitivity"
     elif family == "control":
         analysis_role = "mechanism_control"
+    elif family == "oracle_control":
+        analysis_role = "non_dp_exact_endpoint_oracle_controller_diagnostic"
     else:
         raise ValueError(f"unsupported arm family: {family}")
     return {
@@ -321,6 +358,7 @@ def _base_arm(
         # Retain the mathematical name in manifests for backwards-compatible
         # analysis of snapshots created before the semantic CLI was added.
         "slaclip_beta": beta,
+        "controller_input": CONTROLLER_INPUT_BY_METHOD.get(method),
         "reference_arm_id": reference_arm_id,
         # Common random numbers isolate method/C/noise effects within a seed.
         "rng_domain": f"full-slaclip-cdf:s{seed}",
@@ -358,6 +396,7 @@ def expand_spec(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
     noise_sensitivity = spec.get("noise_sensitivity")
     client_sensitivity = spec.get("client_sensitivity")
     controls = spec.get("controls")
+    oracle_controls = spec.get("oracle_controls")
     named_sections = {
         "primary": primary,
         "threshold_robustness": threshold_robustness,
@@ -365,6 +404,7 @@ def expand_spec(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
         "noise_sensitivity": noise_sensitivity,
         "client_sensitivity": client_sensitivity,
         "controls": controls,
+        "oracle_controls": oracle_controls,
     }
     if any(not isinstance(value, dict) for value in named_sections.values()):
         raise ValueError("all campaign matrix sections must be objects")
@@ -374,6 +414,7 @@ def expand_spec(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
     assert isinstance(noise_sensitivity, dict)
     assert isinstance(client_sensitivity, dict)
     assert isinstance(controls, dict)
+    assert isinstance(oracle_controls, dict)
     require_exact_keys(primary, {"initial_clip_norms", "seeds", "methods"}, "primary")
     require_exact_keys(
         threshold_robustness,
@@ -396,6 +437,11 @@ def expand_spec(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
         "client_sensitivity",
     )
     require_exact_keys(controls, {"initial_clip_norm", "seeds", "methods"}, "controls")
+    require_exact_keys(
+        oracle_controls,
+        {"initial_clip_norm", "seeds", "etas", "betas", "method"},
+        "oracle_controls",
+    )
 
     primary_clip_norms = primary["initial_clip_norms"]
     primary_seeds = primary["seeds"]
@@ -686,6 +732,65 @@ def expand_spec(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
                 )
             )
 
+    oracle_clip = require_number(
+        oracle_controls["initial_clip_norm"],
+        "oracle_controls.initial_clip_norm",
+        positive=True,
+    )
+    oracle_seeds = oracle_controls["seeds"]
+    oracle_etas = oracle_controls["etas"]
+    oracle_betas = oracle_controls["betas"]
+    if (
+        not isinstance(oracle_seeds, list)
+        or not isinstance(oracle_etas, list)
+        or not isinstance(oracle_betas, list)
+    ):
+        raise ValueError("oracle-control axes must be arrays")
+    oracle_seeds = [
+        require_int(value, "oracle_controls.seed", positive=False)
+        for value in oracle_seeds
+    ]
+    oracle_etas = [
+        require_number(value, "oracle_controls.eta") for value in oracle_etas
+    ]
+    oracle_betas = [
+        require_number(value, "oracle_controls.beta") for value in oracle_betas
+    ]
+    if any(value < 0 for value in oracle_etas):
+        raise ValueError("oracle-control eta must be non-negative")
+    if any(value < 0 or value > 1 for value in oracle_betas):
+        raise ValueError("oracle-control beta must lie in [0, 1]")
+    _unique(oracle_seeds, "oracle_controls.seeds")
+    _unique(oracle_etas, "oracle_controls.etas")
+    _unique(oracle_betas, "oracle_controls.betas")
+    if oracle_controls["method"] != ORACLE_SLACLIP_METHOD:
+        raise ValueError("oracle_controls must use oracle_slaclip_control")
+    if oracle_clip not in primary_clip_norms or not set(oracle_seeds).issubset(
+        primary_seeds
+    ):
+        raise ValueError("oracle controls require matching primary fixed baselines")
+    oracle_token = number_token(oracle_clip)
+    for seed in oracle_seeds:
+        reference_id = f"primary-c{oracle_token}-s{seed}-fixed"
+        for eta in oracle_etas:
+            for beta in oracle_betas:
+                arms.append(
+                    _base_arm(
+                        common=common,
+                        arm_id=(
+                            f"oracle-c{oracle_token}-s{seed}-"
+                            f"e{number_token(eta)}-b{number_token(beta)}"
+                        ),
+                        family="oracle_control",
+                        method=ORACLE_SLACLIP_METHOD,
+                        seed=seed,
+                        clip_norm=oracle_clip,
+                        eta=eta,
+                        beta=beta,
+                        reference_arm_id=reference_id,
+                    )
+                )
+
     expected = require_int(spec["expected_arm_count"], "expected_arm_count")
     ids = [arm["arm_id"] for arm in arms]
     if len(arms) != expected or len(ids) != len(set(ids)):
@@ -855,6 +960,64 @@ def load_runtime(path: Path) -> dict[str, Any]:
     value = load_object(path, "runtime campaign manifest")
     validate_runtime_manifest(value)
     return value
+
+
+def _oracle_noisy_match_key(arm: Mapping[str, Any]) -> bytes:
+    missing = [name for name in ORACLE_NOISY_MATCH_FIELDS if name not in arm]
+    if missing:
+        raise RuntimeError(
+            f"oracle/noisy arm is missing match fields: "
+            f"{arm.get('arm_id', '<unknown>')} {missing}"
+        )
+    return canonical_bytes(
+        {name: arm[name] for name in ORACLE_NOISY_MATCH_FIELDS}
+    )
+
+
+def resolve_oracle_noisy_arm_pairs(
+    runtime: Mapping[str, Any],
+) -> list[tuple[Mapping[str, Any], Mapping[str, Any]]]:
+    """Resolve exact-CDF oracle arms to unique noisy-CDF full-SlaClip arms.
+
+    The method and controller input intentionally differ.  Every scientific
+    and randomization setting that can otherwise affect the trajectory must
+    be identical.  Missing or ambiguous manifest counterparts are rejected
+    before any completed metrics are interpreted.
+    """
+
+    raw_arms = runtime.get("arms")
+    if not isinstance(raw_arms, list) or any(
+        not isinstance(arm, dict) for arm in raw_arms
+    ):
+        raise RuntimeError("runtime manifest arms are invalid")
+    arms = list(raw_arms)
+    noisy_by_key: dict[bytes, list[Mapping[str, Any]]] = {}
+    for arm in arms:
+        if arm["method"] != FULL_SLACLIP_METHOD:
+            continue
+        if arm.get("controller_input") != NOISY_CONTROLLER_INPUT:
+            raise RuntimeError(
+                f"full SlaClip arm has invalid controller input: {arm['arm_id']}"
+            )
+        noisy_by_key.setdefault(_oracle_noisy_match_key(arm), []).append(arm)
+
+    pairs: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
+    for oracle in arms:
+        if oracle["method"] != ORACLE_SLACLIP_METHOD:
+            continue
+        if oracle.get("controller_input") != EXACT_CONTROLLER_INPUT:
+            raise RuntimeError(
+                f"oracle SlaClip arm has invalid controller input: {oracle['arm_id']}"
+            )
+        matches = noisy_by_key.get(_oracle_noisy_match_key(oracle), [])
+        if len(matches) != 1:
+            raise RuntimeError(
+                "oracle/noisy manifest match must be unique: "
+                f"oracle={oracle['arm_id']} matched_noisy_arms="
+                f"{[arm['arm_id'] for arm in matches]}"
+            )
+        pairs.append((oracle, matches[0]))
+    return pairs
 
 
 def mark_job_status(args: argparse.Namespace) -> None:
@@ -1195,7 +1358,7 @@ def _arm_command(
         str(stop_file),
         "--acknowledge-non-dp-diagnostics",
     ]
-    if arm["method"] == FULL_SLACLIP_METHOD:
+    if arm["method"] in ADAPTIVE_METHODS:
         command.extend(
             [
                 "--slaclip-eta",
@@ -1420,12 +1583,23 @@ def run_preflight_smoke(args: argparse.Namespace) -> int:
     repository = args.repository.resolve()
     if repository_sha(repository) != runtime["repository_sha"] or repository_dirty(repository):
         raise RuntimeError("repository snapshot changed before real-model smoke")
-    desired_method = FIXED_DP_METHOD if args.lane == 0 else FULL_SLACLIP_METHOD
+    desired_method = (
+        args.method
+        if args.method is not None
+        else FIXED_DP_METHOD
+        if args.lane == 0
+        else FULL_SLACLIP_METHOD
+    )
+    template_method = (
+        FULL_SLACLIP_METHOD
+        if desired_method == ORACLE_SLACLIP_METHOD
+        else desired_method
+    )
     candidates = [
         arm
         for arm in runtime["arms"]
         if arm["family"] == "primary"
-        and arm["method"] == desired_method
+        and arm["method"] == template_method
         and arm["initial_clip_norm"] == 10.0
     ]
     if not candidates:
@@ -1435,7 +1609,18 @@ def run_preflight_smoke(args: argparse.Namespace) -> int:
     if len(selected) != 1:
         raise RuntimeError("paper-style smoke template is not unique at the first seed")
     arm = dict(selected[0])
-    label = "paper-baseline" if args.lane == 0 else "full-slaclip"
+    labels = {
+        FIXED_DP_METHOD: "paper-baseline",
+        FULL_SLACLIP_METHOD: "full-slaclip",
+        ORACLE_SLACLIP_METHOD: "oracle-slaclip-control",
+    }
+    label = labels[desired_method]
+    if desired_method == ORACLE_SLACLIP_METHOD:
+        arm["method"] = ORACLE_SLACLIP_METHOD
+        arm["analysis_role"] = (
+            "non_dp_exact_endpoint_oracle_controller_diagnostic"
+        )
+        arm["controller_input"] = EXACT_CONTROLLER_INPUT
     arm["arm_id"] = f"preflight-{label}"
     arm["rng_domain"] = "full-slaclip-cdf:preflight:c10"
     campaign_root = manifest_path.parent
@@ -1622,10 +1807,15 @@ def _model_metrics(
         "family": arm["family"],
         "analysis_role": arm["analysis_role"],
         "method": arm["method"],
+        "controller_input": arm["controller_input"],
         "seed": arm["seed"],
         "num_clients": arm["num_clients"],
         "noise_multiplier": arm["noise_multiplier"],
+        "effective_gradient_noise_multiplier": (
+            0.0 if arm["method"] in CONTROL_METHODS else arm["noise_multiplier"]
+        ),
         "initial_clip_norm": arm["initial_clip_norm"],
+        "slaclip_num_slots": arm["slaclip_num_slots"],
         "slaclip_eta": arm["slaclip_eta"],
         "slaclip_base_target_clipped_fraction": arm[
             "slaclip_base_target_clipped_fraction"
@@ -1647,12 +1837,16 @@ def _model_metrics(
         "actual_clipped_fraction": any_group.get("fraction"),
         "would_clip_fraction": any_group.get("would_fraction"),
         "elapsed_seconds": summary.get("elapsed_seconds"),
+        "sample_schedule_sha256": behavior.get("sample_schedule_sha256"),
+        "supervision_schedule_sha256": behavior.get(
+            "supervision_schedule_sha256"
+        ),
         "cdf_endpoint_noise_std_theoretical": (
             float(
                 arm["noise_multiplier"]
                 * math.sqrt(arm["slaclip_num_slots"] / arm["num_clients"])
             )
-            if arm["method"] == FULL_SLACLIP_METHOD
+            if arm["method"] in ADAPTIVE_METHODS
             else None
         ),
     }
@@ -1752,10 +1946,13 @@ BASE_METRIC_COLUMNS = (
     "family",
     "analysis_role",
     "method",
+    "controller_input",
     "seed",
     "num_clients",
     "noise_multiplier",
+    "effective_gradient_noise_multiplier",
     "initial_clip_norm",
+    "slaclip_num_slots",
     "slaclip_eta",
     "slaclip_base_target_clipped_fraction",
     "slaclip_beta",
@@ -1771,6 +1968,8 @@ BASE_METRIC_COLUMNS = (
     "actual_clipped_fraction",
     "would_clip_fraction",
     "elapsed_seconds",
+    "sample_schedule_sha256",
+    "supervision_schedule_sha256",
     "cdf_endpoint_noise_std_theoretical",
 )
 
@@ -2263,6 +2462,7 @@ def ensure_full_comparisons(
 def aggregate_campaign(args: argparse.Namespace) -> bool:
     manifest_path = args.manifest.resolve()
     runtime = load_runtime(manifest_path)
+    oracle_noisy_arm_pairs = resolve_oracle_noisy_arm_pairs(runtime)
     root = manifest_path.parent
     rows: list[dict[str, Any]] = []
     statuses: dict[str, str] = {}
@@ -2303,14 +2503,14 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
                 "raw_gradient_l2_median_A",
                 "raw_gradient_l2_median_B",
             ]
-            if row["method"] in {FIXED_DP_METHOD, FULL_SLACLIP_METHOD}:
+            if row["method"] in {FIXED_DP_METHOD, *ADAPTIVE_METHODS}:
                 required_metrics.extend(
                     (
                         "aggregate_signal_to_noise_l2_ratio_median_A",
                         "aggregate_signal_to_noise_l2_ratio_median_B",
                     )
                 )
-            if row["method"] == FULL_SLACLIP_METHOD:
+            if row["method"] in ADAPTIVE_METHODS:
                 required_metrics.extend(
                     f"{name}_{group}"
                     for group in ("A", "B")
@@ -2319,6 +2519,9 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
                         "cdf_error_rmse_median",
                         "oracle_next_threshold_median",
                         "actual_target_absolute_error_median",
+                        "actual_clipped_fraction",
+                        "retained_energy_fraction_median",
+                        "final_threshold",
                         "log_threshold_total_variation",
                         "oracle_direction_agreement_fraction",
                     )
@@ -2357,10 +2560,16 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
                 "arm_id": row["arm_id"],
                 "reference_arm_id": reference_id,
                 "family": row["family"],
+                "method": row["method"],
+                "controller_input": row["controller_input"],
                 "seed": row["seed"],
                 "num_clients": row["num_clients"],
                 "noise_multiplier": row["noise_multiplier"],
+                "effective_gradient_noise_multiplier": row[
+                    "effective_gradient_noise_multiplier"
+                ],
                 "initial_clip_norm": row["initial_clip_norm"],
+                "slaclip_num_slots": row["slaclip_num_slots"],
                 "slaclip_eta": row["slaclip_eta"],
                 "slaclip_beta": row["slaclip_beta"],
                 "model": row["model"],
@@ -2428,12 +2637,207 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
             }
         )
 
+    diagnostic_paired_rows: list[dict[str, Any]] = []
+    diagnostic_methods = {ORACLE_SLACLIP_METHOD, *CONTROL_METHODS}
+    for row in rows:
+        reference_id = row["reference_arm_id"]
+        if row["method"] not in diagnostic_methods or not isinstance(
+            reference_id, str
+        ):
+            continue
+        reference = rows_by_arm_model.get((reference_id, row["model"]))
+        if reference is None:
+            continue
+
+        def difference(metric: str) -> float | None:
+            candidate = row.get(metric)
+            fixed = reference.get(metric)
+            if (
+                isinstance(candidate, (int, float))
+                and not isinstance(candidate, bool)
+                and isinstance(fixed, (int, float))
+                and not isinstance(fixed, bool)
+            ):
+                return float(candidate) - float(fixed)
+            return None
+
+        diagnostic_paired_rows.append(
+            {
+                "arm_id": row["arm_id"],
+                "reference_arm_id": reference_id,
+                "family": row["family"],
+                "analysis_role": row["analysis_role"],
+                "comparison_role": (
+                    "NON_DP_EXACT_ENDPOINT_ORACLE_DIAGNOSTIC"
+                    if row["method"] == ORACLE_SLACLIP_METHOD
+                    else "NON_DP_MECHANISM_CONTROL_EXPLORATORY"
+                ),
+                "method": row["method"],
+                "controller_input": row["controller_input"],
+                "seed": row["seed"],
+                "num_clients": row["num_clients"],
+                "noise_multiplier": row["noise_multiplier"],
+                "effective_gradient_noise_multiplier": row[
+                    "effective_gradient_noise_multiplier"
+                ],
+                "initial_clip_norm": row["initial_clip_norm"],
+                "slaclip_num_slots": row["slaclip_num_slots"],
+                "slaclip_eta": row["slaclip_eta"],
+                "slaclip_beta": row["slaclip_beta"],
+                "model": row["model"],
+                "candidate_final_loss": row["final_loss"],
+                "fixed_final_loss": reference["final_loss"],
+                "final_loss_difference_candidate_minus_fixed": difference(
+                    "final_loss"
+                ),
+                "candidate_best_loss": row["best_loss"],
+                "fixed_best_loss": reference["best_loss"],
+                "best_loss_difference_candidate_minus_fixed": difference(
+                    "best_loss"
+                ),
+                "candidate_normalized_loss_auc": row["normalized_loss_auc"],
+                "fixed_normalized_loss_auc": reference["normalized_loss_auc"],
+                "normalized_loss_auc_difference_candidate_minus_fixed": difference(
+                    "normalized_loss_auc"
+                ),
+                "candidate_final_minus_best": row["final_minus_best"],
+                "fixed_final_minus_best": reference["final_minus_best"],
+                "final_minus_best_difference_candidate_minus_fixed": difference(
+                    "final_minus_best"
+                ),
+                "candidate_actual_clipped_fraction": row[
+                    "actual_clipped_fraction"
+                ],
+                "fixed_actual_clipped_fraction": reference[
+                    "actual_clipped_fraction"
+                ],
+                "actual_clipped_fraction_difference_candidate_minus_fixed": difference(
+                    "actual_clipped_fraction"
+                ),
+                "candidate_elapsed_seconds": row["elapsed_seconds"],
+                "fixed_elapsed_seconds": reference["elapsed_seconds"],
+                "elapsed_seconds_difference_candidate_minus_fixed": difference(
+                    "elapsed_seconds"
+                ),
+            }
+        )
+
+    oracle_vs_noisy_paired_rows: list[dict[str, Any]] = []
+    oracle_vs_noisy_overall_metrics = (
+        "final_loss",
+        "best_loss",
+        "normalized_loss_auc",
+        "final_minus_best",
+        "actual_clipped_fraction",
+        "elapsed_seconds",
+    )
+    oracle_vs_noisy_group_metrics = (
+        "final_threshold",
+        "log_threshold_total_variation",
+        "actual_clipped_fraction",
+        "retained_energy_fraction_median",
+        "aggregate_signal_to_noise_l2_ratio_median",
+    )
+
+    def oracle_minus_noisy(
+        candidate: Mapping[str, Any],
+        noisy: Mapping[str, Any],
+        metric: str,
+    ) -> float | None:
+        candidate_value = candidate.get(metric)
+        noisy_value = noisy.get(metric)
+        if (
+            isinstance(candidate_value, (int, float))
+            and not isinstance(candidate_value, bool)
+            and math.isfinite(float(candidate_value))
+            and isinstance(noisy_value, (int, float))
+            and not isinstance(noisy_value, bool)
+            and math.isfinite(float(noisy_value))
+        ):
+            return float(candidate_value) - float(noisy_value)
+        return None
+
+    for oracle_arm, noisy_arm in oracle_noisy_arm_pairs:
+        for model in EXPECTED_MODELS:
+            candidate = rows_by_arm_model.get((oracle_arm["arm_id"], model))
+            noisy = rows_by_arm_model.get((noisy_arm["arm_id"], model))
+            if candidate is None or noisy is None:
+                continue
+            for digest_name in (
+                "sample_schedule_sha256",
+                "supervision_schedule_sha256",
+            ):
+                candidate_digest = candidate.get(digest_name)
+                noisy_digest = noisy.get(digest_name)
+                if (
+                    not isinstance(candidate_digest, str)
+                    or len(candidate_digest) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in candidate_digest
+                    )
+                    or candidate_digest != noisy_digest
+                ):
+                    raise RuntimeError(
+                        "oracle/noisy completed pair has mismatched schedule evidence: "
+                        f"{oracle_arm['arm_id']}/{noisy_arm['arm_id']}/{model}/"
+                        f"{digest_name}"
+                    )
+            output: dict[str, Any] = {
+                "oracle_arm_id": oracle_arm["arm_id"],
+                "noisy_arm_id": noisy_arm["arm_id"],
+                "oracle_family": oracle_arm["family"],
+                "noisy_family": noisy_arm["family"],
+                "comparison_role": (
+                    "NON_DP_ORACLE_VS_NOISY_CDF_CONTROLLER_DIAGNOSTIC"
+                ),
+                "candidate_method": candidate["method"],
+                "noisy_method": noisy["method"],
+                "candidate_controller_input": candidate["controller_input"],
+                "noisy_controller_input": noisy["controller_input"],
+                "seed": candidate["seed"],
+                "num_clients": candidate["num_clients"],
+                "noise_multiplier": candidate["noise_multiplier"],
+                "effective_gradient_noise_multiplier": candidate[
+                    "effective_gradient_noise_multiplier"
+                ],
+                "initial_clip_norm": candidate["initial_clip_norm"],
+                "slaclip_num_slots": candidate["slaclip_num_slots"],
+                "slaclip_eta": candidate["slaclip_eta"],
+                "slaclip_beta": candidate["slaclip_beta"],
+                "model": model,
+                "sample_schedule_sha256": candidate["sample_schedule_sha256"],
+                "supervision_schedule_sha256": candidate[
+                    "supervision_schedule_sha256"
+                ],
+            }
+            for metric in oracle_vs_noisy_overall_metrics:
+                output[f"candidate_{metric}"] = candidate.get(metric)
+                output[f"noisy_{metric}"] = noisy.get(metric)
+                output[f"{metric}_difference_candidate_minus_noisy"] = (
+                    oracle_minus_noisy(candidate, noisy, metric)
+                )
+            for group_name in ("A", "B"):
+                for metric in oracle_vs_noisy_group_metrics:
+                    grouped_metric = f"{metric}_{group_name}"
+                    output[f"candidate_{grouped_metric}"] = candidate.get(
+                        grouped_metric
+                    )
+                    output[f"noisy_{grouped_metric}"] = noisy.get(grouped_metric)
+                    output[
+                        f"{grouped_metric}_difference_candidate_minus_noisy"
+                    ] = oracle_minus_noisy(candidate, noisy, grouped_metric)
+            oracle_vs_noisy_paired_rows.append(output)
+
     group_keys = (
         "family",
         "method",
+        "controller_input",
         "num_clients",
         "noise_multiplier",
+        "effective_gradient_noise_multiplier",
         "initial_clip_norm",
+        "slaclip_num_slots",
         "slaclip_eta",
         "slaclip_beta",
         "model",
@@ -2458,9 +2862,13 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
 
     paired_group_keys = (
         "family",
+        "method",
+        "controller_input",
         "num_clients",
         "noise_multiplier",
+        "effective_gradient_noise_multiplier",
         "initial_clip_norm",
+        "slaclip_num_slots",
         "slaclip_eta",
         "slaclip_beta",
         "model",
@@ -2514,14 +2922,166 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
             "final_loss_difference_slaclip_minus_fixed_holm_p"
         ] = running_adjusted
 
+    diagnostic_group_keys = (
+        "family",
+        "analysis_role",
+        "comparison_role",
+        "method",
+        "controller_input",
+        "num_clients",
+        "noise_multiplier",
+        "effective_gradient_noise_multiplier",
+        "initial_clip_norm",
+        "slaclip_num_slots",
+        "slaclip_eta",
+        "slaclip_beta",
+        "model",
+    )
+    diagnostic_difference_metrics = (
+        "final_loss_difference_candidate_minus_fixed",
+        "best_loss_difference_candidate_minus_fixed",
+        "normalized_loss_auc_difference_candidate_minus_fixed",
+        "final_minus_best_difference_candidate_minus_fixed",
+        "actual_clipped_fraction_difference_candidate_minus_fixed",
+        "elapsed_seconds_difference_candidate_minus_fixed",
+    )
+    diagnostic_grouped: dict[tuple[Any, ...], list[Mapping[str, Any]]] = {}
+    for row in diagnostic_paired_rows:
+        diagnostic_grouped.setdefault(
+            tuple(row[key] for key in diagnostic_group_keys), []
+        ).append(row)
+    diagnostic_paired_aggregate_rows: list[dict[str, Any]] = []
+    for key, group_rows in sorted(
+        diagnostic_grouped.items(),
+        key=lambda item: tuple(str(value) for value in item[0]),
+    ):
+        output = dict(zip(diagnostic_group_keys, key))
+        output["seed_count"] = len({row["seed"] for row in group_rows})
+        for metric in diagnostic_difference_metrics:
+            values = _finite_values(group_rows, metric)
+            output[f"{metric}_n"] = len(values)
+            output[f"{metric}_mean"] = (
+                statistics.fmean(values) if values else None
+            )
+            output[f"{metric}_median"] = (
+                statistics.median(values) if values else None
+            )
+            output[f"{metric}_sample_std"] = (
+                statistics.stdev(values) if len(values) > 1 else None
+            )
+            output[f"{metric}_negative_fraction"] = (
+                sum(value < 0.0 for value in values) / len(values)
+                if values
+                else None
+            )
+        diagnostic_paired_aggregate_rows.append(output)
+
+    oracle_vs_noisy_group_keys = (
+        "num_clients",
+        "noise_multiplier",
+        "effective_gradient_noise_multiplier",
+        "initial_clip_norm",
+        "slaclip_num_slots",
+        "slaclip_eta",
+        "slaclip_beta",
+        "model",
+    )
+    oracle_vs_noisy_difference_metrics = tuple(
+        f"{metric}_difference_candidate_minus_noisy"
+        for metric in oracle_vs_noisy_overall_metrics
+    ) + tuple(
+        f"{metric}_{group_name}_difference_candidate_minus_noisy"
+        for group_name in ("A", "B")
+        for metric in oracle_vs_noisy_group_metrics
+    )
+    oracle_vs_noisy_grouped: dict[
+        tuple[Any, ...], list[Mapping[str, Any]]
+    ] = {}
+    for row in oracle_vs_noisy_paired_rows:
+        oracle_vs_noisy_grouped.setdefault(
+            tuple(row[key] for key in oracle_vs_noisy_group_keys), []
+        ).append(row)
+    oracle_vs_noisy_paired_aggregate_rows: list[dict[str, Any]] = []
+    for key, group_rows in sorted(
+        oracle_vs_noisy_grouped.items(),
+        key=lambda item: tuple(str(value) for value in item[0]),
+    ):
+        output = dict(zip(oracle_vs_noisy_group_keys, key))
+        output["seed_count"] = len({row["seed"] for row in group_rows})
+        for metric in oracle_vs_noisy_difference_metrics:
+            values = _finite_values(group_rows, metric)
+            output[f"{metric}_n"] = len(values)
+            output[f"{metric}_mean"] = (
+                statistics.fmean(values) if values else None
+            )
+            output[f"{metric}_median"] = (
+                statistics.median(values) if values else None
+            )
+            output[f"{metric}_sample_std"] = (
+                statistics.stdev(values) if len(values) > 1 else None
+            )
+            output[f"{metric}_negative_fraction"] = (
+                sum(value < 0.0 for value in values) / len(values)
+                if values
+                else None
+            )
+        oracle_vs_noisy_paired_aggregate_rows.append(output)
+
+    expected_oracle_vs_noisy_paired_metric_row_count = (
+        len(oracle_noisy_arm_pairs) * len(EXPECTED_MODELS)
+    )
+    expected_oracle_vs_noisy_aggregate_keys = {
+        (
+            oracle_arm["num_clients"],
+            oracle_arm["noise_multiplier"],
+            oracle_arm["noise_multiplier"],
+            oracle_arm["initial_clip_norm"],
+            oracle_arm["slaclip_num_slots"],
+            oracle_arm["slaclip_eta"],
+            oracle_arm["slaclip_beta"],
+            model,
+        )
+        for oracle_arm, _noisy_arm in oracle_noisy_arm_pairs
+        for model in EXPECTED_MODELS
+    }
+    expected_oracle_vs_noisy_paired_aggregate_row_count = len(
+        expected_oracle_vs_noisy_aggregate_keys
+    )
+    if args.require_complete:
+        if (
+            len(oracle_vs_noisy_paired_rows)
+            != expected_oracle_vs_noisy_paired_metric_row_count
+        ):
+            raise RuntimeError(
+                "complete campaign oracle/noisy paired row count is "
+                f"{len(oracle_vs_noisy_paired_rows)}, expected "
+                f"{expected_oracle_vs_noisy_paired_metric_row_count}"
+            )
+        actual_oracle_vs_noisy_aggregate_keys = {
+            tuple(row[key] for key in oracle_vs_noisy_group_keys)
+            for row in oracle_vs_noisy_paired_aggregate_rows
+        }
+        if (
+            actual_oracle_vs_noisy_aggregate_keys
+            != expected_oracle_vs_noisy_aggregate_keys
+        ):
+            raise RuntimeError(
+                "complete campaign oracle/noisy aggregate groups differ from "
+                "the unique manifest configurations"
+            )
+
     paired_columns = (
         "arm_id",
         "reference_arm_id",
         "family",
+        "method",
+        "controller_input",
         "seed",
         "num_clients",
         "noise_multiplier",
+        "effective_gradient_noise_multiplier",
         "initial_clip_norm",
+        "slaclip_num_slots",
         "slaclip_eta",
         "slaclip_beta",
         "model",
@@ -2545,6 +3105,82 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
         "fixed_actual_clipped_fraction",
         "actual_clipped_fraction_difference",
     )
+    diagnostic_paired_columns = (
+        "arm_id",
+        "reference_arm_id",
+        "family",
+        "analysis_role",
+        "comparison_role",
+        "method",
+        "controller_input",
+        "seed",
+        "num_clients",
+        "noise_multiplier",
+        "effective_gradient_noise_multiplier",
+        "initial_clip_norm",
+        "slaclip_num_slots",
+        "slaclip_eta",
+        "slaclip_beta",
+        "model",
+        "candidate_final_loss",
+        "fixed_final_loss",
+        "final_loss_difference_candidate_minus_fixed",
+        "candidate_best_loss",
+        "fixed_best_loss",
+        "best_loss_difference_candidate_minus_fixed",
+        "candidate_normalized_loss_auc",
+        "fixed_normalized_loss_auc",
+        "normalized_loss_auc_difference_candidate_minus_fixed",
+        "candidate_final_minus_best",
+        "fixed_final_minus_best",
+        "final_minus_best_difference_candidate_minus_fixed",
+        "candidate_actual_clipped_fraction",
+        "fixed_actual_clipped_fraction",
+        "actual_clipped_fraction_difference_candidate_minus_fixed",
+        "candidate_elapsed_seconds",
+        "fixed_elapsed_seconds",
+        "elapsed_seconds_difference_candidate_minus_fixed",
+    )
+    oracle_vs_noisy_paired_columns: list[str] = [
+        "oracle_arm_id",
+        "noisy_arm_id",
+        "oracle_family",
+        "noisy_family",
+        "comparison_role",
+        "candidate_method",
+        "noisy_method",
+        "candidate_controller_input",
+        "noisy_controller_input",
+        "seed",
+        "num_clients",
+        "noise_multiplier",
+        "effective_gradient_noise_multiplier",
+        "initial_clip_norm",
+        "slaclip_num_slots",
+        "slaclip_eta",
+        "slaclip_beta",
+        "model",
+        "sample_schedule_sha256",
+        "supervision_schedule_sha256",
+    ]
+    for metric in oracle_vs_noisy_overall_metrics:
+        oracle_vs_noisy_paired_columns.extend(
+            (
+                f"candidate_{metric}",
+                f"noisy_{metric}",
+                f"{metric}_difference_candidate_minus_noisy",
+            )
+        )
+    for group_name in ("A", "B"):
+        for metric in oracle_vs_noisy_group_metrics:
+            grouped_metric = f"{metric}_{group_name}"
+            oracle_vs_noisy_paired_columns.extend(
+                (
+                    f"candidate_{grouped_metric}",
+                    f"noisy_{grouped_metric}",
+                    f"{grouped_metric}_difference_candidate_minus_noisy",
+                )
+            )
     aggregate_columns = list(group_keys) + ["seed_count"]
     for metric in AGGREGATED_METRICS:
         aggregate_columns.extend((f"{metric}_n", f"{metric}_mean", f"{metric}_sample_std"))
@@ -2569,6 +3205,34 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
     paired_aggregate_columns.append(
         "final_loss_difference_slaclip_minus_fixed_holm_p"
     )
+    diagnostic_paired_aggregate_columns = list(diagnostic_group_keys) + [
+        "seed_count"
+    ]
+    for metric in diagnostic_difference_metrics:
+        diagnostic_paired_aggregate_columns.extend(
+            f"{metric}_{name}"
+            for name in (
+                "n",
+                "mean",
+                "median",
+                "sample_std",
+                "negative_fraction",
+            )
+        )
+    oracle_vs_noisy_paired_aggregate_columns = list(
+        oracle_vs_noisy_group_keys
+    ) + ["seed_count"]
+    for metric in oracle_vs_noisy_difference_metrics:
+        oracle_vs_noisy_paired_aggregate_columns.extend(
+            f"{metric}_{name}"
+            for name in (
+                "n",
+                "mean",
+                "median",
+                "sample_std",
+                "negative_fraction",
+            )
+        )
     atomic_csv(root / "campaign_metrics.csv", rows, METRIC_COLUMNS)
     atomic_csv(root / "paired_metrics.csv", paired_rows, paired_columns)
     atomic_csv(root / "aggregate_metrics.csv", aggregate_rows, aggregate_columns)
@@ -2576,6 +3240,26 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
         root / "paired_aggregate_metrics.csv",
         paired_aggregate_rows,
         paired_aggregate_columns,
+    )
+    atomic_csv(
+        root / "diagnostic_paired_metrics.csv",
+        diagnostic_paired_rows,
+        diagnostic_paired_columns,
+    )
+    atomic_csv(
+        root / "diagnostic_paired_aggregate_metrics.csv",
+        diagnostic_paired_aggregate_rows,
+        diagnostic_paired_aggregate_columns,
+    )
+    atomic_csv(
+        root / "oracle_vs_noisy_paired_metrics.csv",
+        oracle_vs_noisy_paired_rows,
+        oracle_vs_noisy_paired_columns,
+    )
+    atomic_csv(
+        root / "oracle_vs_noisy_paired_aggregate_metrics.csv",
+        oracle_vs_noisy_paired_aggregate_rows,
+        oracle_vs_noisy_paired_aggregate_columns,
     )
     expected_comparisons = sum(
         arm["method"] == FULL_SLACLIP_METHOD for arm in runtime["arms"]
@@ -2606,8 +3290,38 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
         "arm_statuses": statuses,
         "metric_row_count": len(rows),
         "paired_metric_row_count": len(paired_rows),
+        "diagnostic_paired_metric_row_count": len(diagnostic_paired_rows),
         "aggregate_row_count": len(aggregate_rows),
         "paired_aggregate_row_count": len(paired_aggregate_rows),
+        "diagnostic_paired_aggregate_row_count": len(
+            diagnostic_paired_aggregate_rows
+        ),
+        "expected_oracle_vs_noisy_paired_metric_row_count": (
+            expected_oracle_vs_noisy_paired_metric_row_count
+        ),
+        "oracle_vs_noisy_paired_metric_row_count": len(
+            oracle_vs_noisy_paired_rows
+        ),
+        "oracle_vs_noisy_paired_aggregate_row_count": len(
+            oracle_vs_noisy_paired_aggregate_rows
+        ),
+        "expected_oracle_vs_noisy_paired_aggregate_row_count": (
+            expected_oracle_vs_noisy_paired_aggregate_row_count
+        ),
+        "diagnostic_pairing_policy": (
+            "Oracle and non-DP mechanism controls are descriptive diagnostics "
+            "against matched fixed-C arms; they are excluded from SlaClip "
+            "efficacy selection and Holm correction."
+        ),
+        "oracle_vs_noisy_pairing_policy": (
+            "Exact-endpoint oracle SlaClip candidates are paired one-to-one "
+            "with noisy-endpoint full SlaClip only when all training, DP, "
+            "controller, RNG-domain, K, seed, and model settings match and "
+            "completed sample/supervision schedules have identical hashes. "
+            "These non-private oracle comparisons are descriptive mechanism "
+            "diagnostics only and are excluded from efficacy claims, Holm "
+            "correction, and beta selection."
+        ),
         "expected_comparison_count": expected_comparisons,
         "comparison_evidence_count": len(comparison_records),
         "comparisons_verified_this_pass": sum(
@@ -2662,6 +3376,10 @@ def _archive_candidate(path: Path, root: Path) -> bool:
         "paired_metrics.csv",
         "aggregate_metrics.csv",
         "paired_aggregate_metrics.csv",
+        "diagnostic_paired_metrics.csv",
+        "diagnostic_paired_aggregate_metrics.csv",
+        "oracle_vs_noisy_paired_metrics.csv",
+        "oracle_vs_noisy_paired_aggregate_metrics.csv",
         "development_beta_selection.json",
     }:
         return True
@@ -2868,6 +3586,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     preflight_smoke = subparsers.add_parser("run-smoke")
     preflight_smoke.add_argument("--manifest", type=Path, required=True)
     preflight_smoke.add_argument("--lane", type=int, choices=(0, 1), required=True)
+    preflight_smoke.add_argument(
+        "--method",
+        choices=(FIXED_DP_METHOD, FULL_SLACLIP_METHOD, ORACLE_SLACLIP_METHOD),
+    )
     preflight_smoke.add_argument("--repository", type=Path, required=True)
     preflight_smoke.add_argument("--python-bin", type=Path, required=True)
     preflight_smoke.add_argument("--private-key", type=Path, required=True)
