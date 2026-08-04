@@ -79,6 +79,16 @@ METHOD_SPECS: Mapping[str, MethodSpec] = MappingProxyType(
             independently_accounted=False,
             release_class="uncertified_federated_slaclip_cdf_endpoint_adaptation",
         ),
+        "oracle_slaclip_control": MethodSpec(
+            name="oracle_slaclip_control",
+            clipping_enabled=True,
+            gaussian_noise_enabled=True,
+            is_control=True,
+            independently_accounted=False,
+            release_class=(
+                "non_private_exact_cdf_endpoint_oracle_control_with_noisy_gradient"
+            ),
+        ),
     }
 )
 

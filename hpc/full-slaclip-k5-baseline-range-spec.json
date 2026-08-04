@@ -99,6 +99,13 @@
       "clip_only_control"
     ]
   },
+  "oracle_controls": {
+    "initial_clip_norm": 10.0,
+    "seeds": [],
+    "etas": [],
+    "betas": [],
+    "method": "oracle_slaclip_control"
+  },
   "scientific_boundary": {
     "claim_level": 1,
     "analysis_role": "development_hyperparameter_screen_not_confirmatory_test",

@@ -31,7 +31,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -110,8 +110,34 @@ EXPECTED_LORA_TARGETS = {
     "gpt2": ["c_attn"],
 }
 SLACLIP_METHOD = "slaclip_dp_lora"
+ORACLE_SLACLIP_METHOD = "oracle_slaclip_control"
+NOISY_CONTROLLER_INPUT = "noisy_endpoints"
+EXACT_CONTROLLER_INPUT = "exact_endpoints"
+ADAPTIVE_METHODS = frozenset({SLACLIP_METHOD, ORACLE_SLACLIP_METHOD})
+CONTROLLER_INPUT_BY_METHOD = {
+    SLACLIP_METHOD: NOISY_CONTROLLER_INPUT,
+    ORACLE_SLACLIP_METHOD: EXACT_CONTROLLER_INPUT,
+}
+# The historical full-SlaClip domain is immutable for backwards-compatible
+# confirmation.  A paired oracle reuses it so the controller input is the only
+# stochastic difference; an explicitly unpaired oracle gets its own domain.
+SLACLIP_PAIRED_SLACK_NOISE_SCOPE = SLACLIP_METHOD
 SLACLIP_REFERENCE_REPOSITORY = "https://github.com/ZsyRock/SlaClip"
 SLACLIP_REFERENCE_REVISION = "d48b8e07aef33c58a3595ee18b4dccf9c75fa1f3"
+
+
+def slaclip_slack_noise_method_scope(
+    method: str, *, pair_noise_across_methods: bool
+) -> str:
+    if method == SLACLIP_METHOD:
+        return SLACLIP_METHOD
+    if method == ORACLE_SLACLIP_METHOD:
+        return (
+            SLACLIP_PAIRED_SLACK_NOISE_SCOPE
+            if pair_noise_across_methods
+            else ORACLE_SLACLIP_METHOD
+        )
+    raise ValueError(f"method has no SlaClip slack-noise domain: {method}")
 
 
 @dataclass(frozen=True)
@@ -1998,18 +2024,27 @@ def slaclip_round_controller_summary(
     clip_thresholds: dict[str, float],
     num_slots: int,
     eta: float,
+    controller_input: str = NOISY_CONTROLLER_INPUT,
     base_target_clipped_fraction: float | None = None,
     beta: float | None = None,
     c_min: float,
     c_max: float,
     epsilon: float = 1e-6,
 ) -> dict[str, Any]:
-    """Reconcile one full-SlaClip update from its joint noisy releases."""
+    """Reconcile one adaptive update from noisy and exact endpoint signals.
+
+    Formal SlaClip selects ``noisy_endpoints``.  The explicitly non-private
+    oracle control selects ``exact_endpoints`` while retaining the same noisy
+    gradient and slack-vector releases so that only the controller input is
+    ablated.
+    """
 
     if not records:
         raise ValueError("cannot update SlaClip without client releases")
     if num_slots < 2:
         raise ValueError("full SlaClip requires at least two CDF slots")
+    if controller_input not in {NOISY_CONTROLLER_INPUT, EXACT_CONTROLLER_INPUT}:
+        raise ValueError(f"unsupported controller input: {controller_input!r}")
     base_target = resolve_base_target_clipped_fraction(
         base_target_clipped_fraction=base_target_clipped_fraction,
         beta=beta,
@@ -2020,6 +2055,10 @@ def slaclip_round_controller_summary(
         "clients": len(records),
         "num_slots": num_slots,
         "eta": eta,
+        "controller_input": controller_input,
+        "controller_input_is_non_dp_exact": (
+            controller_input == EXACT_CONTROLLER_INPUT
+        ),
         "base_target_clipped_fraction": base_target,
         "beta": base_target,
         "epsilon": epsilon,
@@ -2095,7 +2134,7 @@ def slaclip_round_controller_summary(
         cdf_error_rmse = math.sqrt(
             math.fsum(value * value for value in cdf_errors) / num_slots
         )
-        update = full_slaclip_update(
+        noisy_update = full_slaclip_update(
             threshold,
             float(noisy_indicator[0]),
             float(noisy_indicator[-1]),
@@ -2105,14 +2144,6 @@ def slaclip_round_controller_summary(
             max_clip_norm=c_max,
             epsilon=epsilon,
         )
-        update_fields = asdict(update) if hasattr(update, "__dataclass_fields__") else dict(update)
-        update_fields["unbounded_next_clip_threshold"] = update_fields.pop(
-            "unbounded_next_clip_norm"
-        )
-        update_fields["next_clip_threshold"] = update_fields.pop("next_clip_norm")
-        update_fields["c_min"] = update_fields.pop("min_clip_norm")
-        update_fields["c_max"] = update_fields.pop("max_clip_norm")
-        update_fields.pop("current_clip_norm", None)
         oracle_update = full_slaclip_update(
             threshold,
             float(exact_indicator[0]),
@@ -2123,10 +2154,33 @@ def slaclip_round_controller_summary(
             max_clip_norm=c_max,
             epsilon=epsilon,
         )
-        oracle_next = float(oracle_update["next_clip_norm"])
-        noisy_next = float(update_fields["next_clip_threshold"])
-        noisy_log_step = float(update_fields["raw_log_step"])
-        oracle_log_step = float(oracle_update["raw_log_step"])
+
+        def normalized_update_fields(update: Mapping[str, Any]) -> dict[str, Any]:
+            fields = (
+                asdict(update)
+                if hasattr(update, "__dataclass_fields__")
+                else dict(update)
+            )
+            fields["unbounded_next_clip_threshold"] = fields.pop(
+                "unbounded_next_clip_norm"
+            )
+            fields["next_clip_threshold"] = fields.pop("next_clip_norm")
+            fields["c_min"] = fields.pop("min_clip_norm")
+            fields["c_max"] = fields.pop("max_clip_norm")
+            fields.pop("current_clip_norm", None)
+            return fields
+
+        noisy_fields = normalized_update_fields(noisy_update)
+        oracle_fields = normalized_update_fields(oracle_update)
+        update_fields = dict(
+            noisy_fields
+            if controller_input == NOISY_CONTROLLER_INPUT
+            else oracle_fields
+        )
+        oracle_next = float(oracle_fields["next_clip_threshold"])
+        noisy_next = float(noisy_fields["next_clip_threshold"])
+        noisy_log_step = float(noisy_fields["raw_log_step"])
+        oracle_log_step = float(oracle_fields["raw_log_step"])
 
         def direction(value: float) -> int:
             return -1 if value < 0.0 else (1 if value > 0.0 else 0)
@@ -2143,6 +2197,10 @@ def slaclip_round_controller_summary(
             "exact_cdf_proxy_by_slot": [
                 float(value) for value in exact_indicator
             ],
+            "controller_input": controller_input,
+            "controller_input_is_non_dp_exact": (
+                controller_input == EXACT_CONTROLLER_INPUT
+            ),
             "normalized_proxy_noise_std_per_slot": normalized_proxy_noise_std,
             "cdf_error_mae": float(cdf_error_mae),
             "cdf_error_rmse": float(cdf_error_rmse),
@@ -2187,8 +2245,13 @@ def slaclip_round_controller_summary(
                     - float(update_fields["dynamic_target_clipped"])
                 )
             ),
+            "noisy_dynamic_target_clipped": float(
+                noisy_fields["dynamic_target_clipped"]
+            ),
+            "noisy_raw_log_step": noisy_log_step,
+            "noisy_next_clip_threshold": noisy_next,
             "oracle_dynamic_target_clipped": float(
-                oracle_update["dynamic_target_clipped"]
+                oracle_fields["dynamic_target_clipped"]
             ),
             "oracle_raw_log_step": oracle_log_step,
             "oracle_next_clip_threshold": oracle_next,
@@ -2217,7 +2280,7 @@ def read_round_shards(
     slaclip_contract: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     validate_private_directory(rounds_directory, "round diagnostics directory")
-    adaptive = expected_method == SLACLIP_METHOD
+    adaptive = expected_method in ADAPTIVE_METHODS
     if adaptive != (slaclip_contract is not None):
         raise RuntimeError("SlaClip round validation contract mismatch")
     current_thresholds: dict[str, float] | None = None
@@ -2305,6 +2368,7 @@ def read_round_shards(
                 clip_thresholds=current_thresholds,
                 num_slots=int(controller["num_slots"]),
                 eta=float(controller["eta"]),
+                controller_input=str(controller["controller_input"]),
                 base_target_clipped_fraction=(
                     resolve_base_target_clipped_fraction(
                         base_target_clipped_fraction=controller.get(
@@ -2520,6 +2584,15 @@ def behavior_summary(shards: Sequence[dict[str, Any]]) -> dict[str, Any]:
     if any(value is not None for value in controller_rounds):
         if not all(isinstance(value, dict) for value in controller_rounds):
             raise RuntimeError("SlaClip controller telemetry is incomplete")
+        controller_inputs = {
+            str(value.get("controller_input")) for value in controller_rounds
+        }
+        if len(controller_inputs) != 1 or controller_inputs.pop() not in {
+            NOISY_CONTROLLER_INPUT,
+            EXACT_CONTROLLER_INPUT,
+        }:
+            raise RuntimeError("SlaClip controller-input telemetry is invalid")
+        controller_input = str(controller_rounds[0]["controller_input"])
         controller_groups: dict[str, Any] = {}
         for group in ("A", "B"):
             group_rounds = [value[group] for value in controller_rounds]
@@ -2682,6 +2755,10 @@ def behavior_summary(shards: Sequence[dict[str, Any]]) -> dict[str, Any]:
                 }
         result["slaclip_controller"] = {
             "variant": "full_slaclip_cdf_endpoints",
+            "controller_input": controller_input,
+            "controller_input_is_non_dp_exact": (
+                controller_input == EXACT_CONTROLLER_INPUT
+            ),
             "rounds": len(controller_rounds),
             "base_target_clipped_fraction": controller_rounds[0][
                 "base_target_clipped_fraction"
@@ -2702,6 +2779,7 @@ def illustrative_accounting_diagnostic(
     delta: float,
     contains_slaclip: bool = False,
     slaclip_num_slots: int | None = None,
+    controller_input: str | None = None,
 ) -> dict[str, Any]:
     """Record why standard DP-SGD accounting cannot certify this mechanism."""
 
@@ -2716,10 +2794,28 @@ def illustrative_accounting_diagnostic(
             raise ValueError(
                 "a full-SlaClip accounting diagnostic requires at least two slots"
             )
+        resolved_controller_input = (
+            NOISY_CONTROLLER_INPUT
+            if controller_input is None
+            else controller_input
+        )
+        if resolved_controller_input not in {
+            NOISY_CONTROLLER_INPUT,
+            EXACT_CONTROLLER_INPUT,
+        }:
+            raise ValueError("invalid SlaClip accounting controller input")
         reasons.extend(
             [
                 "This is a federated per-client adaptation of full SlaClip, not the paper's audited per-sample DP-SGD implementation.",
-                "The controller uses noisy CDF endpoints, but exact CDF and clipping telemetry are retained only as non-DP private diagnostics and are not controller inputs.",
+                (
+                    "The controller uses noisy CDF endpoints; exact CDF and "
+                    "clipping telemetry are retained only as non-DP private "
+                    "diagnostics and are not controller inputs."
+                    if resolved_controller_input == NOISY_CONTROLLER_INPUT
+                    else "The oracle controller uses exact CDF endpoints to set "
+                    "the next threshold and is explicitly NON-DP, even though "
+                    "gradient noise and the noisy slack release remain enabled."
+                ),
                 (
                     f"The explicit K={slaclip_num_slots} release has no "
                     "independently reviewed end-to-end composition analysis "
@@ -2727,11 +2823,16 @@ def illustrative_accounting_diagnostic(
                 ),
             ]
         )
+    elif controller_input is not None:
+        raise ValueError("controller_input requires contains_slaclip=True")
     return {
         "status": "NOT_CERTIFIED",
         "epsilon": None,
         "delta": delta,
         "noise_multiplier": noise_multiplier,
+        "controller_input": (
+            resolved_controller_input if contains_slaclip else None
+        ),
         "mechanism_steps_per_client": rounds,
         "fixed_batch_sampling_rates": [
             batch_size / size for size in client_partition_sizes
@@ -2843,13 +2944,14 @@ def validate_checkpoint_trainer_state(
     ):
         raise RuntimeError("checkpoint round-shard digest is invalid")
     controller_state = state.get("slaclip_controller_state")
-    if config.method == SLACLIP_METHOD:
+    if config.method in ADAPTIVE_METHODS:
         if slaclip_contract is None or not isinstance(controller_state, dict):
             raise RuntimeError("checkpoint SlaClip controller state is missing")
         expected_controller_identity = {
             "controller_contract_sha256": canonical_json_fingerprint(
                 slaclip_contract
             ),
+            "controller_input": slaclip_contract["controller_input"],
             "updates_completed": completed_round,
         }
         for key, expected in expected_controller_identity.items():
@@ -2898,7 +3000,7 @@ def train_one_model(
     resume: bool,
     stop_file: Path | None,
 ) -> dict[str, Any]:
-    adaptive = config.method == SLACLIP_METHOD
+    adaptive = config.method in ADAPTIVE_METHODS
     if adaptive != (slaclip_contract is not None):
         raise RuntimeError("SlaClip model contract mismatch")
     controller = slaclip_contract["controller"] if slaclip_contract else None
@@ -3387,7 +3489,9 @@ def train_one_model(
                             model_kind,
                             round_index,
                             client_id,
-                            method_scope=SLACLIP_METHOD,
+                            method_scope=str(
+                                controller["slack_noise_method_scope"]
+                            ),
                         )
                     )
                     for group in ("A", "B")
@@ -3497,6 +3601,7 @@ def train_one_model(
                 clip_thresholds=current_clip_thresholds,
                 num_slots=int(controller["num_slots"]),
                 eta=float(controller["eta"]),
+                controller_input=str(controller["controller_input"]),
                 base_target_clipped_fraction=(
                     resolve_base_target_clipped_fraction(
                         base_target_clipped_fraction=controller.get(
@@ -3587,6 +3692,9 @@ def train_one_model(
                                 "controller_contract_sha256": (
                                     canonical_json_fingerprint(slaclip_contract)
                                 ),
+                                "controller_input": slaclip_contract[
+                                    "controller_input"
+                                ],
                                 "updates_completed": round_index,
                                 "next_clip_threshold_by_group": dict(
                                     current_clip_thresholds
@@ -3619,7 +3727,11 @@ def train_one_model(
                 **(
                     {
                         "slaclip": {
-                            group: {
+                            "controller_input": slaclip_contract[
+                                "controller_input"
+                            ],
+                            **{
+                                group: {
                                 "base_target_clipped_fraction": last_round_summary[
                                     "slaclip_controller"
                                 ][group]["base_target_clipped_fraction"],
@@ -3652,8 +3764,9 @@ def train_one_model(
                                 "dynamic_target_clipped": last_round_summary[
                                     "slaclip_controller"
                                 ][group]["dynamic_target_clipped"],
-                            }
-                            for group in ("A", "B")
+                                }
+                                for group in ("A", "B")
+                            },
                         }
                     }
                     if adaptive
@@ -3826,6 +3939,11 @@ def train_one_model(
             "private_key_commitment": private_key_commitment,
             "rng_domain": rng_domain,
             "pair_noise_across_methods": config.pair_noise_across_methods,
+            "slaclip_slack_noise_method_scope": (
+                str(controller["slack_noise_method_scope"])
+                if adaptive and controller is not None
+                else None
+            ),
             "raw_key_or_derived_seeds_logged": False,
         },
         "privacy_accounting": illustrative_accounting_diagnostic(
@@ -3840,6 +3958,11 @@ def train_one_model(
                 if adaptive and controller is not None
                 else None
             ),
+            controller_input=(
+                str(controller["controller_input"])
+                if adaptive and controller is not None
+                else None
+            ),
         ),
         "elapsed_seconds": elapsed,
         "completed_at_utc": utc_now(),
@@ -3851,6 +3974,11 @@ def train_one_model(
             "schema_version": 2,
             "status": "COMPLETED",
             "method": config.method,
+            "controller_input": (
+                slaclip_contract["controller_input"]
+                if slaclip_contract is not None
+                else None
+            ),
             "model": model_kind,
             "round": config.rounds,
             "rounds": config.rounds,
@@ -3875,7 +4003,7 @@ def validate_completed_root_summary(
         "schema_version": 2,
         "status": "COMPLETED",
         "privacy_label": PRIVACY_LABEL,
-        "contains_slaclip": config.method == SLACLIP_METHOD,
+        "contains_slaclip": config.method in ADAPTIVE_METHODS,
         "method": config.method,
         "method_spec": asdict(METHOD_SPECS[config.method]),
         "run_config_fingerprint": run_config_fingerprint,
@@ -4070,7 +4198,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit(f"refusing to overwrite existing output: {output_dir}")
     config = make_effective_config(args)
     validate_config(config)
-    if config.method in {"paper_dp_lora", SLACLIP_METHOD} and config.noise_multiplier <= 0:
+    if config.method in {"paper_dp_lora", *ADAPTIVE_METHODS} and config.noise_multiplier <= 0:
         raise SystemExit(f"{config.method} requires --noise-multiplier > 0")
     if args.device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("CUDA was requested but torch.cuda.is_available() is false")
@@ -4089,7 +4217,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit("output directory must be outside the Git worktree")
 
     slaclip_contract: dict[str, Any] | None = None
-    if config.method == SLACLIP_METHOD:
+    if config.method in ADAPTIVE_METHODS:
+        controller_input = CONTROLLER_INPUT_BY_METHOD[config.method]
         if args.slaclip_num_slots < 2:
             raise SystemExit(
                 "--slaclip-num-slots must be at least two for the full "
@@ -4128,6 +4257,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         slaclip_contract = {
             "schema_version": "full_slaclip_contract_v1",
             "variant": "full_slaclip_cdf_endpoints",
+            "controller_input": controller_input,
+            "non_private_oracle_control": (
+                controller_input == EXACT_CONTROLLER_INPUT
+            ),
             "federated_adaptation": (
                 "per_client_joint_gradient_slack_release_then_equal_fedavg_"
                 "and_one_controller_update_per_round"
@@ -4139,6 +4272,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             },
             "controller": {
                 "eta": float(args.slaclip_eta),
+                "controller_input": controller_input,
+                "slack_noise_method_scope": slaclip_slack_noise_method_scope(
+                    config.method,
+                    pair_noise_across_methods=config.pair_noise_across_methods,
+                ),
                 "base_target_clipped_fraction": float(
                     args.slaclip_base_target_clipped_fraction
                 ),
@@ -4184,7 +4322,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "eta*(gamma-q) is bounded before exp only to avoid "
                     "floating-point overflow; every activation is logged"
                 ),
-                "controller_inputs": "noisy_joint_release_endpoints_only",
+                "controller_inputs": (
+                    "noisy_joint_release_endpoints_only"
+                    if controller_input == NOISY_CONTROLLER_INPUT
+                    else "exact_non_dp_endpoint_signals"
+                ),
             },
             "exact_cdf_and_clipping_diagnostics": PRIVACY_LABEL,
             "release_noise_warning": (
@@ -4229,18 +4371,34 @@ def main(argv: Sequence[str] | None = None) -> None:
         "No independent epsilon is reported because the paper does not provide the constants/calibration needed to map sigma=2 to its epsilon sweep.",
     ]
     if slaclip_contract is not None:
+        assert config.method in ADAPTIVE_METHODS
+        controller_input = CONTROLLER_INPUT_BY_METHOD[config.method]
         assumptions.extend(
             [
                 (
-                    "The full SlaClip controller uses the first and final noisy "
-                    "CDF-proxy slots to derive a dynamic target; "
+                    "The adaptive controller uses the first and final "
+                    + (
+                        "noisy CDF-proxy slots"
+                        if controller_input == NOISY_CONTROLLER_INPUT
+                        else "exact, explicitly non-private CDF-proxy slots"
+                    )
+                    + " to derive a dynamic target; "
                     "base_target_clipped_fraction (the paper/reference beta) "
-                    "is modulated by the noisy estimated fraction of remaining "
+                    "is modulated by the estimated fraction of remaining "
                     "non-small gradients, so it is not a fixed clipping target "
                     "and no calibration data enters the controller at runtime."
                 ),
                 "SlaClip is adapted to the paper-literal federated mechanism by releasing one joint gradient/slack vector per client and LoRA group, then updating each A/B threshold once after FedAvg.",
-                "The controller consumes only noisy endpoints; exact endpoint values and actual clipping fractions are retained solely as explicitly labelled non-DP private diagnostics.",
+                (
+                    "The controller consumes only noisy endpoints; exact endpoint "
+                    "values and actual clipping fractions are retained solely as "
+                    "explicitly labelled non-DP private diagnostics."
+                    if controller_input == NOISY_CONTROLLER_INPUT
+                    else "This oracle control uses exact endpoint signals to set "
+                    "the next threshold and is explicitly NON-DP; the sigma=2 "
+                    "gradient noise and noisy slack release remain enabled solely "
+                    "to isolate controller-input noise."
+                ),
                 (
                     f"The requested K={num_slots} policy with "
                     f"N={config.num_clients} and sigma={config.noise_multiplier:g} "
@@ -4309,6 +4467,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             "diagnostics_are_private_non_dp_data": True,
             "baseline_derived_calibration_is_non_dp": False,
             "exact_cdf_diagnostics_are_non_dp": slaclip_contract is not None,
+            "oracle_controller_uses_non_dp_exact_cdf": (
+                config.method == ORACLE_SLACLIP_METHOD
+            ),
         },
         "repository": repo,
         "environment": {

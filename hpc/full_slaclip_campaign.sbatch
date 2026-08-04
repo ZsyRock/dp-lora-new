@@ -227,14 +227,15 @@ if [[ "$smoke_rc_0" -ne 0 || "$smoke_rc_1" -ne 0 ]]; then
 fi
 
 # Exercise the actual pinned models, LoRA wiring, paper baseline mechanism,
-# full CDF-endpoint controller, checkpoint writer, and final validation.  Both
-# smokes share their private RNG domain; one lane runs them sequentially while
-# two lanes run them concurrently.
+# full noisy CDF-endpoint controller, exact-endpoint NON-DP oracle control,
+# checkpoint writer, and final validation.  The baseline/full pair shares its
+# private RNG domain; the oracle then runs on one verified lane.
 # On resume, train_federated.py --resume deeply revalidates completed smokes.
 campaign_stage="real_model_preflight"
 run_step "$python_bin" "$coordinator" run-smoke \
     --manifest "$runtime_manifest" \
     --lane 0 \
+    --method paper_dp_lora \
     --repository "$repository" \
     --python-bin "$python_bin" \
     --private-key "$private_key" &
@@ -245,6 +246,7 @@ if [[ "$parent_lanes" -eq 2 ]]; then
     run_step "$python_bin" "$coordinator" run-smoke \
         --manifest "$runtime_manifest" \
         --lane 1 \
+        --method slaclip_dp_lora \
         --repository "$repository" \
         --python-bin "$python_bin" \
         --private-key "$private_key" &
@@ -263,6 +265,7 @@ elif [[ "$model_smoke_rc_0" -eq 0 ]]; then
     run_step "$python_bin" "$coordinator" run-smoke \
         --manifest "$runtime_manifest" \
         --lane 1 \
+        --method slaclip_dp_lora \
         --repository "$repository" \
         --python-bin "$python_bin" \
         --private-key "$private_key" &
@@ -289,6 +292,37 @@ if [[ "$model_smoke_rc_0" -ne 0 || "$model_smoke_rc_1" -ne 0 ]]; then
         exit 75
     fi
     echo "ERROR: real-model preflight reached an unclassified failure state" >&2
+    exit 1
+fi
+
+# The oracle path deliberately retains gradient/slack noise but consumes exact
+# endpoint signals for the next threshold.  It is an explicitly NON-DP
+# mechanism diagnostic and must pass a real-model smoke before formal arms.
+model_smoke_rc_oracle=0
+run_step "$python_bin" "$coordinator" run-smoke \
+    --manifest "$runtime_manifest" \
+    --lane 0 \
+    --method oracle_slaclip_control \
+    --repository "$repository" \
+    --python-bin "$python_bin" \
+    --private-key "$private_key" &
+model_smoke_pid_oracle=$!
+set +e
+wait_for_full_slaclip_child "$model_smoke_pid_oracle"
+model_smoke_rc_oracle=$?
+set -e
+if [[ "$model_smoke_rc_oracle" -ne 0 ]]; then
+    "$python_bin" "$coordinator" aggregate --manifest "$runtime_manifest" || true
+    "$python_bin" "$coordinator" archive-small \
+        --campaign-root "$campaign_root" --archive-root "$archive_root" || true
+    model_smoke_oracle_classification="$(
+        classify_full_slaclip_exit_codes "$model_smoke_rc_oracle"
+    )"
+    if [[ "$model_smoke_oracle_classification" == "CHECKPOINTED_STOP" ]]; then
+        echo "Oracle real-model preflight stopped at a checkpoint boundary; resume the same run ID."
+        exit 75
+    fi
+    echo "ERROR: oracle real-model preflight failed: oracle=$model_smoke_rc_oracle" >&2
     exit 1
 fi
 

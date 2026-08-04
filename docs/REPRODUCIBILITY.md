@@ -292,9 +292,9 @@ exploration for GPT-2 rather than falsely described as a within-model grid.
 The resulting ranking remains development evidence only; a selected value
 must be frozen before an independent confirmation run.
 
-## Current single-job Level-1 campaign
+## Legacy unsubmitted K=15 Level-1 template
 
-The checked-in campaign specification contains 108 resumable runner arms in
+The older checked-in campaign template contains 108 resumable runner arms in
 one Slurm allocation on one node.  Two GPU lanes consume 54 waves without job
 arrays or nested submissions.  Each runner arm trains both BERT-base and GPT-2
 small, producing 216 model-level training executions:
@@ -328,6 +328,53 @@ privacy-accounting omissions.  Until those gates are implemented, even a clean
 campaign completion remains Level 1 rather than a paper benchmark
 reproduction, a journal-complete result package, or evidence of an end-to-end
 certified privacy guarantee.
+
+## Active K=5 stability and fair-fixed suite
+
+`hpc/full-slaclip-k5-stability-suite-spec.json` is the active single-allocation
+follow-up to completed job `1356439`. It freezes the previously selected
+noisy-controller candidate (`K=5`, `beta=0.76`, `eta=0.2`, `C_0=10`) before
+using ten new seeds `100..109`. The BERT comparison is explicitly a
+replication of the observed unstable result; only GPT-2 had a positive
+development signal.
+
+The 80 runner arms are organized as follows:
+
+| Family | Runner-arm matrix | Count |
+| --- | --- | ---: |
+| Frozen primary | fixed `C=10` versus noisy full SlaClip; seeds `100..109` | 20 |
+| Fair fixed-C and initial-C development | both methods; `C_0 in {0.1, 0.3, 1, 3}`; seeds `100..102` (with `C=10` supplied by primary) | 24 |
+| Noisy-controller stability | `beta=0.76`, `eta in {0.01, 0.025, 0.05, 0.1}`; seeds `100..102` (`eta=0.2` supplied by primary) | 12 |
+| Protected-record-count diagnostic | fixed and noisy full SlaClip at `N=20`; seeds `100..102` | 6 |
+| Mechanism controls | no-DP and clip-only at `C=10`; seeds `100..102` | 6 |
+| Exact-endpoint oracle control | exact rather than noisy CDF endpoints drive the next threshold; `eta in {0.025, 0.05, 0.1, 0.2}`; seeds `100..102` | 12 |
+
+The oracle arm retains the same `sigma=2` gradient-noise mechanism and the
+same paired random-number streams for gradient and slack noise, but uses the
+non-noised endpoint values to drive the controller. Threshold trajectories can
+therefore diverge, so realized scaled releases need not be bitwise equal. The
+oracle is a deliberately non-private mechanism diagnostic, never an efficacy
+or privacy result; it isolates controller-input CDF noise without changing the
+nominal gradient-noise mechanism.
+
+The final aggregator keeps claim-bearing and diagnostic comparisons separate:
+`paired_metrics.csv` and `paired_aggregate_metrics.csv` contain only noisy
+full-SlaClip-versus-matched-fixed comparisons, while
+`diagnostic_paired_metrics.csv` covers controls versus fixed and
+`oracle_vs_noisy_paired_metrics.csv` plus
+`oracle_vs_noisy_paired_aggregate_metrics.csv` directly pair and summarize
+exact- versus noisy-endpoint controllers at identical seed, model, C, N,
+sigma, K, eta, and beta. The two diagnostic families are descriptive and
+never enter Holm correction or beta selection.
+
+This suite deliberately omits a sigma sweep because sigma simultaneously
+changes gradient noise, endpoint noise, and privacy. It omits `N=80` because
+that setting costs sixteen times the client updates of `N=5`; `N=20` first
+tests whether reducing the theoretical endpoint-noise standard deviation from
+2 to 1 gives a monotone mechanism signal. Any tuned fixed C or eta selected
+from seeds `100..102` remains development-only and requires a later fresh-seed
+comparison. The frozen primary is a training-randomness confirmation on the
+internal validation objective, not independent downstream benchmark evidence.
 
 ## Minimum result package
 

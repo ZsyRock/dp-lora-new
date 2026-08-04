@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import math
@@ -11,6 +12,7 @@ from pathlib import Path
 import paper_repro.full_slaclip_campaign as campaign_module
 from paper_repro.full_slaclip_campaign import (
     FULL_SLACLIP_METHOD,
+    ORACLE_SLACLIP_METHOD,
     _arm_command,
     _model_metrics,
     aggregate_campaign,
@@ -19,6 +21,7 @@ from paper_repro.full_slaclip_campaign import (
     expand_spec,
     load_spec,
     paired_inference,
+    resolve_oracle_noisy_arm_pairs,
     validated_step_environment,
     validate_or_create_key,
     validate_runtime_manifest,
@@ -105,7 +108,9 @@ printf 'child_rc=%s notifier_rc=%s generation=%s\n' \
 def test_slurm_worker_uses_signal_safe_wait_for_every_background_child() -> None:
     worker = SLURM_WORKER.read_text(encoding="utf-8")
     assert '\nwait "$' not in worker
-    assert worker.count("wait_for_full_slaclip_child") == 8
+    assert worker.count("wait_for_full_slaclip_child") == 9
+    assert "--method oracle_slaclip_control" in worker
+    assert "NON-DP" in worker
 
 
 def test_compute_step_environment_is_validated_fail_closed(
@@ -214,6 +219,51 @@ def test_checked_in_matrix_is_exact_and_contains_no_slaclip_q() -> None:
     assert all(arm["slaclip_c_max"] == 50.0 for arm in adaptive)
     assert all(arm["data_split_seed"] == 1729 for arm in arms)
     assert all(arm["evaluation_seed"] == 2718 for arm in arms)
+
+
+def test_oracle_control_matrix_uses_exact_endpoints_and_primary_references(
+    tmp_path: Path,
+) -> None:
+    spec = copy.deepcopy(load_spec(SPEC))
+    spec["expected_arm_count"] = 110
+    spec["oracle_controls"] = {
+        "initial_clip_norm": 10.0,
+        "seeds": [42, 43],
+        "etas": [0.05],
+        "betas": [0.76],
+        "method": ORACLE_SLACLIP_METHOD,
+    }
+    spec_path = tmp_path / "oracle-spec.json"
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+    arms = expand_spec(load_spec(spec_path))
+    oracle = [arm for arm in arms if arm["method"] == ORACLE_SLACLIP_METHOD]
+    assert len(oracle) == 2
+    assert {arm["family"] for arm in oracle} == {"oracle_control"}
+    assert {arm["analysis_role"] for arm in oracle} == {
+        "non_dp_exact_endpoint_oracle_controller_diagnostic"
+    }
+    assert {arm["controller_input"] for arm in oracle} == {"exact_endpoints"}
+    assert {arm["slaclip_eta"] for arm in oracle} == {0.05}
+    assert {arm["slaclip_beta"] for arm in oracle} == {0.76}
+    assert {arm["noise_multiplier"] for arm in oracle} == {2.0}
+    assert {arm["slaclip_num_slots"] for arm in oracle} == {15}
+    by_id = {arm["arm_id"]: arm for arm in arms}
+    for arm in oracle:
+        reference = by_id[arm["reference_arm_id"]]
+        assert reference["method"] == "paper_dp_lora"
+        assert reference["seed"] == arm["seed"]
+        assert reference["initial_clip_norm"] == arm["initial_clip_norm"]
+        command = _arm_command(
+            arm,
+            repository=tmp_path / "repo",
+            python_bin=tmp_path / "env" / "bin" / "python",
+            input_manifest=tmp_path / "input.json",
+            output_dir=tmp_path / arm["arm_id"],
+            private_key=tmp_path / "key",
+            stop_file=tmp_path / "stop",
+        )
+        assert command[command.index("--method") + 1] == ORACLE_SLACLIP_METHOD
+        assert "--slaclip-num-slots" in command
 
 
 def test_beta5_screen_is_full_slaclip_only_and_has_five_base_targets() -> None:
@@ -676,6 +726,7 @@ def _fake_model_summary(*, adaptive: bool, final_loss: float) -> dict[str, objec
         "upper_bound_hits": 5,
         "noisy_adjacent_monotonicity_violations": 6,
         "exact_adjacent_monotonicity_violations": 0,
+        "log_threshold_total_variation": 0.8,
     }
     behavior_group = {
         "actual_clipped_fraction": 0.1,
@@ -685,11 +736,18 @@ def _fake_model_summary(*, adaptive: bool, final_loss: float) -> dict[str, objec
             for index, name in enumerate(
                 (
                     "raw_gradient_l2",
+                    "raw_to_threshold_ratio",
+                    "removed_gradient_l2",
+                    "retained_energy_fraction",
                     "clipped_signal_gradient_l2",
                     "noise_gradient_l2",
                     "signal_to_noise_l2_ratio",
                     "signal_noise_cosine",
                     "global_update_l2",
+                    "aggregate_signal_gradient_l2",
+                    "aggregate_noise_gradient_l2",
+                    "aggregate_signal_to_noise_l2_ratio",
+                    "relative_global_update",
                 ),
                 start=1,
             )
@@ -698,7 +756,11 @@ def _fake_model_summary(*, adaptive: bool, final_loss: float) -> dict[str, objec
     return {
         "evaluations": [{"round": 0, "loss": 4.0}, {"round": 50, "loss": final_loss}],
         "clipping": {"any_group": {"fraction": 0.1, "would_fraction": 0.1}},
-        "behavior_summary": {"groups": {"A": behavior_group, "B": behavior_group}},
+        "behavior_summary": {
+            "sample_schedule_sha256": "a" * 64,
+            "supervision_schedule_sha256": "b" * 64,
+            "groups": {"A": behavior_group, "B": behavior_group},
+        },
         "elapsed_seconds": 12.0,
         "slaclip": {"controller_summary": {"groups": {"A": group, "B": group}}}
         if adaptive
@@ -798,3 +860,245 @@ def test_incremental_aggregator_writes_paired_machine_readable_results(
         )
         for row in paired_aggregates
     } == {-0.2}
+
+
+def test_oracle_and_non_dp_controls_use_separate_descriptive_pairing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    spec = copy.deepcopy(load_spec(K5_RANGE_SPEC))
+    spec["expected_arm_count"] = 8
+    spec["primary"]["seeds"] = [52, 53]
+    spec["sensitivity"]["seeds"] = []
+    spec["controls"]["seeds"] = [52]
+    spec["oracle_controls"] = {
+        "initial_clip_norm": 10.0,
+        "seeds": [52, 53],
+        "etas": [0.2],
+        "betas": [0.38],
+        "method": ORACLE_SLACLIP_METHOD,
+    }
+    spec_path = tmp_path / "diagnostic-spec.json"
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+    input_manifest = tmp_path / "input-manifest.json"
+    input_manifest.write_text('{"pinned":true}\n', encoding="utf-8")
+    runtime = build_runtime_manifest(
+        spec_path,
+        repository_sha="c" * 40,
+        input_manifest=input_manifest,
+        created_at_utc="2026-08-04T00:00:00+00:00",
+    )
+    runtime_path = tmp_path / "campaign" / "runtime-manifest.json"
+    atomic_json(runtime_path, runtime)
+    completed_methods = {
+        "paper_dp_lora",
+        "no_dp_lora_control",
+        "clip_only_control",
+        FULL_SLACLIP_METHOD,
+        ORACLE_SLACLIP_METHOD,
+    }
+    losses = {
+        "paper_dp_lora": 3.4,
+        "no_dp_lora_control": 2.9,
+        "clip_only_control": 3.2,
+        FULL_SLACLIP_METHOD: 3.1,
+        ORACLE_SLACLIP_METHOD: 3.0,
+    }
+    for arm in runtime["arms"]:
+        if arm["method"] not in completed_methods:
+            continue
+        adaptive = arm["method"] in {
+            FULL_SLACLIP_METHOD,
+            ORACLE_SLACLIP_METHOD,
+        }
+        summary = {
+            "status": "COMPLETED",
+            "method": arm["method"],
+            "models": {
+                model: _fake_model_summary(
+                    adaptive=adaptive,
+                    final_loss=losses[arm["method"]],
+                )
+                for model in ("bert", "gpt2")
+            },
+        }
+        atomic_json(
+            tmp_path / "campaign" / "arms" / arm["arm_id"] / "final_summary.json",
+            summary,
+        )
+        atomic_json(
+            tmp_path / "campaign" / "arm-status" / f"{arm['arm_id']}.json",
+            {"status": "COMPLETED"},
+        )
+    monkeypatch.setattr(
+        campaign_module,
+        "ensure_full_comparisons",
+        lambda *_args, **_kwargs: [],
+    )
+    assert aggregate_campaign(
+        argparse.Namespace(manifest=runtime_path, require_complete=False)
+    ) is False
+
+    with (tmp_path / "campaign" / "campaign_metrics.csv").open(
+        encoding="utf-8", newline=""
+    ) as handle:
+        metrics = list(csv.DictReader(handle))
+    control_rows = [
+        row for row in metrics if row["method"] in {"no_dp_lora_control", "clip_only_control"}
+    ]
+    oracle_rows = [
+        row for row in metrics if row["method"] == ORACLE_SLACLIP_METHOD
+    ]
+    assert {float(row["noise_multiplier"]) for row in control_rows} == {2.0}
+    assert {
+        float(row["effective_gradient_noise_multiplier"]) for row in control_rows
+    } == {0.0}
+    assert {float(row["noise_multiplier"]) for row in oracle_rows} == {2.0}
+    assert {
+        float(row["effective_gradient_noise_multiplier"]) for row in oracle_rows
+    } == {2.0}
+    assert {row["controller_input"] for row in oracle_rows} == {
+        "exact_endpoints"
+    }
+
+    with (tmp_path / "campaign" / "paired_metrics.csv").open(
+        encoding="utf-8", newline=""
+    ) as handle:
+        efficacy_pairs = list(csv.DictReader(handle))
+    assert len(efficacy_pairs) == 4
+    assert {row["method"] for row in efficacy_pairs} == {FULL_SLACLIP_METHOD}
+    with (tmp_path / "campaign" / "diagnostic_paired_metrics.csv").open(
+        encoding="utf-8", newline=""
+    ) as handle:
+        diagnostic = list(csv.DictReader(handle))
+    assert len(diagnostic) == 8
+    assert {row["method"] for row in diagnostic} == {
+        "no_dp_lora_control",
+        "clip_only_control",
+        ORACLE_SLACLIP_METHOD,
+    }
+    assert {row["comparison_role"] for row in diagnostic} == {
+        "NON_DP_EXACT_ENDPOINT_ORACLE_DIAGNOSTIC",
+        "NON_DP_MECHANISM_CONTROL_EXPLORATORY",
+    }
+    assert all(
+        float(row["final_loss_difference_candidate_minus_fixed"]) < 0.0
+        for row in diagnostic
+    )
+    with (
+        tmp_path / "campaign" / "diagnostic_paired_aggregate_metrics.csv"
+    ).open(encoding="utf-8", newline="") as handle:
+        diagnostic_aggregate = list(csv.DictReader(handle))
+    assert len(diagnostic_aggregate) == 6
+    assert all(
+        "holm" not in key.lower()
+        for row in diagnostic_aggregate
+        for key in row
+    )
+    campaign_summary = json.loads(
+        (tmp_path / "campaign" / "campaign_summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert campaign_summary["diagnostic_paired_metric_row_count"] == 8
+    assert campaign_summary["diagnostic_paired_aggregate_row_count"] == 6
+    assert "excluded from SlaClip efficacy selection" in campaign_summary[
+        "diagnostic_pairing_policy"
+    ]
+
+    with (tmp_path / "campaign" / "oracle_vs_noisy_paired_metrics.csv").open(
+        encoding="utf-8", newline=""
+    ) as handle:
+        oracle_vs_noisy = list(csv.DictReader(handle))
+    assert len(oracle_vs_noisy) == 4
+    assert {row["candidate_method"] for row in oracle_vs_noisy} == {
+        ORACLE_SLACLIP_METHOD
+    }
+    assert {row["noisy_method"] for row in oracle_vs_noisy} == {
+        FULL_SLACLIP_METHOD
+    }
+    assert {
+        round(float(row["final_loss_difference_candidate_minus_noisy"]), 12)
+        for row in oracle_vs_noisy
+    } == {-0.1}
+    assert {float(row["candidate_final_threshold_A"]) for row in oracle_vs_noisy} == {
+        7.0
+    }
+    assert {
+        float(row["candidate_retained_energy_fraction_median_A"])
+        for row in oracle_vs_noisy
+    } == {4.0}
+    assert {
+        float(row["candidate_aggregate_signal_to_noise_l2_ratio_median_B"])
+        for row in oracle_vs_noisy
+    } == {12.0}
+    with (
+        tmp_path / "campaign" / "oracle_vs_noisy_paired_aggregate_metrics.csv"
+    ).open(encoding="utf-8", newline="") as handle:
+        oracle_vs_noisy_aggregate = list(csv.DictReader(handle))
+    assert len(oracle_vs_noisy_aggregate) == 2
+    assert all(
+        "holm" not in key.lower() and "p_value" not in key.lower()
+        for row in oracle_vs_noisy_aggregate
+        for key in row
+    )
+    assert campaign_summary[
+        "expected_oracle_vs_noisy_paired_metric_row_count"
+    ] == 4
+    assert campaign_summary["oracle_vs_noisy_paired_metric_row_count"] == 4
+    assert campaign_summary["oracle_vs_noisy_paired_aggregate_row_count"] == 2
+    assert "excluded from efficacy claims" in campaign_summary[
+        "oracle_vs_noisy_pairing_policy"
+    ]
+    assert campaign_summary["development_beta_selection"] is None
+
+
+def test_oracle_noisy_pair_resolution_is_exact_and_fails_closed() -> None:
+    assert resolve_oracle_noisy_arm_pairs(
+        {"arms": expand_spec(load_spec(K5_RANGE_SPEC))}
+    ) == []
+
+    spec = copy.deepcopy(load_spec(K5_RANGE_SPEC))
+    spec["expected_arm_count"] = 6
+    spec["primary"]["seeds"] = [52, 53]
+    spec["sensitivity"]["seeds"] = []
+    spec["controls"]["seeds"] = []
+    spec["oracle_controls"] = {
+        "initial_clip_norm": 10.0,
+        "seeds": [52, 53],
+        "etas": [0.2],
+        "betas": [0.38],
+        "method": ORACLE_SLACLIP_METHOD,
+    }
+    arms = expand_spec(spec)
+    simple_runtime = {"arms": arms}
+    pairs = resolve_oracle_noisy_arm_pairs(simple_runtime)
+    assert len(pairs) == 2
+    assert pairs[0][0]["method"] == ORACLE_SLACLIP_METHOD
+    assert pairs[0][1]["method"] == FULL_SLACLIP_METHOD
+
+    missing = copy.deepcopy(simple_runtime)
+    oracle = next(
+        arm for arm in missing["arms"] if arm["method"] == ORACLE_SLACLIP_METHOD
+    )
+    oracle["slaclip_eta"] = 0.1
+    try:
+        resolve_oracle_noisy_arm_pairs(missing)
+    except RuntimeError as error:
+        assert "must be unique" in str(error)
+    else:
+        raise AssertionError("missing noisy oracle counterpart was accepted")
+
+    ambiguous = copy.deepcopy(simple_runtime)
+    noisy = next(
+        arm for arm in ambiguous["arms"] if arm["method"] == FULL_SLACLIP_METHOD
+    )
+    duplicate = copy.deepcopy(noisy)
+    duplicate["arm_id"] = "duplicate-noisy-arm"
+    ambiguous["arms"].append(duplicate)
+    try:
+        resolve_oracle_noisy_arm_pairs(ambiguous)
+    except RuntimeError as error:
+        assert "must be unique" in str(error)
+    else:
+        raise AssertionError("ambiguous noisy oracle counterpart was accepted")

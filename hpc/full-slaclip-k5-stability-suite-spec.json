@@ -1,0 +1,253 @@
+{
+  "schema_version": 1,
+  "campaign_name": "full_slaclip_k5_stability_and_fair_fixed_suite_v1",
+  "description": "One-allocation K=5 suite: fresh-seed confirmation of the frozen beta=0.76 candidate, fair fixed-C and eta development screens, exact-endpoint oracle controls, mechanism controls, initial-C robustness, and N=20 CDF-record sensitivity.",
+  "expected_arm_count": 80,
+  "common": {
+    "models": [
+      "bert",
+      "gpt2"
+    ],
+    "num_clients": 5,
+    "rounds": 50,
+    "batch_size": 8,
+    "noise_multiplier": 2.0,
+    "learning_rate": 0.0005,
+    "rank": 512,
+    "max_seq_length": 128,
+    "max_validation_records": 512,
+    "eval_every": 10,
+    "checkpoint_every": 10,
+    "data_split_seed": 1729,
+    "evaluation_seed": 2718,
+    "delta": 0.00001,
+    "slaclip_num_slots": 5,
+    "slaclip_c_min": 0.1,
+    "slaclip_c_max": 50.0,
+    "default_eta": 0.2,
+    "default_beta": 0.76
+  },
+  "primary": {
+    "initial_clip_norms": [
+      10.0
+    ],
+    "seeds": [
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      107,
+      108,
+      109
+    ],
+    "methods": [
+      "paper_dp_lora",
+      "slaclip_dp_lora"
+    ]
+  },
+  "threshold_robustness": {
+    "initial_clip_norms": [
+      0.1,
+      0.3,
+      1.0,
+      3.0
+    ],
+    "seeds": [
+      100,
+      101,
+      102
+    ],
+    "methods": [
+      "paper_dp_lora",
+      "slaclip_dp_lora"
+    ]
+  },
+  "sensitivity": {
+    "initial_clip_norm": 10.0,
+    "seeds": [
+      100,
+      101,
+      102
+    ],
+    "etas": [
+      0.01,
+      0.025,
+      0.05,
+      0.1,
+      0.2
+    ],
+    "betas": [
+      0.76
+    ],
+    "method": "slaclip_dp_lora",
+    "exclude_primary_default": true
+  },
+  "noise_sensitivity": {
+    "initial_clip_norm": 10.0,
+    "seeds": [],
+    "noise_multipliers": [],
+    "methods": [
+      "paper_dp_lora",
+      "slaclip_dp_lora"
+    ]
+  },
+  "client_sensitivity": {
+    "initial_clip_norm": 10.0,
+    "seeds": [
+      100,
+      101,
+      102
+    ],
+    "num_clients": [
+      20
+    ],
+    "methods": [
+      "paper_dp_lora",
+      "slaclip_dp_lora"
+    ]
+  },
+  "controls": {
+    "initial_clip_norm": 10.0,
+    "seeds": [
+      100,
+      101,
+      102
+    ],
+    "methods": [
+      "no_dp_lora_control",
+      "clip_only_control"
+    ]
+  },
+  "oracle_controls": {
+    "initial_clip_norm": 10.0,
+    "seeds": [
+      100,
+      101,
+      102
+    ],
+    "etas": [
+      0.025,
+      0.05,
+      0.1,
+      0.2
+    ],
+    "betas": [
+      0.76
+    ],
+    "method": "oracle_slaclip_control"
+  },
+  "scientific_boundary": {
+    "claim_level": 1,
+    "analysis_role": "frozen_candidate_training_randomness_confirmation_plus_mechanism_development_not_external_test_evidence",
+    "training_dataset": "MedDialog_HealthcareMagic_plus_iCliniq_public_reconstruction",
+    "models": [
+      "bert-base-uncased",
+      "gpt2-small"
+    ],
+    "paper_result_reproduced": false,
+    "paper_benchmarks_evaluated": false,
+    "external_test_set_used": false,
+    "end_to_end_dp_certified": false,
+    "exact_diagnostics_privacy_label": "NON_DP_PRIVATE_DIAGNOSTIC",
+    "controller_family": "full_SlaClip_two_CDF_endpoints_K5_only",
+    "excluded_method_family": "SlaClip-Q_and_all_fixed-target-quantile-controllers",
+    "frozen_primary_configuration": {
+      "method": "slaclip_dp_lora",
+      "initial_clip_norm": 10.0,
+      "num_clients": 5,
+      "num_slots": 5,
+      "noise_multiplier": 2.0,
+      "eta": 0.2,
+      "base_target_clipped_fraction": 0.76,
+      "selection_source_campaign": "full-slaclip-3dffa27-20260804T010406Z",
+      "selection_source_slurm_job_id": "1356439",
+      "selection_source_repository_sha": "3dffa272275a0fb60ad53eabc20386eba933c6aa",
+      "selection_artifact_sha256": "6a7f1a68f3c4bbf623a0c0eeab0a6c2f302f70142340f5e8f1887214fdd2b510",
+      "selection_source_campaign_summary_sha256": "fac99eef41270407c09795a398c59a870169580d626f89d3c372e68ce76b4cc9",
+      "selection_source_paired_aggregate_sha256": "52b3920449715c9e2a09ffab01105e1b3ee1e1c9b75d965f4d9514c3a0b2abaf"
+    },
+    "primary_roles_by_model": {
+      "gpt2": "fresh-seed confirmation of the previously selected beta=0.76 candidate versus fixed C=10",
+      "bert": "fresh-seed replication of the previously observed unstable/non-improving result; not a pre-claimed efficacy win"
+    },
+    "confirmation_seeds": [
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      107,
+      108,
+      109
+    ],
+    "confirmation_seeds_disjoint_from_selection_seeds": true,
+    "development_subset_of_confirmation_seeds": [
+      100,
+      101,
+      102
+    ],
+    "primary_configuration_was_frozen_before_development_subset_results": true,
+    "fixed_C_development_grid": [
+      0.1,
+      0.3,
+      1.0,
+      3.0,
+      10.0
+    ],
+    "fixed_C_fairness_rule": "all fixed-C results are reported; any best fixed C selected here is development-only and requires new-seed confirmation before claiming superiority over tuned fixed clipping",
+    "eta_development_grid_at_beta_0p76": [
+      0.01,
+      0.025,
+      0.05,
+      0.1,
+      0.2
+    ],
+    "beta_policy": "beta=0.76 was selected before this run; beta is the conditional clipped fraction of remaining non-small-gradient mass, not the unclipped fraction",
+    "target_semantics": "round_target_clipped_fraction=clip(beta*(1-s_hat[K-1]/(C_t+1e-6)),0,1)",
+    "oracle_control": {
+      "method": "oracle_slaclip_control",
+      "controller_input": "exact_non_noised_CDF_endpoints",
+      "gradient_update_noise_multiplier": 2.0,
+      "privacy_role": "NON_DP_DIAGNOSTIC_CONTROL_ONLY",
+      "efficacy_selection_eligible": false,
+      "purpose": "isolate controller-input CDF noise while retaining the same sigma=2 gradient-noise mechanism and paired random-number streams; divergent thresholds can change realized scaled releases"
+    },
+    "mechanism_controls": [
+      "no_dp_lora_control",
+      "clip_only_control_C10"
+    ],
+    "client_count_sensitivity": {
+      "values": [
+        5,
+        20
+      ],
+      "expected_normalized_CDF_endpoint_noise_std": {
+        "N5": 2.0,
+        "N20": 1.0
+      },
+      "role": "mechanism diagnostic; changing N also changes per-round training work and is not a pure CDF-noise intervention"
+    },
+    "omitted_noise_multiplier_sweep_reason": "sigma changes gradient noise, CDF noise, and privacy simultaneously; no equal-epsilon accountant is currently available",
+    "omitted_N80_reason": "N80 is sixteen times the client-update cost of N5 and is deferred until oracle and N20 establish a monotone mechanism signal",
+    "fixed_evaluation_protocol": {
+      "data_split_seed": 1729,
+      "evaluation_seed": 2718,
+      "holdout_records": 512,
+      "evaluation_rounds": [
+        0,
+        10,
+        20,
+        30,
+        40,
+        50
+      ]
+    },
+    "reporting_rule": "report every arm and paired seed; primary final-loss inference is restricted to the frozen C10 candidate, while fixed-C, eta, initial-C, N20, and oracle arms are development/mechanism evidence with multiplicity-aware summaries",
+    "journal_boundary": "this campaign uses internal language-model validation loss and cannot replace independent downstream benchmark accuracy, EM/F1, ROUGE-L, or certified equal-privacy evaluation"
+  }
+}
