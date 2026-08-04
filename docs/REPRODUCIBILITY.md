@@ -266,10 +266,13 @@ target as `beta * (1-z_hat)`.
 
 ## K=5 baseline-range development screen
 
-`hpc/full-slaclip-k5-baseline-range-spec.json` pre-registers one 30-arm,
-15-wave campaign with matched fixed-`C=10` baselines and full SlaClip at
-`K=5`.  It retains the previous MedDialog, BERT/GPT-2, five-client, 50-round,
-batch-8, `sigma=2`, learning-rate, LoRA-rank, evaluation, and seed settings.
+`hpc/full-slaclip-k5-baseline-range-spec.json` pre-registers one 30-arm
+campaign with matched fixed-`C=10` baselines and full SlaClip at `K=5`.
+The wrapper uses one L4 lane and executes the 15 logical arm pairs
+sequentially inside the same allocation because the fast development QoS
+permits one GPU per job.  It retains the previous MedDialog, BERT/GPT-2,
+five-client, 50-round, batch-8, `sigma=2`, learning-rate, LoRA-rank,
+evaluation, and seed settings.
 
 The candidate base target clipped fractions are
 `{0, 0.19, 0.38, 0.57, 0.76}`.  They are the five equally spaced endpoints of

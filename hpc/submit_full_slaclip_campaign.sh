@@ -7,8 +7,8 @@ usage() {
     cat >&2 <<'USAGE'
 Usage: hpc/submit_full_slaclip_campaign.sh [--resume] [--test-only]
 
-Submit one checked-in full-SlaClip campaign as exactly one two-GPU Slurm job.
-The allocation performs two typed-GPU CUDA smokes before starting the matrix.
+Submit one checked-in full-SlaClip campaign as exactly one Slurm job with one
+or two GPU lanes.  Every allocated typed-GPU lane is checked before training.
 
 --resume requires DPLORA_FULL_RUN_ID to name an existing partial campaign.
 --test-only performs all login-node gates and Slurm scheduler validation but
@@ -24,7 +24,7 @@ Important overrides:
   DPLORA_FULL_SPEC_RELATIVE   spec path inside snapshot
   DPLORA_FULL_ACCOUNT         Slurm account (default: normal)
   DPLORA_FULL_PARTITION       partitions (default: quad_h200,dual_h200)
-  DPLORA_FULL_GPU_GRES        typed two-GPU allocation (default: gpu:h200:2)
+  DPLORA_FULL_GPU_GRES        typed one/two-GPU allocation (default: gpu:h200:2)
   DPLORA_FULL_EXPECTED_GPU    CUDA device-name substring (default from GRES)
   DPLORA_FULL_MIN_VRAM_GIB    per-lane minimum VRAM GiB (default from GRES)
   DPLORA_FULL_CPUS_PER_TASK   CPU cores per GPU lane (default: 12; max: 12)
@@ -221,10 +221,11 @@ host_memory="${DPLORA_FULL_HOST_MEMORY:-384G}"
 lane_memory="${DPLORA_FULL_LANE_MEMORY:-192G}"
 walltime="${DPLORA_FULL_WALLTIME:-2-12:00:00}"
 job_name="${DPLORA_FULL_JOB_NAME:-dp-lora-full-slaclip}"
-if [[ "$gpu_gres" =~ ^gpu:([A-Za-z0-9_-]+):2$ ]]; then
+if [[ "$gpu_gres" =~ ^gpu:([A-Za-z0-9_-]+):([12])$ ]]; then
     gpu_type="${BASH_REMATCH[1]}"
+    gpu_lanes="${BASH_REMATCH[2]}"
 else
-    echo "ERROR: typed allocation must have exactly two GPUs, e.g. gpu:l4:2" >&2
+    echo "ERROR: typed allocation must have one or two GPUs, e.g. gpu:l4:1" >&2
     exit 1
 fi
 lane_gres="gpu:$gpu_type:1"
@@ -277,7 +278,7 @@ sbatch_args=(
     "--partition=$partition"
     "--gres=$gpu_gres"
     --nodes=1
-    --ntasks=2
+    "--ntasks=$gpu_lanes"
     "--cpus-per-task=$cpus_per_task"
     "--mem=$host_memory"
     "--time=$walltime"
@@ -299,7 +300,7 @@ echo "Environment:       $env_prefix"
 echo "Input manifest:    $input_manifest"
 echo "Scratch output:    $campaign_root"
 echo "Persistent archive:$archive_root"
-echo "Resources:         account=$account partition=$partition gres=$gpu_gres nodes=1 lanes=2 cpus/lane=$cpus_per_task mem=$host_memory lane_mem=$lane_memory time=$walltime"
+echo "Resources:         account=$account partition=$partition gres=$gpu_gres nodes=1 lanes=$gpu_lanes cpus/lane=$cpus_per_task mem=$host_memory lane_mem=$lane_memory time=$walltime"
 echo "GPU gate:          name_contains=$expected_gpu min_vram_gib=$min_vram_gib"
 
 "$sbatch_bin" "${sbatch_args[@]}" "$worker" \

@@ -46,6 +46,9 @@ def test_slurm_worker_exports_required_cuda_determinism_contract() -> None:
     assert run_step.count("--export=ALL") == 1
     assert run_step.count("< /dev/null") == 1
     assert "consume future wave rows" in run_step
+    assert 'parent_lanes="${SLURM_NTASKS:-0}"' in worker
+    assert '[[ "$parent_lanes" -eq 2 ]]' in worker
+    assert "starting_sequential_wave=" in worker
 
 
 def test_compute_step_environment_is_validated_fail_closed(
@@ -250,17 +253,17 @@ def test_k5_baseline_range_screen_is_full_slaclip_only_and_pre_registered() -> N
     assert boundary["expected_normalized_cdf_endpoint_noise_std"] == 2.0
 
 
-def test_k5_range_submitter_uses_two_l4_lanes_and_right_sized_resources() -> None:
+def test_k5_range_submitter_uses_one_l4_lane_and_right_sized_resources() -> None:
     submitter = K5_RANGE_SUBMITTER.read_text(encoding="utf-8")
     assert (
         "DPLORA_FULL_SPEC_RELATIVE=hpc/full-slaclip-k5-baseline-range-spec.json"
         in submitter
     )
-    assert "DPLORA_FULL_GPU_GRES=gpu:l4:2" in submitter
-    assert "DPLORA_FULL_PARTITION=l4" in submitter
-    assert "DPLORA_FULL_HOST_MEMORY=24G" in submitter
+    assert "DPLORA_FULL_GPU_GRES=gpu:l4swarm:1" in submitter
+    assert "DPLORA_FULL_PARTITION=scavenger_l4" in submitter
+    assert "DPLORA_FULL_HOST_MEMORY=12G" in submitter
     assert "DPLORA_FULL_LANE_MEMORY=12G" in submitter
-    assert "DPLORA_FULL_WALLTIME=01:00:00" in submitter
+    assert "DPLORA_FULL_WALLTIME=02:00:00" in submitter
     assert "slaclip_q" not in submitter.lower()
 
 

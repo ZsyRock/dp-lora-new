@@ -33,9 +33,10 @@ trainer="$repository/paper_repro/train_federated.py"
 runtime_manifest="$campaign_root/runtime-manifest.json"
 global_stop="$campaign_root/control/stop.request"
 lane_cpus="${SLURM_CPUS_PER_TASK:-0}"
+parent_lanes="${SLURM_NTASKS:-0}"
 
-if [[ "${SLURM_JOB_NUM_NODES:-0}" != 1 || "${SLURM_NTASKS:-0}" != 2 ]]; then
-    echo "ERROR: full SlaClip campaign requires one node and two parent tasks" >&2
+if [[ "${SLURM_JOB_NUM_NODES:-0}" != 1 || ! "$parent_lanes" =~ ^[12]$ ]]; then
+    echo "ERROR: full SlaClip campaign requires one node and one or two GPU lanes" >&2
     exit 2
 fi
 if [[ ! "$lane_cpus" =~ ^[1-9][0-9]*$ || "$lane_cpus" -gt 12 ]]; then
@@ -178,46 +179,53 @@ echo "campaign_root=$campaign_root"
 echo "stop_file=$global_stop"
 nvidia-smi
 
-# A single-task step prevents the two-task parent allocation from confusing
+# A single-task step prevents a multi-task parent allocation from confusing
 # single-process input/runtime checks.
 campaign_stage="runtime_and_input_preflight"
 run_step "$python_bin" -m pip check
 run_step "$python_bin" "$trainer" --check-inputs --input-manifest "$input_manifest"
 
-# Verify both independently scheduled typed-GPU lanes before the formal matrix.
+# Verify every independently scheduled typed-GPU lane before the formal matrix.
 campaign_stage="cuda_preflight"
+smoke_rc_0=0
+smoke_rc_1=0
 run_step "$python_bin" "$coordinator" cuda-smoke \
     --lane 0 \
     --output "$campaign_root/preflight/cuda-lane-0.json" \
     --expected-device-name "$expected_gpu" \
     --min-vram-gib "$min_vram_gib" &
 smoke_pid_0=$!
-run_step "$python_bin" "$coordinator" cuda-smoke \
-    --lane 1 \
-    --output "$campaign_root/preflight/cuda-lane-1.json" \
-    --expected-device-name "$expected_gpu" \
-    --min-vram-gib "$min_vram_gib" &
-smoke_pid_1=$!
+if [[ "$parent_lanes" -eq 2 ]]; then
+    run_step "$python_bin" "$coordinator" cuda-smoke \
+        --lane 1 \
+        --output "$campaign_root/preflight/cuda-lane-1.json" \
+        --expected-device-name "$expected_gpu" \
+        --min-vram-gib "$min_vram_gib" &
+    smoke_pid_1=$!
+fi
 set +e
 wait "$smoke_pid_0"
 smoke_rc_0=$?
 if [[ "$smoke_rc_0" -ne 0 ]]; then
     request_stop
 fi
-wait "$smoke_pid_1"
-smoke_rc_1=$?
+if [[ "$parent_lanes" -eq 2 ]]; then
+    wait "$smoke_pid_1"
+    smoke_rc_1=$?
+fi
 set -e
 if [[ "$smoke_rc_0" -ne 0 || "$smoke_rc_1" -ne 0 ]]; then
     "$python_bin" "$coordinator" aggregate --manifest "$runtime_manifest" || true
     "$python_bin" "$coordinator" archive-small \
         --campaign-root "$campaign_root" --archive-root "$archive_root" || true
-    echo "ERROR: two-lane typed-GPU CUDA preflight failed: lane0=$smoke_rc_0 lane1=$smoke_rc_1" >&2
+    echo "ERROR: typed-GPU CUDA preflight failed: lane0=$smoke_rc_0 lane1=$smoke_rc_1" >&2
     exit 1
 fi
 
 # Exercise the actual pinned models, LoRA wiring, paper baseline mechanism,
 # full CDF-endpoint controller, checkpoint writer, and final validation.  Both
-# smokes share their private RNG domain and run concurrently on the two lanes.
+# smokes share their private RNG domain; one lane runs them sequentially while
+# two lanes run them concurrently.
 # On resume, train_federated.py --resume deeply revalidates completed smokes.
 campaign_stage="real_model_preflight"
 run_step "$python_bin" "$coordinator" run-smoke \
@@ -227,21 +235,39 @@ run_step "$python_bin" "$coordinator" run-smoke \
     --python-bin "$python_bin" \
     --private-key "$private_key" &
 model_smoke_pid_0=$!
-run_step "$python_bin" "$coordinator" run-smoke \
-    --manifest "$runtime_manifest" \
-    --lane 1 \
-    --repository "$repository" \
-    --python-bin "$python_bin" \
-    --private-key "$private_key" &
-model_smoke_pid_1=$!
+model_smoke_rc_0=0
+model_smoke_rc_1=0
+if [[ "$parent_lanes" -eq 2 ]]; then
+    run_step "$python_bin" "$coordinator" run-smoke \
+        --manifest "$runtime_manifest" \
+        --lane 1 \
+        --repository "$repository" \
+        --python-bin "$python_bin" \
+        --private-key "$private_key" &
+    model_smoke_pid_1=$!
+fi
 set +e
 wait "$model_smoke_pid_0"
 model_smoke_rc_0=$?
 if [[ "$model_smoke_rc_0" -ne 0 ]]; then
     request_stop
 fi
-wait "$model_smoke_pid_1"
-model_smoke_rc_1=$?
+if [[ "$parent_lanes" -eq 2 ]]; then
+    wait "$model_smoke_pid_1"
+    model_smoke_rc_1=$?
+elif [[ "$model_smoke_rc_0" -eq 0 ]]; then
+    run_step "$python_bin" "$coordinator" run-smoke \
+        --manifest "$runtime_manifest" \
+        --lane 1 \
+        --repository "$repository" \
+        --python-bin "$python_bin" \
+        --private-key "$private_key" &
+    model_smoke_pid_1=$!
+    wait "$model_smoke_pid_1"
+    model_smoke_rc_1=$?
+else
+    model_smoke_rc_1=125
+fi
 set -e
 if [[ "$model_smoke_rc_0" -ne 0 || "$model_smoke_rc_1" -ne 0 ]]; then
     "$python_bin" "$coordinator" aggregate --manifest "$runtime_manifest" || true
@@ -265,46 +291,81 @@ if [[ -e "$global_stop" ]]; then
 fi
 
 campaign_stage="formal_matrix"
-while IFS=$'\t' read -r arm_index_0 arm_index_1; do
-    echo "starting_wave=$((arm_index_0 / 2)) arm_indices=$arm_index_0,$arm_index_1"
-    run_step "$python_bin" "$coordinator" run-arm \
-        --manifest "$runtime_manifest" \
-        --arm-index "$arm_index_0" \
-        --repository "$repository" \
-        --python-bin "$python_bin" \
-        --private-key "$private_key" &
-    arm_pid_0=$!
-    run_step "$python_bin" "$coordinator" run-arm \
-        --manifest "$runtime_manifest" \
-        --arm-index "$arm_index_1" \
-        --repository "$repository" \
-        --python-bin "$python_bin" \
-        --private-key "$private_key" &
-    arm_pid_1=$!
+if [[ "$parent_lanes" -eq 2 ]]; then
+    while IFS=$'\t' read -r arm_index_0 arm_index_1; do
+        echo "starting_wave=$((arm_index_0 / 2)) arm_indices=$arm_index_0,$arm_index_1"
+        run_step "$python_bin" "$coordinator" run-arm \
+            --manifest "$runtime_manifest" \
+            --arm-index "$arm_index_0" \
+            --repository "$repository" \
+            --python-bin "$python_bin" \
+            --private-key "$private_key" &
+        arm_pid_0=$!
+        run_step "$python_bin" "$coordinator" run-arm \
+            --manifest "$runtime_manifest" \
+            --arm-index "$arm_index_1" \
+            --repository "$repository" \
+            --python-bin "$python_bin" \
+            --private-key "$private_key" &
+        arm_pid_1=$!
 
-    set +e
-    wait "$arm_pid_0"
-    arm_rc_0=$?
-    if [[ "$arm_rc_0" -ne 0 ]]; then
-        request_stop
-    fi
-    wait "$arm_pid_1"
-    arm_rc_1=$?
-    set -e
+        set +e
+        wait "$arm_pid_0"
+        arm_rc_0=$?
+        if [[ "$arm_rc_0" -ne 0 ]]; then
+            request_stop
+        fi
+        wait "$arm_pid_1"
+        arm_rc_1=$?
+        set -e
 
-    "$python_bin" "$coordinator" aggregate --manifest "$runtime_manifest"
-    "$python_bin" "$coordinator" archive-small \
-        --campaign-root "$campaign_root" --archive-root "$archive_root"
+        "$python_bin" "$coordinator" aggregate --manifest "$runtime_manifest"
+        "$python_bin" "$coordinator" archive-small \
+            --campaign-root "$campaign_root" --archive-root "$archive_root"
 
-    if [[ "$arm_rc_0" -eq 75 || "$arm_rc_1" -eq 75 || -e "$global_stop" ]]; then
-        echo "Campaign stopped at a checkpoint boundary; resume the same run ID."
-        exit 75
-    fi
-    if [[ "$arm_rc_0" -ne 0 || "$arm_rc_1" -ne 0 ]]; then
-        echo "ERROR: campaign wave failed: lane0=$arm_rc_0 lane1=$arm_rc_1" >&2
-        exit 1
-    fi
-done < <("$python_bin" "$coordinator" waves --manifest "$runtime_manifest")
+        if [[ "$arm_rc_0" -eq 75 || "$arm_rc_1" -eq 75 || -e "$global_stop" ]]; then
+            echo "Campaign stopped at a checkpoint boundary; resume the same run ID."
+            exit 75
+        fi
+        if [[ "$arm_rc_0" -ne 0 || "$arm_rc_1" -ne 0 ]]; then
+            echo "ERROR: campaign wave failed: lane0=$arm_rc_0 lane1=$arm_rc_1" >&2
+            exit 1
+        fi
+    done < <("$python_bin" "$coordinator" waves --manifest "$runtime_manifest")
+else
+    while IFS=$'\t' read -r arm_index_0 arm_index_1; do
+        echo "starting_sequential_wave=$((arm_index_0 / 2)) arm_indices=$arm_index_0,$arm_index_1"
+        for arm_index in "$arm_index_0" "$arm_index_1"; do
+            run_step "$python_bin" "$coordinator" run-arm \
+                --manifest "$runtime_manifest" \
+                --arm-index "$arm_index" \
+                --repository "$repository" \
+                --python-bin "$python_bin" \
+                --private-key "$private_key" &
+            arm_pid=$!
+            set +e
+            wait "$arm_pid"
+            arm_rc=$?
+            set -e
+            if [[ "$arm_rc" -ne 0 ]]; then
+                request_stop
+            fi
+
+            "$python_bin" "$coordinator" aggregate --manifest "$runtime_manifest"
+            "$python_bin" "$coordinator" archive-small \
+                --campaign-root "$campaign_root" --archive-root "$archive_root"
+
+            if [[ "$arm_rc" -eq 75 || -e "$global_stop" ]]; then
+                echo "Campaign stopped at a checkpoint boundary; resume the same run ID."
+                exit 75
+            fi
+            if [[ "$arm_rc" -ne 0 ]]; then
+                echo "ERROR: sequential campaign arm failed: index=$arm_index rc=$arm_rc" >&2
+                exit 1
+            fi
+        done
+    done < <("$python_bin" "$coordinator" waves --manifest "$runtime_manifest")
+fi
 
 campaign_stage="final_revalidation"
 "$python_bin" "$coordinator" aggregate \
