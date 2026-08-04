@@ -2701,6 +2701,7 @@ def illustrative_accounting_diagnostic(
     noise_multiplier: float,
     delta: float,
     contains_slaclip: bool = False,
+    slaclip_num_slots: int | None = None,
 ) -> dict[str, Any]:
     """Record why standard DP-SGD accounting cannot certify this mechanism."""
 
@@ -2711,11 +2712,19 @@ def illustrative_accounting_diagnostic(
         "Publishing multiple models or paired arms requires an explicit composition analysis.",
     ]
     if contains_slaclip:
+        if slaclip_num_slots is None or slaclip_num_slots < 2:
+            raise ValueError(
+                "a full-SlaClip accounting diagnostic requires at least two slots"
+            )
         reasons.extend(
             [
                 "This is a federated per-client adaptation of full SlaClip, not the paper's audited per-sample DP-SGD implementation.",
                 "The controller uses noisy CDF endpoints, but exact CDF and clipping telemetry are retained only as non-DP private diagnostics and are not controller inputs.",
-                "K=15 with five client releases at sigma=2 exceeds the paper's automatic monotonicity-rule slot choice and has no independently reviewed composition analysis here.",
+                (
+                    f"The explicit K={slaclip_num_slots} release has no "
+                    "independently reviewed end-to-end composition analysis "
+                    "for this federated adaptation."
+                ),
             ]
         )
     return {
@@ -3826,6 +3835,11 @@ def train_one_model(
             noise_multiplier=effective_noise_multiplier,
             delta=config.delta,
             contains_slaclip=adaptive,
+            slaclip_num_slots=(
+                int(controller["num_slots"])
+                if adaptive and controller is not None
+                else None
+            ),
         ),
         "elapsed_seconds": elapsed,
         "completed_at_utc": utc_now(),
@@ -4135,14 +4149,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "beta_compatibility_alias": True,
                 "epsilon": 1e-6,
                 "num_slots": int(num_slots),
-                "num_slots_selection": (
-                    "user_journal_small_batch_k15"
-                    if config.batch_size < 128 and num_slots == 15
-                    else "explicit"
-                ),
-                "user_small_batch_policy": (
-                    "K=15 when local batch size is below 128"
-                ),
+                "num_slots_selection": "explicit",
+                "explicit_num_slots": int(num_slots),
                 "local_batch_size": config.batch_size,
                 "num_clients": config.num_clients,
                 "expected_release_records": config.num_clients,
@@ -4179,7 +4187,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "controller_inputs": "noisy_joint_release_endpoints_only",
             },
             "exact_cdf_and_clipping_diagnostics": PRIVACY_LABEL,
-            "k15_release_noise_warning": (
+            "release_noise_warning": (
                 f"With {config.num_clients} client contributions, "
                 f"sigma={config.noise_multiplier:g}, and K={num_slots}, the "
                 "normalized endpoint noise standard deviation is "
@@ -4229,7 +4237,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "base_target_clipped_fraction (the paper/reference beta) "
                     "is modulated by the noisy estimated fraction of remaining "
                     "non-small gradients, so it is not a fixed clipping target "
-                    "and no baseline calibration is used."
+                    "and no calibration data enters the controller at runtime."
                 ),
                 "SlaClip is adapted to the paper-literal federated mechanism by releasing one joint gradient/slack vector per client and LoRA group, then updating each A/B threshold once after FedAvg.",
                 "The controller consumes only noisy endpoints; exact endpoint values and actual clipping fractions are retained solely as explicitly labelled non-DP private diagnostics.",

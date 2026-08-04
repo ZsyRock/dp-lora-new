@@ -22,6 +22,7 @@ from paper_repro.train_federated import (
     EffectiveConfig,
     empty_mechanism_components,
     empty_state_like,
+    illustrative_accounting_diagnostic,
     parameter_groups,
     parse_args,
     partition_indices,
@@ -188,6 +189,28 @@ def minimal_valid_input_manifest(root: Path) -> dict:
 
 
 class PaperReproTests(unittest.TestCase):
+    def test_slaclip_accounting_diagnostic_reports_the_explicit_k(self) -> None:
+        diagnostic = illustrative_accounting_diagnostic(
+            client_partition_sizes=[10] * 5,
+            batch_size=8,
+            rounds=50,
+            noise_multiplier=2.0,
+            delta=1e-5,
+            contains_slaclip=True,
+            slaclip_num_slots=5,
+        )
+        self.assertTrue(any("K=5" in reason for reason in diagnostic["reasons"]))
+        self.assertFalse(any("K=15" in reason for reason in diagnostic["reasons"]))
+        with self.assertRaisesRegex(ValueError, "requires at least two slots"):
+            illustrative_accounting_diagnostic(
+                client_partition_sizes=[10] * 5,
+                batch_size=8,
+                rounds=50,
+                noise_multiplier=2.0,
+                delta=1e-5,
+                contains_slaclip=True,
+            )
+
     def test_full_slaclip_base_target_cli_and_beta_alias_resolve_fail_closed(
         self,
     ) -> None:

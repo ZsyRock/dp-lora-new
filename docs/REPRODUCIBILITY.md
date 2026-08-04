@@ -241,23 +241,46 @@ only in the next round.  Only the *noisy* endpoints drive the update.  The
 exact CDF proxy, raw gradient norms, and actual clipping fractions are written
 only as `NON_DP_PRIVATE_DIAGNOSTIC` telemetry and must not be presented as DP
 releases.  Full SlaClip has no SlaClip-Q fixed target, target file, or
-baseline-derived calibration stage.
+runtime calibration input.  A development campaign may pre-register several
+scalar `beta` hyperparameters from earlier non-DP private baseline diagnostics;
+each candidate still drives the full two-endpoint dynamic controller above.
 
 The slack coordinates and clipped gradient form one bounded vector per client
 and group and receive independent Gaussian coordinates at scale `sigma*C_t`.
 This retains the joint-release construction inside the declared federated
 adaptation, but it does not establish the missing end-to-end accountant.  In
 particular, the original construction is adapted here to five client
-aggregate-gradient records rather than a standard per-sample DP-SGD batch, and
-the requested `K_slots=15` small-batch policy exceeds the automatic SNR bound
-implied by five released records at `sigma=2`.  Consequently all current full
+aggregate-gradient records rather than a standard per-sample DP-SGD batch.
+The slot count is explicit in each campaign specification.  With five released
+records at `sigma=2`, both `K=15` and the later `K=5` development screen exceed
+the automatic rule's `K=1`; their theoretical normalized endpoint-noise
+standard deviations are 3.464 and 2.0, respectively.  Consequently all current full
 SlaClip results must retain `epsilon=null`,
 `end_to_end_dp_certified=false`, and the Level-1 claim boundary.
 
-Baseline-derived fixed targets may still be mentioned by old artifacts so
-that historical runs remain interpretable.  That ablation is not an active
-method, is not included in the current campaign, and must not be recommended
-or launched as evidence for the full-SlaClip extension.
+Baseline-derived *fixed-target controllers* may still be mentioned by old
+artifacts so that historical runs remain interpretable.  That SlaClip-Q-style
+ablation is not an active method.  It is distinct from selecting a scalar
+full-SlaClip `beta` before training: the latter still computes the per-round
+target as `beta * (1-z_hat)`.
+
+## K=5 baseline-range development screen
+
+`hpc/full-slaclip-k5-baseline-range-spec.json` pre-registers one 30-arm,
+15-wave campaign with matched fixed-`C=10` baselines and full SlaClip at
+`K=5`.  It retains the previous MedDialog, BERT/GPT-2, five-client, 50-round,
+batch-8, `sigma=2`, learning-rate, LoRA-rank, evaluation, and seed settings.
+
+The candidate base target clipped fractions are
+`{0, 0.19, 0.38, 0.57, 0.76}`.  They are the five equally spaced endpoints of
+the BERT baseline's roundwise-five-seed-mean any-group clipping interval
+`[0, 0.76]`; this follows the requested range-grid example and is not an
+empirical quantile estimator.  The specification pins the source campaign and
+all ten source trajectory hashes.  GPT-2's matched baseline interval is
+exactly `[0,0]`, so the same five values are explicitly labelled cross-model
+exploration for GPT-2 rather than falsely described as a within-model grid.
+The resulting ranking remains development evidence only; a selected value
+must be frozen before an independent confirmation run.
 
 ## Current single-job Level-1 campaign
 

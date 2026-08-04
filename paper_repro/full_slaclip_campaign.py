@@ -222,8 +222,8 @@ def _common_values(spec: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("default_beta must be in (0, 1]")
     if normalized["rounds"] != 50 or normalized["batch_size"] != 8:
         raise ValueError("formal campaign must retain T=50 and B=8")
-    if normalized["slaclip_num_slots"] != 15:
-        raise ValueError("this campaign freezes the requested K_slots=15 policy")
+    if normalized["slaclip_num_slots"] < 2:
+        raise ValueError("full SlaClip requires at least two CDF endpoint slots")
     return normalized
 
 
@@ -512,9 +512,9 @@ def expand_spec(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
         for value in sensitivity_seeds
     ]
     etas = [require_number(value, "sensitivity.eta", positive=True) for value in etas]
-    betas = [require_number(value, "sensitivity.beta", positive=True) for value in betas]
-    if any(value > 1 for value in betas):
-        raise ValueError("sensitivity beta must not exceed one")
+    betas = [require_number(value, "sensitivity.beta") for value in betas]
+    if any(value < 0 or value > 1 for value in betas):
+        raise ValueError("sensitivity beta must lie in [0, 1]")
     _unique(sensitivity_seeds, "sensitivity.seeds")
     _unique(etas, "sensitivity.etas")
     _unique(betas, "sensitivity.betas")
@@ -1817,9 +1817,9 @@ def write_development_beta_selection(
         or not development_seeds
     ):
         raise RuntimeError("beta-development boundary is incomplete")
-    candidates = [require_number(value, "development beta", positive=True) for value in candidate_values]
-    if len(set(candidates)) != 5 or any(value > 1.0 for value in candidates):
-        raise RuntimeError("beta-development candidates must be five unique values in (0,1]")
+    candidates = [require_number(value, "development beta") for value in candidate_values]
+    if len(set(candidates)) != 5 or any(value < 0.0 or value > 1.0 for value in candidates):
+        raise RuntimeError("beta-development candidates must be five unique values in [0,1]")
     expected_seeds = {
         require_int(value, "development seed", positive=False)
         for value in development_seeds

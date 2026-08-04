@@ -28,8 +28,12 @@ from paper_repro.full_slaclip_campaign import (
 REPOSITORY = Path(__file__).resolve().parents[1]
 SPEC = REPOSITORY / "hpc" / "full-slaclip-campaign-spec.json"
 BETA5_SPEC = REPOSITORY / "hpc" / "full-slaclip-beta5-screen-spec.json"
+K5_RANGE_SPEC = REPOSITORY / "hpc" / "full-slaclip-k5-baseline-range-spec.json"
 SLURM_WORKER = REPOSITORY / "hpc" / "full_slaclip_campaign.sbatch"
 BETA5_SUBMITTER = REPOSITORY / "hpc" / "submit_full_slaclip_beta5_screen.sh"
+K5_RANGE_SUBMITTER = (
+    REPOSITORY / "hpc" / "submit_full_slaclip_k5_baseline_range.sh"
+)
 
 
 def test_slurm_worker_exports_required_cuda_determinism_contract() -> None:
@@ -198,10 +202,72 @@ def test_beta5_submitter_uses_two_l4_lanes_and_development_spec() -> None:
     assert "slaclip_q" not in submitter.lower()
 
 
+def test_k5_baseline_range_screen_is_full_slaclip_only_and_pre_registered() -> None:
+    spec = load_spec(K5_RANGE_SPEC)
+    arms = expand_spec(spec)
+    assert len(arms) == 30
+    assert Counter(arm["family"] for arm in arms) == {
+        "primary": 10,
+        "sensitivity": 20,
+    }
+    assert Counter(arm["method"] for arm in arms) == {
+        "paper_dp_lora": 5,
+        "slaclip_dp_lora": 25,
+    }
+    adaptive = [arm for arm in arms if arm["method"] == FULL_SLACLIP_METHOD]
+    candidates = {0.0, 0.19, 0.38, 0.57, 0.76}
+    assert {
+        arm["slaclip_base_target_clipped_fraction"] for arm in adaptive
+    } == candidates
+    assert {arm["slaclip_beta"] for arm in adaptive} == candidates
+    assert all(arm["slaclip_num_slots"] == 5 for arm in adaptive)
+    assert all(arm["num_clients"] == 5 for arm in arms)
+    assert all(arm["noise_multiplier"] == 2.0 for arm in arms)
+    assert all("slaclip_q" not in arm["method"].lower() for arm in arms)
+
+    boundary = spec["scientific_boundary"]
+    calibration = boundary["baseline_calibration"]
+    assert boundary["candidate_base_target_clipped_fractions"] == [
+        0.0,
+        0.19,
+        0.38,
+        0.57,
+        0.76,
+    ]
+    assert "remaining non-small-gradient mass" in boundary["beta_semantics"]
+    assert calibration["metric"] == "any_group_clipped_fraction"
+    assert calibration["bert_roundwise_mean_min"] == 0.0
+    assert calibration["bert_roundwise_mean_max"] == 0.76
+    assert len(calibration["source_round_summaries_sha256"]) == 10
+    assert all(
+        len(value) == 64
+        for value in calibration["source_round_summaries_sha256"].values()
+    )
+    assert calibration["gpt2_degenerate_interval"] is True
+    assert calibration["gpt2_grid_role"] == (
+        "cross_model_exploration_only_not_within_model_calibration"
+    )
+    assert boundary["expected_normalized_cdf_endpoint_noise_std"] == 2.0
+
+
+def test_k5_range_submitter_uses_two_l4_lanes_and_right_sized_resources() -> None:
+    submitter = K5_RANGE_SUBMITTER.read_text(encoding="utf-8")
+    assert (
+        "DPLORA_FULL_SPEC_RELATIVE=hpc/full-slaclip-k5-baseline-range-spec.json"
+        in submitter
+    )
+    assert "DPLORA_FULL_GPU_GRES=gpu:l4swarm:2" in submitter
+    assert "DPLORA_FULL_PARTITION=scavenger_l4" in submitter
+    assert "DPLORA_FULL_HOST_MEMORY=24G" in submitter
+    assert "DPLORA_FULL_LANE_MEMORY=12G" in submitter
+    assert "DPLORA_FULL_WALLTIME=01:00:00" in submitter
+    assert "slaclip_q" not in submitter.lower()
+
+
 def test_beta5_development_selection_is_per_model_and_explicitly_not_test(
     tmp_path: Path,
 ) -> None:
-    candidates = [0.01, 0.03, 0.066, 0.146, 0.5]
+    candidates = [0.0, 0.03, 0.066, 0.146, 0.5]
     seeds = [52, 53]
     runtime = {
         "campaign_name": "test-beta5",

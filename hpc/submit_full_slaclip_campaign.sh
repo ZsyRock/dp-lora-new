@@ -33,10 +33,9 @@ Important overrides:
   DPLORA_FULL_WALLTIME        walltime (default: 2-12:00:00)
   DPLORA_FULL_JOB_NAME        safe Slurm job name
 
-The confirmatory paper setting fixes K_clients=5, T=50, B=8, sigma=2,
-lr=5e-4, rank=512, K_slots=15, and full SlaClip C bounds [0.1, 50].
-Pre-registered sensitivity arms vary sigma and client count while retaining
-K_slots=15. Exact gradient/CDF diagnostics are non-DP private artifacts.
+The checked-in specification fixes the clients, rounds, batch size, privacy
+noise, optimizer, LoRA rank, SlaClip slot count, and threshold bounds for a
+campaign. Exact gradient/CDF diagnostics are non-DP private artifacts.
 USAGE
 }
 

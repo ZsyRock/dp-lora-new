@@ -1,0 +1,204 @@
+{
+  "schema_version": 1,
+  "campaign_name": "full_slaclip_k5_baseline_range_beta5_meddialog_development_v1",
+  "description": "K=5 full-SlaClip development screen over five base target clipped fractions calibrated from the matched C=10 BERT baseline trajectory; GPT-2 uses the same grid as an explicitly labelled cross-model exploration because its own baseline clipping interval is degenerate at zero.",
+  "expected_arm_count": 30,
+  "common": {
+    "models": [
+      "bert",
+      "gpt2"
+    ],
+    "num_clients": 5,
+    "rounds": 50,
+    "batch_size": 8,
+    "noise_multiplier": 2.0,
+    "learning_rate": 0.0005,
+    "rank": 512,
+    "max_seq_length": 128,
+    "max_validation_records": 512,
+    "eval_every": 10,
+    "checkpoint_every": 10,
+    "data_split_seed": 1729,
+    "evaluation_seed": 2718,
+    "delta": 0.00001,
+    "slaclip_num_slots": 5,
+    "slaclip_c_min": 0.1,
+    "slaclip_c_max": 50.0,
+    "default_eta": 0.2,
+    "default_beta": 0.38
+  },
+  "primary": {
+    "initial_clip_norms": [
+      10.0
+    ],
+    "seeds": [
+      52,
+      53,
+      54,
+      55,
+      56
+    ],
+    "methods": [
+      "paper_dp_lora",
+      "slaclip_dp_lora"
+    ]
+  },
+  "threshold_robustness": {
+    "initial_clip_norms": [],
+    "seeds": [],
+    "methods": [
+      "paper_dp_lora",
+      "slaclip_dp_lora"
+    ]
+  },
+  "sensitivity": {
+    "initial_clip_norm": 10.0,
+    "seeds": [
+      52,
+      53,
+      54,
+      55,
+      56
+    ],
+    "etas": [
+      0.2
+    ],
+    "betas": [
+      0.0,
+      0.19,
+      0.38,
+      0.57,
+      0.76
+    ],
+    "method": "slaclip_dp_lora",
+    "exclude_primary_default": true
+  },
+  "noise_sensitivity": {
+    "initial_clip_norm": 10.0,
+    "seeds": [],
+    "noise_multipliers": [],
+    "methods": [
+      "paper_dp_lora",
+      "slaclip_dp_lora"
+    ]
+  },
+  "client_sensitivity": {
+    "initial_clip_norm": 10.0,
+    "seeds": [],
+    "num_clients": [],
+    "methods": [
+      "paper_dp_lora",
+      "slaclip_dp_lora"
+    ]
+  },
+  "controls": {
+    "initial_clip_norm": 10.0,
+    "seeds": [],
+    "methods": [
+      "no_dp_lora_control",
+      "clip_only_control"
+    ]
+  },
+  "scientific_boundary": {
+    "claim_level": 1,
+    "analysis_role": "development_hyperparameter_screen_not_confirmatory_test",
+    "training_dataset": "MedDialog_HealthcareMagic_plus_iCliniq_public_reconstruction",
+    "models": [
+      "bert-base-uncased",
+      "gpt2-small"
+    ],
+    "paper_result_reproduced": false,
+    "paper_benchmarks_evaluated": false,
+    "external_test_set_used_for_selection": false,
+    "end_to_end_dp_certified": false,
+    "exact_diagnostics_privacy_label": "NON_DP_PRIVATE_DIAGNOSTIC",
+    "controller_family": "full_SlaClip_two_noisy_CDF_endpoints_only",
+    "excluded_method_family": "SlaClip-Q_and_all_fixed-target-quantile-controllers",
+    "base_target_clipped_fraction_symbol": "beta",
+    "beta_semantics": "conditional clipped fraction of the remaining non-small-gradient mass; beta is not the unclipped fraction and is not the realized overall clipping fraction",
+    "candidate_base_target_clipped_fractions": [
+      0.0,
+      0.19,
+      0.38,
+      0.57,
+      0.76
+    ],
+    "target_semantics": "round_target_clipped_fraction=clip(beta*(1-s_hat[K-1]/(C_t+1e-6)),0,1)",
+    "target_grid_rule": "five equally spaced endpoints over the non-degenerate BERT any-group fixed-C10 baseline roundwise-seed-mean clipping interval; this is a range grid matching the user's example, not an empirical quantile grid",
+    "group_target_policy": "the same beta is applied independently to the LoRA A and B controllers; the grid uses the campaign-level any-group metric, which equals B for this BERT baseline because every A clipping event is also a B clipping event",
+    "baseline_calibration": {
+      "source_campaign": "full-slaclip-beta5-37364f5-20260730T212106Z",
+      "source_slurm_job_id": "1344958",
+      "source_repository_sha": "37364f5a792b321016edb9485af799a25a73042d",
+      "source_runtime_manifest_sha256": "5885ed25637c6a07d6b126e31facc4b7056f6c0c7127fb98f0d1c2e9de6a727d",
+      "source_campaign_summary_sha256": "d31473b5579528b585bc427ef5a74f3a633f2ca484f82a7409b815550f7edfec",
+      "source_round_summaries_sha256": {
+        "bert_seed_52": "61d022bebfb627825d87345593d5e5b0b092cd40aa29956abe5375940393cc3e",
+        "bert_seed_53": "df0b374c1c5130c8379b4910f8eb7d345609764504f643181678342aa349ddc4",
+        "bert_seed_54": "64b0ece8480c0093c35c94bb9640a90dec283072c006a4103d53dfc5a89355ea",
+        "bert_seed_55": "2f473bfde0fbbf59a05d59de187098d56a874be07eb3fc72eaef40e10df60a9c",
+        "bert_seed_56": "1f6b04f31c93165741280562c16d627fbef36ad5d3e2b37807a9c43026255a8c",
+        "gpt2_seed_52": "988b61623df984dd9c6646da22bea2875d63c1aa3a5410811ef341dddc3f5a7d",
+        "gpt2_seed_53": "265496c7dc3d69b92e38e9ed55a027006e1a1d52d2c4cc1a98b7059cc5b7f650",
+        "gpt2_seed_54": "9536058576132d2d4f28e65c011383c932bed3bf026850aaa9f77d4fe97baa6d",
+        "gpt2_seed_55": "992ef14fd10dcbea4d0ac9f2d83b7ca995f634daa8246d3ba3391cbd44ab16af",
+        "gpt2_seed_56": "29d108ee0a26128ae38c1aa0f57570ec74107bac5c6dceb78c2fe02dfbaf6855"
+      },
+      "method": "paper_dp_lora",
+      "initial_clip_norm": 10.0,
+      "models": [
+        "bert",
+        "gpt2"
+      ],
+      "seeds": [
+        52,
+        53,
+        54,
+        55,
+        56
+      ],
+      "rounds": 50,
+      "metric": "any_group_clipped_fraction",
+      "aggregation": "mean over five matched seeds separately at each round",
+      "bert_round_1": 0.0,
+      "bert_round_50": 0.76,
+      "bert_roundwise_mean_min": 0.0,
+      "bert_roundwise_mean_max": 0.76,
+      "gpt2_round_1": 0.0,
+      "gpt2_round_50": 0.0,
+      "gpt2_roundwise_mean_min": 0.0,
+      "gpt2_roundwise_mean_max": 0.0,
+      "gpt2_degenerate_interval": true,
+      "gpt2_grid_role": "cross_model_exploration_only_not_within_model_calibration"
+    },
+    "fixed_controller_values": {
+      "initial_clip_norm": 10.0,
+      "eta": 0.2,
+      "num_slots": 5,
+      "c_min": 0.1,
+      "c_max": 50.0
+    },
+    "development_seeds": [
+      52,
+      53,
+      54,
+      55,
+      56
+    ],
+    "selection_unit": "select_base_target_clipped_fraction_separately_for_each_model",
+    "selection_primary_metric": "mean_paired_final_internal_validation_loss_delta_vs_fixed_C10",
+    "selection_tiebreakers": [
+      "mean_paired_normalized_internal_validation_loss_AUC_delta",
+      "lower_controller_bound_hit_and_clamp_rate",
+      "smaller_base_target_clipped_fraction"
+    ],
+    "reporting_rule": "report all five target curves and matched baselines; BERT is the baseline-range-calibrated analysis, GPT-2 is exploratory; any selected value must later be frozen before independent confirmation",
+    "k5_policy": "user_requested_SlaClip_slack_dimension_K_equals_5_while_num_clients_remains_5",
+    "expected_normalized_cdf_endpoint_noise_std": 2.0,
+    "fixed_evaluation_protocol": {
+      "data_split_seed": 1729,
+      "evaluation_seed": 2718,
+      "holdout_records": 512
+    }
+  }
+}
