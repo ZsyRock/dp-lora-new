@@ -1,0 +1,198 @@
+{
+  "schema_version": 1,
+  "campaign_name": "full_slaclip_k5_tuned_fixed_three_stage_confirmation_v1",
+  "description": "One-allocation three-stage study: tune fixed C and record its clipping trajectory, derive and screen five conditional full-SlaClip beta targets with three local initial thresholds, then compare one frozen configuration per model against the strongest tuned fixed baseline on twenty disjoint training seeds.",
+  "expected_stage_arm_counts": {
+    "fixed_development": 130,
+    "slaclip_development": 150,
+    "confirmation": 80,
+    "total": 360
+  },
+  "common": {
+    "models": [
+      "bert",
+      "gpt2"
+    ],
+    "num_clients": 5,
+    "rounds": 50,
+    "batch_size": 8,
+    "noise_multiplier": 2.0,
+    "learning_rate": 0.0005,
+    "rank": 512,
+    "max_seq_length": 128,
+    "max_validation_records": 512,
+    "eval_every": 10,
+    "checkpoint_every": 25,
+    "data_split_seed": 1729,
+    "evaluation_seed": 2718,
+    "delta": 0.00001,
+    "slaclip_num_slots": 5,
+    "slaclip_c_min": 0.1,
+    "slaclip_c_max": 50.0,
+    "slaclip_eta": 0.2,
+    "slaclip_endpoint_epsilon": 0.000001
+  },
+  "fixed_development": {
+    "method": "paper_dp_lora",
+    "clip_norm_grid": [
+      0.1,
+      0.3,
+      0.5,
+      0.75,
+      1.0,
+      1.5,
+      2.0,
+      2.5,
+      3.0,
+      4.0,
+      5.0,
+      7.0,
+      10.0
+    ],
+    "seeds": [
+      110,
+      111,
+      112,
+      113,
+      114
+    ],
+    "selection_rule": [
+      "lowest_mean_final_internal_validation_loss",
+      "lowest_mean_normalized_internal_validation_loss_auc",
+      "lowest_final_loss_sample_std",
+      "smaller_fixed_C"
+    ]
+  },
+  "slaclip_development": {
+    "method": "slaclip_dp_lora",
+    "seeds": [
+      110,
+      111,
+      112,
+      113,
+      114
+    ],
+    "initial_C_policy": "selected_fixed_C_and_immediate_grid_neighbours",
+    "beta_derivation": {
+      "calibration_group": "B",
+      "actual_clipped_fraction_field": "B.clipped_fraction",
+      "exact_near_zero_formula": "z=exact_normalized_slack_endpoint_K/(C+epsilon)",
+      "conditional_beta_formula": "beta_t=p_t/(1-z_t)",
+      "quantile_interval": [
+        0.1,
+        0.9
+      ],
+      "num_points": 5,
+      "degenerate_interval_policy": "fail_closed"
+    },
+    "selection_rule": [
+      "lowest_mean_paired_final_loss_delta_vs_selected_fixed_C",
+      "lowest_mean_paired_normalized_loss_auc_delta",
+      "fewest_controller_instability_events",
+      "smaller_beta",
+      "smaller_initial_C"
+    ]
+  },
+  "confirmation": {
+    "methods": [
+      "paper_dp_lora",
+      "slaclip_dp_lora"
+    ],
+    "seeds": [
+      200,
+      201,
+      202,
+      203,
+      204,
+      205,
+      206,
+      207,
+      208,
+      209,
+      210,
+      211,
+      212,
+      213,
+      214,
+      215,
+      216,
+      217,
+      218,
+      219
+    ],
+    "primary_metric": "final_internal_validation_loss",
+    "multiplicity": "Holm_across_two_models",
+    "success_rule": {
+      "mean_SlaClip_minus_fixed_below_zero": true,
+      "paired_two_sided_95pct_CI_upper_below_zero": true,
+      "holm_alpha": 0.05,
+      "normalized_loss_auc_not_worse": true,
+      "minimum_seed_win_fraction": 0.7
+    }
+  },
+  "scientific_boundary": {
+    "claim_level": 1,
+    "analysis_role": "development_selection_then_disjoint_training_seed_confirmation_not_external_test_evidence",
+    "training_dataset": "MedDialog_HealthcareMagic_plus_iCliniq_public_reconstruction",
+    "models": [
+      "bert-base-uncased",
+      "gpt2-small"
+    ],
+    "controller_family": "full_SlaClip_two_noisy_CDF_endpoints_K5_only",
+    "excluded_method_family": "SlaClip-Q_and_all_fixed-target-quantile-controllers",
+    "beta_semantics": "conditional clipped fraction of remaining non-small-gradient mass",
+    "round_target_semantics": "clip(beta*(1-s_hat[K-1]/(C_t+1e-6)),0,1)",
+    "development_seeds": [
+      110,
+      111,
+      112,
+      113,
+      114
+    ],
+    "confirmation_seeds": [
+      200,
+      201,
+      202,
+      203,
+      204,
+      205,
+      206,
+      207,
+      208,
+      209,
+      210,
+      211,
+      212,
+      213,
+      214,
+      215,
+      216,
+      217,
+      218,
+      219
+    ],
+    "confirmation_seeds_disjoint_from_development": true,
+    "selection_lock_policy": "both model-specific selections are atomically frozen and hash-bound before any confirmation arm is materialized",
+    "paper_default_fixed_C_anchor": 10.0,
+    "paper_result_reproduced": false,
+    "paper_benchmarks_evaluated": false,
+    "external_test_set_used": false,
+    "end_to_end_dp_certified": false,
+    "exact_diagnostics_privacy_label": "NON_DP_PRIVATE_DIAGNOSTIC",
+    "fixed_evaluation_protocol": {
+      "data_split_seed": 1729,
+      "evaluation_seed": 2718,
+      "holdout_records": 512,
+      "evaluation_rounds": [
+        0,
+        10,
+        20,
+        30,
+        40,
+        50
+      ]
+    },
+    "reporting_rule": "report every fixed-C and full-SlaClip development candidate, both boundary-hit flags, all confirmation seeds, paired confidence intervals, exact sign-flip tests, and Holm-adjusted primary p-values",
+    "journal_boundary": "confirmation isolates training randomness only because all arms retain the same internal LM-loss holdout; downstream benchmark accuracy, EM/F1, ROUGE-L, and independently certified equal-privacy evaluation remain future work"
+  }
+}

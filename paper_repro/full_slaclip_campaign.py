@@ -16,12 +16,12 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import io
 import json
 import math
 import os
 import platform
 import secrets
-import shutil
 import signal
 import socket
 import stat
@@ -32,6 +32,21 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+try:
+    from paper_repro.durable_io import (
+        atomic_write_bytes as durable_atomic_write_bytes,
+        atomic_write_text,
+        fsync_directory,
+        fsync_fd,
+    )
+except ModuleNotFoundError:  # Support direct ``python paper_repro/...py`` use.
+    from durable_io import (  # type: ignore[no-redef]
+        atomic_write_bytes as durable_atomic_write_bytes,
+        atomic_write_text,
+        fsync_directory,
+        fsync_fd,
+    )
 
 
 SCHEMA_VERSION = 1
@@ -134,22 +149,7 @@ def sha256_file(path: Path) -> str:
 
 def atomic_bytes(path: Path, value: bytes, *, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
-    descriptor = os.open(
-        temporary,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-        mode,
-    )
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(value)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        os.chmod(path, mode)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    durable_atomic_write_bytes(path, value, mode=mode)
 
 
 def atomic_json(path: Path, value: Any) -> None:
@@ -889,17 +889,12 @@ def validate_or_create_key(path: Path, *, create: bool) -> None:
             with os.fdopen(descriptor, "wb") as handle:
                 handle.write(secrets.token_bytes(CAMPAIGN_KEY_BYTES))
                 handle.flush()
-                os.fsync(handle.fileno())
-            directory_descriptor = os.open(
-                path.parent,
-                os.O_RDONLY
-                | getattr(os, "O_DIRECTORY", 0)
-                | getattr(os, "O_CLOEXEC", 0),
-            )
-            try:
-                os.fsync(directory_descriptor)
-            finally:
-                os.close(directory_descriptor)
+                fsync_fd(
+                    handle.fileno(),
+                    path=path,
+                    operation="fsync_campaign_private_key",
+                )
+            fsync_directory(path.parent)
         except BaseException:
             if path.exists():
                 path.unlink()
@@ -2053,15 +2048,11 @@ AGGREGATED_METRICS = (
 
 def atomic_csv(path: Path, rows: Sequence[Mapping[str, Any]], columns: Sequence[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
-    with temporary.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(columns), extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
-    os.chmod(path, 0o600)
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=list(columns), extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(rows)
+    atomic_write_text(path, buffer.getvalue(), mode=0o600)
 
 
 def _finite_values(rows: Sequence[Mapping[str, Any]], key: str) -> list[float]:
@@ -3381,6 +3372,19 @@ def _archive_candidate(path: Path, root: Path) -> bool:
         "oracle_vs_noisy_paired_metrics.csv",
         "oracle_vs_noisy_paired_aggregate_metrics.csv",
         "development_beta_selection.json",
+        # Three-stage tuned-fixed/full-SlaClip campaign control plane and
+        # compact journal-facing result tables.  These files are immutable or
+        # atomically regenerated and must survive scratch loss/resubmission.
+        "preflight-runtime-manifest.json",
+        "stage2-runtime-manifest.json",
+        "stage3-runtime-manifest.json",
+        "fixed-selection.lock.json",
+        "slaclip-selection.lock.json",
+        "fixed_beta_calibration.csv",
+        "fixed_trajectory.csv",
+        "slaclip_trajectory.csv",
+        "confirmation_paired_metrics.csv",
+        "confirmation_aggregate_metrics.csv",
     }:
         return True
     if relative.parts[0] == "arm-status" and relative.suffix == ".json":
@@ -3421,10 +3425,9 @@ def archive_small(args: argparse.Namespace) -> None:
         if destination_path.exists() and sha256_file(destination_path) == sha256_file(source_path):
             pass
         else:
-            temporary = destination_path.with_name(f".{destination_path.name}.tmp.{os.getpid()}")
-            shutil.copyfile(source_path, temporary)
-            os.chmod(temporary, 0o600)
-            os.replace(temporary, destination_path)
+            durable_atomic_write_bytes(
+                destination_path, source_path.read_bytes(), mode=0o600
+            )
         copied.append(
             {
                 "path": relative.as_posix(),

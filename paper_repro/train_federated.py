@@ -42,6 +42,11 @@ try:
         load_latest_checkpoint,
         write_checkpoint,
     )
+    from paper_repro.durable_io import (
+        atomic_write_text,
+        fsync_directory,
+        fsync_fd,
+    )
     from paper_repro.reproducibility import (
         METHOD_SPECS,
         canonical_json_fingerprint,
@@ -67,6 +72,11 @@ except ModuleNotFoundError:  # Support direct ``python paper_repro/...py`` use.
         archive_round_shards_after,
         load_latest_checkpoint,
         write_checkpoint,
+    )
+    from durable_io import (  # type: ignore[no-redef]
+        atomic_write_text,
+        fsync_directory,
+        fsync_fd,
     )
     from reproducibility import (  # type: ignore[no-redef]
         METHOD_SPECS,
@@ -188,17 +198,6 @@ def json_default(value: Any) -> Any:
     raise TypeError(f"cannot JSON encode {type(value).__name__}")
 
 
-def fsync_directory(path: Path) -> None:
-    descriptor = os.open(
-        path,
-        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
-    )
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
 def validate_private_directory(path: Path, description: str = "private directory") -> None:
     metadata = path.lstat()
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
@@ -251,7 +250,7 @@ def write_new_private_text(path: Path, value: str) -> None:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(value)
             handle.flush()
-            os.fsync(handle.fileno())
+            fsync_fd(handle.fileno(), path=path, operation="fsync_private_text")
     except BaseException:
         path.unlink(missing_ok=True)
         raise
@@ -288,7 +287,6 @@ def acquire_run_lock(output_dir: Path) -> Any:
 def atomic_json(path: Path, value: Any) -> None:
     if os.path.lexists(path):
         validate_private_regular_file(path, "existing JSON output")
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     encoded = (
         json.dumps(
             value,
@@ -300,49 +298,23 @@ def atomic_json(path: Path, value: Any) -> None:
         )
         + "\n"
     )
-    try:
-        descriptor = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
-            0o600,
-        )
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        fsync_directory(path.parent)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_text(path, encoded, mode=0o600)
 
 
 def atomic_jsonl(path: Path, values: Sequence[dict[str, Any]]) -> None:
     if os.path.lexists(path):
         validate_private_regular_file(path, "existing JSONL output")
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        descriptor = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
-            0o600,
+    encoded = "".join(
+        json.dumps(
+            value,
+            sort_keys=True,
+            default=json_default,
+            allow_nan=False,
         )
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            for value in values:
-                handle.write(
-                    json.dumps(
-                        value,
-                        sort_keys=True,
-                        default=json_default,
-                        allow_nan=False,
-                    )
-                    + "\n"
-                )
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        fsync_directory(path.parent)
-    finally:
-        temporary.unlink(missing_ok=True)
+        + "\n"
+        for value in values
+    )
+    atomic_write_text(path, encoded, mode=0o600)
 
 
 def sha256_file(path: Path) -> str:
@@ -517,7 +489,11 @@ def save_final_adapter_atomically(
                 os.chmod(path, 0o600)
                 validate_private_regular_file(path, "generated adapter file")
                 with path.open("rb") as handle:
-                    os.fsync(handle.fileno())
+                    fsync_fd(
+                        handle.fileno(),
+                        path=path,
+                        operation="fsync_final_adapter_file",
+                    )
             else:
                 raise RuntimeError(f"generated adapter contains an unsafe path: {path}")
         fsync_directory(temporary)

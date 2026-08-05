@@ -23,9 +23,9 @@ bit-for-bit reproduction.  Exact client batch losses and gradient statistics
 are labelled `NON_DP_PRIVATE_DIAGNOSTIC`.
 
 The executable is `paper_repro/train_federated.py`; immutable input staging is
-implemented in `scripts/stage_paper_inputs.py`.  The checked-in single-job
-Iridis campaign entry points are `hpc/submit_full_slaclip_campaign.sh` and
-`hpc/full_slaclip_campaign.sbatch`.
+implemented in `scripts/stage_paper_inputs.py`.  The tuned-fixed confirmation
+study is launched by `hpc/submit_staged_slaclip_tuned_fixed.sh`; the older
+general campaign remains available through `hpc/submit_full_slaclip_campaign.sh`.
 
 ## What a completed run proves
 
@@ -106,6 +106,33 @@ the private round shards, checkpoint prefix, trainer state, consolidated logs,
 final adapter and final summaries all reconcile.
 
 ## Iridis Slurm entry points
+
+The current fair-baseline study is declared by
+`hpc/staged-slaclip-tuned-fixed-spec.json` and coordinated by
+`paper_repro/staged_slaclip_campaign.py`.  One Slurm allocation executes three
+ordered stages without an array or child job:
+
+1. 13 fixed thresholds, five development seeds, and both models (130
+   model-level arms), with complete per-round clipping trajectories;
+2. three model-specific initial thresholds crossed with five conditional
+   full-SlaClip base targets and the same development seeds (150 arms); and
+3. the locked best fixed and full-SlaClip configurations on twenty disjoint
+   confirmation seeds per model (80 arms).
+
+The five base targets are derived separately for each model from the selected
+fixed-C trajectory.  For every development round, the calibration computes
+`z_t = s_exact[K-1] / (C + 1e-6)` and
+`beta_t = p_clipped,t / (1 - z_t)`, then takes five equally spaced values over
+the empirical q10--q90 interval.  These exact calibration values are
+`NON_DP_PRIVATE_DIAGNOSTIC`; they are a development procedure, not a claim of
+end-to-end private hyperparameter tuning.  Both selections are hash-bound
+before the next stage is materialized, and confirmation uses seeds `200..219`
+that are absent from development.
+
+The staged wrapper defaults to one 12-hour `scavenger_4a100` allocation with
+two A100 lanes.  Completed arms, round checkpoints, selection locks, and the
+compact result archive are reusable with the same `DPLORA_STAGED_RUN_ID` and
+`--resume` if the preemptible partition cancels the allocation.
 
 `hpc/submit_full_slaclip_campaign.sh` submits
 `hpc/full_slaclip_campaign.sbatch` as one Slurm job on one node.  Inside that

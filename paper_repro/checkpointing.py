@@ -22,6 +22,19 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
+try:
+    from paper_repro.durable_io import (
+        atomic_write_text,
+        fsync_directory as _fsync_directory,
+        fsync_fd,
+    )
+except ModuleNotFoundError:  # Support direct ``python paper_repro/...py`` use.
+    from durable_io import (  # type: ignore[no-redef]
+        atomic_write_text,
+        fsync_directory as _fsync_directory,
+        fsync_fd,
+    )
+
 
 @dataclass(frozen=True)
 class LoadedCheckpoint:
@@ -40,26 +53,8 @@ def _sha256(path: Path) -> str:
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     encoded = json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n"
-    try:
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    atomic_write_text(path, encoded, mode=0o600)
 
 
 def _validate_private_path(path: Path, *, directory: bool, mode: int) -> os.stat_result:
@@ -207,7 +202,11 @@ def _copy_private_file(
         destination_metadata = os.fstat(destination_descriptor)
         if destination_metadata.st_size != finished_source_metadata.st_size:
             raise RuntimeError(f"round diagnostic copy is incomplete: {source_path}")
-        os.fsync(destination_descriptor)
+        fsync_fd(
+            destination_descriptor,
+            path=destination_path,
+            operation="fsync_archived_round_diagnostic",
+        )
         _validate_private_metadata(
             destination_metadata,
             destination_path,
@@ -280,7 +279,11 @@ def write_checkpoint(
         )
         os.chmod(tensor_path, 0o600)
         with tensor_path.open("rb") as handle:
-            os.fsync(handle.fileno())
+            fsync_fd(
+                handle.fileno(),
+                path=tensor_path,
+                operation="fsync_checkpoint_tensor",
+            )
         tensor_sha = _sha256(tensor_path)
         payload = dict(trainer_state)
         payload.update(
@@ -572,7 +575,11 @@ def archive_round_shards_after(
                         destination_directory_fd=staging_descriptor,
                         destination_path=staging_path / path.name,
                     )
-                os.fsync(staging_descriptor)
+                fsync_fd(
+                    staging_descriptor,
+                    path=staging_path,
+                    operation="fsync_round_archive_staging_directory",
+                )
                 try:
                     os.stat(
                         archive_name,
@@ -593,7 +600,11 @@ def archive_round_shards_after(
                     dst_dir_fd=superseded_descriptor,
                 )
                 archive_published = True
-                os.fsync(superseded_descriptor)
+                fsync_fd(
+                    superseded_descriptor,
+                    path=superseded,
+                    operation="fsync_superseded_round_archive_directory",
+                )
 
                 archive = superseded / archive_name
                 _validate_private_path(archive, directory=True, mode=0o700)
@@ -642,7 +653,11 @@ def archive_round_shards_after(
                     os.unlink(path.name, dir_fd=rounds_descriptor)
                     target = archive / path.name
                     moved.append(target)
-                os.fsync(rounds_descriptor)
+                fsync_fd(
+                    rounds_descriptor,
+                    path=rounds_directory,
+                    operation="fsync_round_diagnostics_directory",
+                )
                 return moved
             except BaseException:
                 if not archive_published:
@@ -663,13 +678,21 @@ def archive_round_shards_after(
                             mode=0o600,
                         )
                         os.unlink(name, dir_fd=staging_descriptor)
-                    os.fsync(staging_descriptor)
+                    fsync_fd(
+                        staging_descriptor,
+                        path=staging_path,
+                        operation="fsync_failed_round_archive_staging_cleanup",
+                    )
                 raise
             finally:
                 os.close(staging_descriptor)
                 if not archive_published:
                     os.rmdir(staging_name, dir_fd=superseded_descriptor)
-                    os.fsync(superseded_descriptor)
+                    fsync_fd(
+                        superseded_descriptor,
+                        path=superseded,
+                        operation="fsync_failed_round_archive_directory_cleanup",
+                    )
         finally:
             os.close(superseded_descriptor)
     finally:

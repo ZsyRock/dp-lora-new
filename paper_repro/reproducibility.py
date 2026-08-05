@@ -21,6 +21,11 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 
+try:
+    from paper_repro.durable_io import fsync_directory, fsync_fd
+except ModuleNotFoundError:  # Support direct ``python paper_repro/...py`` use.
+    from durable_io import fsync_directory, fsync_fd  # type: ignore[no-redef]
+
 
 PRIVATE_KEY_BYTES = 32
 PRIVATE_DIRECTORY_MODE = 0o700
@@ -168,17 +173,6 @@ def load_private_key(path: str | os.PathLike[str]) -> bytes:
     return key
 
 
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(
-        path,
-        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
-    )
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
 def create_private_key(path: str | os.PathLike[str]) -> bytes:
     """Atomically create a new private 32-byte key without overwriting a file."""
 
@@ -199,10 +193,14 @@ def create_private_key(path: str | os.PathLike[str]) -> bytes:
             if written <= 0:
                 raise OSError("failed to write private key")
             pending = pending[written:]
-        os.fsync(descriptor)
+        fsync_fd(
+            descriptor,
+            path=key_path,
+            operation="fsync_reproducibility_private_key",
+        )
     finally:
         os.close(descriptor)
-    _fsync_directory(key_path.parent)
+    fsync_directory(key_path.parent)
     return key
 
 
