@@ -21,10 +21,10 @@ Important overrides:
   DPLORA_STAGED_SCRATCH_ROOT
   DPLORA_STAGED_ARCHIVE_ROOT
   DPLORA_STAGED_ACCOUNT             default: normal
-  DPLORA_STAGED_PARTITION           default: scavenger_4a100
-  DPLORA_STAGED_GPU_GRES            default: gpu:a100swarm:2
+  DPLORA_STAGED_PARTITION           default: scavenger_l4
+  DPLORA_STAGED_GPU_GRES            default: gpu:l4swarm:1
   DPLORA_STAGED_CPUS_PER_TASK       default: 4
-  DPLORA_STAGED_HOST_MEMORY         default: 24G
+  DPLORA_STAGED_HOST_MEMORY         default: 12G
   DPLORA_STAGED_LANE_MEMORY         default: 12G
   DPLORA_STAGED_WALLTIME            default: 12:00:00
 
@@ -217,10 +217,10 @@ mkdir -p "$run_root/slurm" "$archive_base" "$private_key_root"
 chmod 700 "$run_root" "$run_root/slurm" "$archive_base" "$private_key_root"
 
 account="${DPLORA_STAGED_ACCOUNT:-normal}"
-partition="${DPLORA_STAGED_PARTITION:-scavenger_4a100}"
-gpu_gres="${DPLORA_STAGED_GPU_GRES:-gpu:a100swarm:2}"
+partition="${DPLORA_STAGED_PARTITION:-scavenger_l4}"
+gpu_gres="${DPLORA_STAGED_GPU_GRES:-gpu:l4swarm:1}"
 cpus_per_task="${DPLORA_STAGED_CPUS_PER_TASK:-4}"
-host_memory="${DPLORA_STAGED_HOST_MEMORY:-24G}"
+host_memory="${DPLORA_STAGED_HOST_MEMORY:-12G}"
 lane_memory="${DPLORA_STAGED_LANE_MEMORY:-12G}"
 walltime="${DPLORA_STAGED_WALLTIME:-12:00:00}"
 job_name="${DPLORA_STAGED_JOB_NAME:-dp-lora-staged-slaclip}"

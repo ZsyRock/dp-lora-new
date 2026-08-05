@@ -129,10 +129,11 @@ end-to-end private hyperparameter tuning.  Both selections are hash-bound
 before the next stage is materialized, and confirmation uses seeds `200..219`
 that are absent from development.
 
-The staged wrapper defaults to one 12-hour `scavenger_4a100` allocation with
-two A100 lanes.  Completed arms, round checkpoints, selection locks, and the
-compact result archive are reusable with the same `DPLORA_STAGED_RUN_ID` and
-`--resume` if the preemptible partition cancels the allocation.
+The staged wrapper defaults to one 12-hour `scavenger_l4` allocation with one
+L4 lane, matching that partition's one-GPU-per-job QoS.  Completed arms, round
+checkpoints, selection locks, and the compact result archive are reusable with
+the same `DPLORA_STAGED_RUN_ID` and `--resume` if the preemptible partition
+cancels the allocation.
 
 `hpc/submit_full_slaclip_campaign.sh` submits
 `hpc/full_slaclip_campaign.sbatch` as one Slurm job on one node.  Inside that

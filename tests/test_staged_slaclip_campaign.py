@@ -403,8 +403,8 @@ def test_worker_is_one_sbatch_without_arrays_or_child_submissions() -> None:
     assert "sbatch " not in worker
     assert "--array" not in submit
     assert submit.count('"$sbatch_bin" "${sbatch_args[@]}" "$worker"') == 1
-    assert "DPLORA_STAGED_PARTITION:-scavenger_4a100" in submit
-    assert "DPLORA_STAGED_GPU_GRES:-gpu:a100swarm:2" in submit
+    assert "DPLORA_STAGED_PARTITION:-scavenger_l4" in submit
+    assert "DPLORA_STAGED_GPU_GRES:-gpu:l4swarm:1" in submit
     assert "DPLORA_STAGED_WALLTIME:-12:00:00" in submit
-    assert 'a100|a100swarm) default_expected_gpu="A100"; default_min_vram_gib=39' in submit
+    assert 'l4|l4swarm) default_expected_gpu="L4"; default_min_vram_gib=20' in submit
     subprocess.run(["bash", "-n", str(WORKER_PATH), str(SUBMIT_PATH)], check=True)
