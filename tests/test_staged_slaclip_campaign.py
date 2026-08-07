@@ -394,10 +394,13 @@ def test_staged_archive_inventory_contains_control_plane(tmp_path: Path) -> None
         "stage2-runtime-manifest.json",
         "stage3-runtime-manifest.json",
         "fixed_beta_calibration.csv",
+        "fixed_groupwise_beta_calibration.csv",
         "fixed_trajectory.csv",
         "slaclip_trajectory.csv",
+        "groupwise_slaclip_trajectory.csv",
         "confirmation_paired_metrics.csv",
         "confirmation_aggregate_metrics.csv",
+        "oracle_vs_noisy_aggregate_metrics.csv",
     }
     for name in names:
         (source / name).write_text("{}\n", encoding="utf-8")

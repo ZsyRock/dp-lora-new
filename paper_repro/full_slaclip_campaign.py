@@ -3680,10 +3680,13 @@ def _archive_candidate(path: Path, root: Path) -> bool:
         "fixed-selection.lock.json",
         "slaclip-selection.lock.json",
         "fixed_beta_calibration.csv",
+        "fixed_groupwise_beta_calibration.csv",
         "fixed_trajectory.csv",
         "slaclip_trajectory.csv",
+        "groupwise_slaclip_trajectory.csv",
         "confirmation_paired_metrics.csv",
         "confirmation_aggregate_metrics.csv",
+        "oracle_vs_noisy_aggregate_metrics.csv",
     }:
         return True
     if relative.parts[0] == "arm-status" and relative.suffix == ".json":
