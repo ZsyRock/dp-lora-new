@@ -12,6 +12,7 @@ from paper_repro.slaclip import (
     full_slaclip_update,
     normalize_noisy_slack,
     resolve_base_target_clipped_fraction,
+    stationary_beta_from_exact_endpoints,
 )
 
 
@@ -222,6 +223,25 @@ class FullSlaClipControllerTests(unittest.TestCase):
         result = self._update(epsilon=0.5)
         self.assertEqual(result["epsilon"], 0.5)
         self.assertAlmostEqual(result["near_zero_adjusted"], 5.0 / 10.5)
+
+    def test_stationary_beta_inversion_uses_the_first_endpoint_not_hard_p(self) -> None:
+        calibration = stationary_beta_from_exact_endpoints(10.0, 0.25, 0.0)
+        self.assertEqual(calibration["stationary_beta"], 0.75)
+        update = full_slaclip_update(
+            10.0,
+            0.25,
+            0.0,
+            beta=calibration["stationary_beta"],
+            eta=0.2,
+            min_clip_norm=0.1,
+            max_clip_norm=50.0,
+        )
+        self.assertEqual(update["controller_error"], 0.0)
+        self.assertEqual(update["next_clip_norm"], 10.0)
+
+    def test_stationary_beta_rejects_non_monotone_exact_endpoints(self) -> None:
+        with self.assertRaisesRegex(ValueError, "0 <= r_exact"):
+            stationary_beta_from_exact_endpoints(10.0, 0.2, 0.3)
 
 
 class SlaClipFailClosedTests(unittest.TestCase):

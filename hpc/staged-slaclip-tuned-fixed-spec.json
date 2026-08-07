@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "campaign_name": "full_slaclip_k5_tuned_fixed_three_stage_confirmation_v1",
-  "description": "One-allocation three-stage study: tune fixed C and record its clipping trajectory, derive and screen five conditional full-SlaClip beta targets with three local initial thresholds, then compare one frozen configuration per model against the strongest tuned fixed baseline on twenty disjoint training seeds.",
+  "description": "One-allocation three-stage study: tune fixed C and record its clipping trajectory, derive and screen five stationary full-SlaClip beta coefficients with three local initial thresholds, then compare one frozen configuration per model against the strongest tuned fixed baseline on twenty disjoint training seeds.",
   "expected_stage_arm_counts": {
     "fixed_development": 130,
     "slaclip_development": 150,
@@ -77,7 +77,7 @@
       "calibration_group": "B",
       "actual_clipped_fraction_field": "B.clipped_fraction",
       "exact_near_zero_formula": "z=exact_normalized_slack_endpoint_K/(C+epsilon)",
-      "conditional_beta_formula": "beta_t=p_t/(1-z_t)",
+      "conditional_beta_formula": "beta_stationary_t=(1-q_exact_t)/(1-z_exact_t)",
       "quantile_interval": [
         0.1,
         0.9
@@ -140,7 +140,7 @@
     ],
     "controller_family": "full_SlaClip_two_noisy_CDF_endpoints_K5_only",
     "excluded_method_family": "SlaClip-Q_and_all_fixed-target-quantile-controllers",
-    "beta_semantics": "conditional clipped fraction of remaining non-small-gradient mass",
+    "beta_semantics": "generalized full-SlaClip coefficient; fixed-trajectory initialization solves gamma_exact=q_exact and is not the raw clipping fraction",
     "round_target_semantics": "clip(beta*(1-s_hat[K-1]/(C_t+1e-6)),0,1)",
     "development_seeds": [
       110,

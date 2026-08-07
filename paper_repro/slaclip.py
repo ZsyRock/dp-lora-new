@@ -389,6 +389,65 @@ def full_slaclip_update(
     }
 
 
+def stationary_beta_from_exact_endpoints(
+    current_clip_norm: Real,
+    exact_cdf_near_threshold: Real,
+    exact_cdf_near_zero: Real,
+    *,
+    epsilon: Real = _ENDPOINT_DENOMINATOR_EPSILON,
+) -> dict[str, float]:
+    """Invert the full controller at a fixed threshold.
+
+    The result is the generalized full-SlaClip coefficient that makes the
+    exact-endpoint controller error zero at the supplied threshold:
+
+    ``beta_stationary = (1 - q_exact) / (1 - r_exact/(C+epsilon))``.
+
+    This is deliberately different from calibrating a declared target to an
+    observed hard clipping fraction.  With finite ``K``, the first slack bin
+    is a CDF surrogate and generally differs from that hard fraction.  Inputs
+    to this helper must be exact (non-noised) diagnostics; a Gaussian endpoint
+    release is unbounded and cannot satisfy these identification checks.
+    """
+
+    current = _positive_real("current_clip_norm", current_clip_norm)
+    q_exact = _finite_real(
+        "exact_cdf_near_threshold", exact_cdf_near_threshold
+    )
+    r_exact = _finite_real("exact_cdf_near_zero", exact_cdf_near_zero)
+    denominator_epsilon = _positive_real("epsilon", epsilon)
+    tolerance = 1e-12
+    if not -tolerance <= r_exact <= q_exact + tolerance <= 1.0 + 2 * tolerance:
+        raise ValueError(
+            "exact slack endpoints must satisfy 0 <= r_exact <= q_exact <= 1"
+        )
+    q_exact = max(0.0, min(1.0, q_exact))
+    r_exact = max(0.0, min(q_exact, r_exact))
+    z_exact = r_exact / (current + denominator_epsilon)
+    one_minus_adjusted_endpoint = 1.0 - z_exact
+    if one_minus_adjusted_endpoint <= tolerance:
+        raise ValueError(
+            "stationary beta is not identifiable because 1-z_exact is zero"
+        )
+    target_clipped_surrogate = 1.0 - q_exact
+    beta_stationary = target_clipped_surrogate / one_minus_adjusted_endpoint
+    if not -tolerance <= beta_stationary <= 1.0 + tolerance:
+        raise ValueError("stationary beta lies outside [0,1]")
+    beta_stationary = max(0.0, min(1.0, beta_stationary))
+    return {
+        "exact_cdf_near_threshold": float(q_exact),
+        "exact_cdf_near_zero": float(r_exact),
+        "near_zero_adjusted": float(z_exact),
+        "one_minus_threshold_adjusted_near_zero_signal": float(
+            one_minus_adjusted_endpoint
+        ),
+        "stationary_target_clipped_surrogate": float(
+            target_clipped_surrogate
+        ),
+        "stationary_beta": float(beta_stationary),
+    }
+
+
 __all__ = [
     "Z_0995",
     "MAX_ABS_LOG_STEP",
@@ -399,4 +458,5 @@ __all__ = [
     "normalize_noisy_slack",
     "resolve_base_target_clipped_fraction",
     "full_slaclip_update",
+    "stationary_beta_from_exact_endpoints",
 ]

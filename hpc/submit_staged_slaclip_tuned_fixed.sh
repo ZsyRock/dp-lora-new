@@ -109,11 +109,11 @@ if [[ ! -x "$python_bin" ]]; then
     exit 1
 fi
 
-worker="$snapshot_repo/hpc/staged_slaclip_tuned_fixed.sbatch"
+worker="$snapshot_repo/${DPLORA_STAGED_WORKER_RELATIVE:-hpc/staged_slaclip_tuned_fixed.sbatch}"
 submit_snapshot="$snapshot_repo/hpc/submit_staged_slaclip_tuned_fixed.sh"
 exit_policy="$snapshot_repo/hpc/full_slaclip_exit_policy.sh"
-spec="$snapshot_repo/hpc/staged-slaclip-tuned-fixed-spec.json"
-staged="$snapshot_repo/paper_repro/staged_slaclip_campaign.py"
+spec="$snapshot_repo/${DPLORA_STAGED_SPEC_RELATIVE:-hpc/staged-slaclip-tuned-fixed-spec.json}"
+staged="$snapshot_repo/${DPLORA_STAGED_ORCHESTRATOR_RELATIVE:-paper_repro/staged_slaclip_campaign.py}"
 full="$snapshot_repo/paper_repro/full_slaclip_campaign.py"
 trainer="$snapshot_repo/paper_repro/train_federated.py"
 stage_script="$snapshot_repo/scripts/stage_paper_inputs.sh"
@@ -180,7 +180,12 @@ fi
 if [[ -n "${DPLORA_STAGED_RUN_ID:-}" ]]; then
     run_id="$DPLORA_STAGED_RUN_ID"
 else
-    run_id="staged-slaclip-${short_sha}-$(date -u +%Y%m%dT%H%M%SZ)"
+    run_prefix="${DPLORA_STAGED_RUN_PREFIX:-staged-slaclip}"
+    if [[ ! "$run_prefix" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        echo "ERROR: unsafe run prefix: $run_prefix" >&2
+        exit 1
+    fi
+    run_id="${run_prefix}-${short_sha}-$(date -u +%Y%m%dT%H%M%SZ)"
 fi
 if [[ ! "$run_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
     echo "ERROR: unsafe run ID: $run_id" >&2

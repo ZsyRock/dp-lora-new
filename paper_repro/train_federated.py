@@ -134,6 +134,7 @@ CONTROLLER_INPUT_BY_METHOD = {
 SLACLIP_PAIRED_SLACK_NOISE_SCOPE = SLACLIP_METHOD
 SLACLIP_REFERENCE_REPOSITORY = "https://github.com/ZsyRock/SlaClip"
 SLACLIP_REFERENCE_REVISION = "d48b8e07aef33c58a3595ee18b4dccf9c75fa1f3"
+GROUPWISE_SLACLIP_VARIANT = "groupwise_generalized_full_slaclip_beta"
 
 
 def slaclip_slack_noise_method_scope(
@@ -148,6 +149,70 @@ def slaclip_slack_noise_method_scope(
             else ORACLE_SLACLIP_METHOD
         )
     raise ValueError(f"method has no SlaClip slack-noise domain: {method}")
+
+
+def resolve_slaclip_base_targets(
+    *,
+    base_target_clipped_fraction: float | None = None,
+    beta: float | None = None,
+    base_target_clipped_fraction_by_group: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, float], bool]:
+    """Resolve either the historical shared beta or canonical A/B betas.
+
+    The scalar path intentionally retains the pre-groupwise resolution rules.
+    Groupwise targets are a separate, explicit contract: both A and B must be
+    present and cannot be combined with either scalar spelling.
+    """
+
+    if base_target_clipped_fraction_by_group is None:
+        shared = resolve_base_target_clipped_fraction(
+            base_target_clipped_fraction=base_target_clipped_fraction,
+            beta=beta,
+        )
+        return {"A": shared, "B": shared}, False
+    if base_target_clipped_fraction is not None or beta is not None:
+        raise ValueError(
+            "groupwise SlaClip base targets cannot be combined with a shared "
+            "base_target_clipped_fraction or beta"
+        )
+    if set(base_target_clipped_fraction_by_group) != {"A", "B"}:
+        raise ValueError(
+            "groupwise SlaClip base targets must contain exactly A and B"
+        )
+    return (
+        {
+            group: resolve_base_target_clipped_fraction(
+                base_target_clipped_fraction=(
+                    base_target_clipped_fraction_by_group[group]
+                )
+            )
+            for group in ("A", "B")
+        },
+        True,
+    )
+
+
+def slaclip_controller_target_arguments(
+    controller: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return mutually exclusive target arguments from a persisted contract."""
+
+    groupwise = controller.get("base_target_clipped_fraction_by_group")
+    if groupwise is not None:
+        # Re-resolve here so malformed persisted contracts fail closed before
+        # any controller update or shard reconciliation.
+        targets, _ = resolve_slaclip_base_targets(
+            base_target_clipped_fraction_by_group=groupwise
+        )
+        return {"base_target_clipped_fraction_by_group": targets}
+    return {
+        "base_target_clipped_fraction": resolve_base_target_clipped_fraction(
+            base_target_clipped_fraction=controller.get(
+                "base_target_clipped_fraction"
+            ),
+            beta=controller.get("beta"),
+        )
+    }
 
 
 @dataclass(frozen=True)
@@ -2003,6 +2068,7 @@ def slaclip_round_controller_summary(
     controller_input: str = NOISY_CONTROLLER_INPUT,
     base_target_clipped_fraction: float | None = None,
     beta: float | None = None,
+    base_target_clipped_fraction_by_group: Mapping[str, Any] | None = None,
     c_min: float,
     c_max: float,
     epsilon: float = 1e-6,
@@ -2021,12 +2087,19 @@ def slaclip_round_controller_summary(
         raise ValueError("full SlaClip requires at least two CDF slots")
     if controller_input not in {NOISY_CONTROLLER_INPUT, EXACT_CONTROLLER_INPUT}:
         raise ValueError(f"unsupported controller input: {controller_input!r}")
-    base_target = resolve_base_target_clipped_fraction(
+    base_targets, groupwise_targets = resolve_slaclip_base_targets(
         base_target_clipped_fraction=base_target_clipped_fraction,
         beta=beta,
+        base_target_clipped_fraction_by_group=(
+            base_target_clipped_fraction_by_group
+        ),
     )
     result: dict[str, Any] = {
-        "variant": "full_slaclip_cdf_endpoints",
+        "variant": (
+            GROUPWISE_SLACLIP_VARIANT
+            if groupwise_targets
+            else "full_slaclip_cdf_endpoints"
+        ),
         "update_timing": "once_after_all_clients_for_use_in_next_round",
         "clients": len(records),
         "num_slots": num_slots,
@@ -2035,16 +2108,33 @@ def slaclip_round_controller_summary(
         "controller_input_is_non_dp_exact": (
             controller_input == EXACT_CONTROLLER_INPUT
         ),
-        "base_target_clipped_fraction": base_target,
-        "beta": base_target,
         "epsilon": epsilon,
         "near_threshold_index": 0,
         "near_zero_index": num_slots - 1,
         "c_min": c_min,
         "c_max": c_max,
     }
+    if groupwise_targets:
+        result.update(
+            {
+                "target_parameterization": "per_gradient_group",
+                "generalized_full_slaclip_beta": True,
+                "base_target_clipped_fraction_by_group": dict(base_targets),
+                "beta_by_group": dict(base_targets),
+            }
+        )
+    else:
+        # Keep the historical shared-beta telemetry shape unchanged so old
+        # round shards remain exactly reconcilable on resume/revalidation.
+        result.update(
+            {
+                "base_target_clipped_fraction": base_targets["A"],
+                "beta": base_targets["A"],
+            }
+        )
     for group in ("A", "B"):
         threshold = float(clip_thresholds[group])
+        base_target = base_targets[group]
         releases = []
         signals = []
         for record in records:
@@ -2345,17 +2435,10 @@ def read_round_shards(
                 num_slots=int(controller["num_slots"]),
                 eta=float(controller["eta"]),
                 controller_input=str(controller["controller_input"]),
-                base_target_clipped_fraction=(
-                    resolve_base_target_clipped_fraction(
-                        base_target_clipped_fraction=controller.get(
-                            "base_target_clipped_fraction"
-                        ),
-                        beta=controller.get("beta"),
-                    )
-                ),
                 c_min=float(controller["c_min"]),
                 c_max=float(controller["c_max"]),
                 epsilon=float(controller["epsilon"]),
+                **slaclip_controller_target_arguments(controller),
             )
             if round_summary.get("slaclip_controller") != recomputed_controller:
                 raise RuntimeError(
@@ -2569,6 +2652,32 @@ def behavior_summary(shards: Sequence[dict[str, Any]]) -> dict[str, Any]:
         }:
             raise RuntimeError("SlaClip controller-input telemetry is invalid")
         controller_input = str(controller_rounds[0]["controller_input"])
+        controller_variants = {
+            str(value.get("variant")) for value in controller_rounds
+        }
+        if len(controller_variants) != 1:
+            raise RuntimeError("SlaClip controller-variant telemetry is invalid")
+        controller_variant = controller_variants.pop()
+        if controller_variant not in {
+            "full_slaclip_cdf_endpoints",
+            GROUPWISE_SLACLIP_VARIANT,
+        }:
+            raise RuntimeError("SlaClip controller variant is unsupported")
+        groupwise_targets = controller_variant == GROUPWISE_SLACLIP_VARIANT
+        if groupwise_targets:
+            targets_by_round = [
+                value.get("base_target_clipped_fraction_by_group")
+                for value in controller_rounds
+            ]
+            if any(target != targets_by_round[0] for target in targets_by_round):
+                raise RuntimeError(
+                    "groupwise SlaClip target telemetry changed across rounds"
+                )
+            targets, resolved_groupwise = resolve_slaclip_base_targets(
+                base_target_clipped_fraction_by_group=targets_by_round[0]
+            )
+            if not resolved_groupwise:
+                raise RuntimeError("groupwise SlaClip targets are invalid")
         controller_groups: dict[str, Any] = {}
         for group in ("A", "B"):
             group_rounds = [value[group] for value in controller_rounds]
@@ -2729,20 +2838,35 @@ def behavior_summary(shards: Sequence[dict[str, Any]]) -> dict[str, Any]:
                         "next_clip_threshold"
                     ],
                 }
-        result["slaclip_controller"] = {
-            "variant": "full_slaclip_cdf_endpoints",
+        controller_result = {
+            "variant": controller_variant,
             "controller_input": controller_input,
             "controller_input_is_non_dp_exact": (
                 controller_input == EXACT_CONTROLLER_INPUT
             ),
             "rounds": len(controller_rounds),
-            "base_target_clipped_fraction": controller_rounds[0][
-                "base_target_clipped_fraction"
-            ],
-            "beta": controller_rounds[0]["beta"],
             "trajectory_sha256": canonical_json_fingerprint(controller_rounds),
             "groups": controller_groups,
         }
+        if groupwise_targets:
+            controller_result.update(
+                {
+                    "target_parameterization": "per_gradient_group",
+                    "generalized_full_slaclip_beta": True,
+                    "base_target_clipped_fraction_by_group": dict(targets),
+                    "beta_by_group": dict(targets),
+                }
+            )
+        else:
+            controller_result.update(
+                {
+                    "base_target_clipped_fraction": controller_rounds[0][
+                        "base_target_clipped_fraction"
+                    ],
+                    "beta": controller_rounds[0]["beta"],
+                }
+            )
+        result["slaclip_controller"] = controller_result
     return result
 
 
@@ -2930,6 +3054,20 @@ def validate_checkpoint_trainer_state(
             "controller_input": slaclip_contract["controller_input"],
             "updates_completed": completed_round,
         }
+        groupwise_targets = controller_state.get(
+            "base_target_clipped_fraction_by_group"
+        )
+        contract_groupwise_targets = slaclip_contract["controller"].get(
+            "base_target_clipped_fraction_by_group"
+        )
+        if contract_groupwise_targets is not None:
+            expected_controller_identity[
+                "base_target_clipped_fraction_by_group"
+            ] = contract_groupwise_targets
+        elif groupwise_targets is not None:
+            raise RuntimeError(
+                "checkpoint shared-beta SlaClip state contains groupwise targets"
+            )
         for key, expected in expected_controller_identity.items():
             if controller_state.get(key) != expected:
                 raise RuntimeError(f"checkpoint SlaClip state mismatch: {key}")
@@ -2955,6 +3093,16 @@ def validate_checkpoint_trainer_state(
             ):
                 raise RuntimeError(
                     "checkpoint SlaClip threshold does not match the last shard"
+                )
+            if (
+                contract_groupwise_targets is not None
+                and last_controller[group].get(
+                    "base_target_clipped_fraction"
+                )
+                != contract_groupwise_targets[group]
+            ):
+                raise RuntimeError(
+                    "checkpoint groupwise SlaClip target does not match the contract"
                 )
     elif controller_state is not None:
         raise RuntimeError("fixed-threshold checkpoint contains SlaClip state")
@@ -3578,17 +3726,10 @@ def train_one_model(
                 num_slots=int(controller["num_slots"]),
                 eta=float(controller["eta"]),
                 controller_input=str(controller["controller_input"]),
-                base_target_clipped_fraction=(
-                    resolve_base_target_clipped_fraction(
-                        base_target_clipped_fraction=controller.get(
-                            "base_target_clipped_fraction"
-                        ),
-                        beta=controller.get("beta"),
-                    )
-                ),
                 c_min=float(controller["c_min"]),
                 c_max=float(controller["c_max"]),
                 epsilon=float(controller["epsilon"]),
+                **slaclip_controller_target_arguments(controller),
             )
             last_round_summary["slaclip_controller"] = controller_summary
             current_clip_thresholds = {
@@ -3675,6 +3816,18 @@ def train_one_model(
                                 "next_clip_threshold_by_group": dict(
                                     current_clip_thresholds
                                 ),
+                                **(
+                                    {
+                                        "base_target_clipped_fraction_by_group": dict(
+                                            slaclip_contract["controller"][
+                                                "base_target_clipped_fraction_by_group"
+                                            ]
+                                        )
+                                    }
+                                    if "base_target_clipped_fraction_by_group"
+                                    in slaclip_contract["controller"]
+                                    else {}
+                                ),
                             }
                         }
                         if adaptive
@@ -3706,6 +3859,23 @@ def train_one_model(
                             "controller_input": slaclip_contract[
                                 "controller_input"
                             ],
+                            **(
+                                {
+                                    "variant": GROUPWISE_SLACLIP_VARIANT,
+                                    "target_parameterization": (
+                                        "per_gradient_group"
+                                    ),
+                                    "generalized_full_slaclip_beta": True,
+                                    "base_target_clipped_fraction_by_group": dict(
+                                        slaclip_contract["controller"][
+                                            "base_target_clipped_fraction_by_group"
+                                        ]
+                                    ),
+                                }
+                                if "base_target_clipped_fraction_by_group"
+                                in slaclip_contract["controller"]
+                                else {}
+                            ),
                             **{
                                 group: {
                                 "base_target_clipped_fraction": last_round_summary[
@@ -4069,9 +4239,40 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "--slaclip-base-target-clipped-fraction"
         ),
     )
+    parser.add_argument(
+        "--slaclip-base-target-clipped-fraction-a",
+        type=float,
+        help=(
+            "canonical generalized full-SlaClip beta for LoRA gradient group A; "
+            "requires the corresponding B option and excludes shared-beta options"
+        ),
+    )
+    parser.add_argument(
+        "--slaclip-base-target-clipped-fraction-b",
+        type=float,
+        help=(
+            "canonical generalized full-SlaClip beta for LoRA gradient group B; "
+            "requires the corresponding A option and excludes shared-beta options"
+        ),
+    )
     parser.add_argument("--slaclip-num-slots", type=int, default=15)
     parser.add_argument("--slaclip-c-min", type=float, default=0.1)
     parser.add_argument("--slaclip-c-max", type=float, default=50.0)
+    parser.add_argument(
+        "--slaclip-baseline-calibration-lock-sha256",
+        help=(
+            "immutable selection-lock digest when beta hyperparameters were "
+            "derived from exact, non-DP fixed-baseline diagnostics"
+        ),
+    )
+    parser.add_argument(
+        "--acknowledge-slaclip-baseline-calibration-is-non-dp",
+        action="store_true",
+        help=(
+            "acknowledge that baseline-derived SlaClip hyperparameters used "
+            "exact private diagnostics during development"
+        ),
+    )
     parser.add_argument("--private-rng-key", type=Path)
     parser.add_argument("--rng-domain")
     parser.add_argument("--pair-noise-across-methods", action="store_true")
@@ -4083,24 +4284,49 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     canonical = args.slaclip_base_target_clipped_fraction
     alias = args.slaclip_beta
+    group_a = args.slaclip_base_target_clipped_fraction_a
+    group_b = args.slaclip_base_target_clipped_fraction_b
+    if (group_a is None) != (group_b is None):
+        parser.error(
+            "--slaclip-base-target-clipped-fraction-a and "
+            "--slaclip-base-target-clipped-fraction-b must be supplied together"
+        )
+    if group_a is not None and (canonical is not None or alias is not None):
+        parser.error(
+            "groupwise SlaClip base targets cannot be combined with "
+            "--slaclip-base-target-clipped-fraction or --slaclip-beta"
+        )
     if canonical is not None and alias is not None and canonical != alias:
         parser.error(
             "--slaclip-base-target-clipped-fraction and --slaclip-beta "
             "specify different values"
         )
     try:
-        resolved = resolve_base_target_clipped_fraction(
-            base_target_clipped_fraction=canonical,
-            beta=alias,
-        )
+        if group_a is not None:
+            resolved_by_group, _ = resolve_slaclip_base_targets(
+                base_target_clipped_fraction_by_group={
+                    "A": group_a,
+                    "B": group_b,
+                }
+            )
+            resolved = None
+        else:
+            resolved_by_group = None
+            resolved = resolve_base_target_clipped_fraction(
+                base_target_clipped_fraction=canonical,
+                beta=alias,
+            )
     except (TypeError, ValueError) as error:
         parser.error(str(error))
     args.slaclip_base_target_clipped_fraction = resolved
     # Preserve the old Namespace field for callers that inspect requested
     # arguments while making the canonical name authoritative internally.
     args.slaclip_beta = resolved
+    args.slaclip_base_target_clipped_fraction_by_group = resolved_by_group
     args.slaclip_base_target_clipped_fraction_source = (
-        "canonical_and_compatible_alias"
+        "groupwise_canonical_cli"
+        if resolved_by_group is not None
+        else "canonical_and_compatible_alias"
         if canonical is not None and alias is not None
         else "canonical_cli"
         if canonical is not None
@@ -4108,6 +4334,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         if alias is not None
         else "default"
     )
+    calibration_lock = args.slaclip_baseline_calibration_lock_sha256
+    calibration_acknowledged = (
+        args.acknowledge_slaclip_baseline_calibration_is_non_dp
+    )
+    if (calibration_lock is None) != (not calibration_acknowledged):
+        parser.error(
+            "--slaclip-baseline-calibration-lock-sha256 and "
+            "--acknowledge-slaclip-baseline-calibration-is-non-dp must be "
+            "supplied together"
+        )
+    if calibration_lock is not None and (
+        len(calibration_lock) != 64
+        or any(character not in "0123456789abcdef" for character in calibration_lock)
+    ):
+        parser.error(
+            "--slaclip-baseline-calibration-lock-sha256 must be 64 lowercase "
+            "hexadecimal characters"
+        )
     return args
 
 
@@ -4174,6 +4418,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit(f"refusing to overwrite existing output: {output_dir}")
     config = make_effective_config(args)
     validate_config(config)
+    if (
+        args.slaclip_baseline_calibration_lock_sha256 is not None
+        and config.method not in ADAPTIVE_METHODS
+    ):
+        raise SystemExit(
+            "baseline-derived SlaClip calibration provenance is only valid "
+            "for an adaptive SlaClip method"
+        )
     if config.method in {"paper_dp_lora", *ADAPTIVE_METHODS} and config.noise_multiplier <= 0:
         raise SystemExit(f"{config.method} requires --noise-multiplier > 0")
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -4195,6 +4447,19 @@ def main(argv: Sequence[str] | None = None) -> None:
     slaclip_contract: dict[str, Any] | None = None
     if config.method in ADAPTIVE_METHODS:
         controller_input = CONTROLLER_INPUT_BY_METHOD[config.method]
+        if args.slaclip_base_target_clipped_fraction_by_group is not None:
+            base_targets, groupwise_targets = resolve_slaclip_base_targets(
+                base_target_clipped_fraction_by_group=(
+                    args.slaclip_base_target_clipped_fraction_by_group
+                )
+            )
+        else:
+            base_targets, groupwise_targets = resolve_slaclip_base_targets(
+                base_target_clipped_fraction=(
+                    args.slaclip_base_target_clipped_fraction
+                ),
+                beta=args.slaclip_beta,
+            )
         if args.slaclip_num_slots < 2:
             raise SystemExit(
                 "--slaclip-num-slots must be at least two for the full "
@@ -4215,12 +4480,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         if (
             not math.isfinite(args.slaclip_eta)
             or args.slaclip_eta < 0
-            or not math.isfinite(
-                args.slaclip_base_target_clipped_fraction
+            or any(
+                not math.isfinite(target) or not 0.0 <= target <= 1.0
+                for target in base_targets.values()
             )
-            or not 0.0
-            <= args.slaclip_base_target_clipped_fraction
-            <= 1.0
             or not math.isfinite(args.slaclip_c_min)
             or not math.isfinite(args.slaclip_c_max)
             or args.slaclip_c_min <= 0
@@ -4230,9 +4493,33 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise SystemExit(
                 "invalid full-SlaClip base target, eta, or threshold bounds"
             )
+        controller_update_formula = (
+            "for each g in {A,B}:q_g=s_hat_g[0];"
+            "r_g=s_hat_g[K-1];z_g=r_g/(C_g+1e-6);"
+            "remaining_g=1-z_g;"
+            "target_clip_g=clip(beta_g*remaining_g,0,1);"
+            "gamma_g=1-target_clip_g;"
+            "C_g_next=clip(C_g*exp(eta*(gamma_g-q_g)),C_min,C_max)"
+            if groupwise_targets
+            else (
+                "q=s_hat[0];r=s_hat[K-1];z=r/(C+1e-6);"
+                "remaining=1-z;"
+                "target_clip=clip(base_target_clipped_fraction*remaining,0,1);"
+                "gamma=1-target_clip;"
+                "C_next=clip(C*exp(eta*(gamma-q)),C_min,C_max)"
+            )
+        )
         slaclip_contract = {
-            "schema_version": "full_slaclip_contract_v1",
-            "variant": "full_slaclip_cdf_endpoints",
+            "schema_version": (
+                "groupwise_generalized_full_slaclip_beta_contract_v1"
+                if groupwise_targets
+                else "full_slaclip_contract_v1"
+            ),
+            "variant": (
+                GROUPWISE_SLACLIP_VARIANT
+                if groupwise_targets
+                else "full_slaclip_cdf_endpoints"
+            ),
             "controller_input": controller_input,
             "non_private_oracle_control": (
                 controller_input == EXACT_CONTROLLER_INPUT
@@ -4246,6 +4533,21 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "repository": SLACLIP_REFERENCE_REPOSITORY,
                 "revision": SLACLIP_REFERENCE_REVISION,
             },
+            "hyperparameter_provenance": {
+                "source": (
+                    "fixed_baseline_exact_endpoint_development_selection_lock"
+                    if args.slaclip_baseline_calibration_lock_sha256 is not None
+                    else "direct_cli_not_declared_baseline_derived"
+                ),
+                "baseline_derived_calibration_is_non_dp": (
+                    args.slaclip_baseline_calibration_lock_sha256 is not None
+                ),
+                "calibration_lock_sha256": (
+                    args.slaclip_baseline_calibration_lock_sha256
+                ),
+                "calibration_data_consumed_at_controller_runtime": False,
+                "frozen_scalar_hyperparameters_only": True,
+            },
             "controller": {
                 "eta": float(args.slaclip_eta),
                 "controller_input": controller_input,
@@ -4253,14 +4555,31 @@ def main(argv: Sequence[str] | None = None) -> None:
                     config.method,
                     pair_noise_across_methods=config.pair_noise_across_methods,
                 ),
-                "base_target_clipped_fraction": float(
-                    args.slaclip_base_target_clipped_fraction
+                **(
+                    {
+                        "target_parameterization": "per_gradient_group",
+                        "generalized_full_slaclip_beta": True,
+                        "base_target_clipped_fraction_by_group": dict(
+                            base_targets
+                        ),
+                        "base_target_clipped_fraction_source": (
+                            args.slaclip_base_target_clipped_fraction_source
+                        ),
+                        "beta_by_group": dict(base_targets),
+                        "shared_beta_compatibility_alias_active": False,
+                    }
+                    if groupwise_targets
+                    else {
+                        "base_target_clipped_fraction": float(
+                            base_targets["A"]
+                        ),
+                        "base_target_clipped_fraction_source": (
+                            args.slaclip_base_target_clipped_fraction_source
+                        ),
+                        "beta": float(base_targets["A"]),
+                        "beta_compatibility_alias": True,
+                    }
                 ),
-                "base_target_clipped_fraction_source": (
-                    args.slaclip_base_target_clipped_fraction_source
-                ),
-                "beta": float(args.slaclip_base_target_clipped_fraction),
-                "beta_compatibility_alias": True,
                 "epsilon": 1e-6,
                 "num_slots": int(num_slots),
                 "num_slots_selection": "explicit",
@@ -4283,13 +4602,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "c_min": float(args.slaclip_c_min),
                 "c_max": float(args.slaclip_c_max),
                 "initial_clip_threshold": config.clip_norm,
-                "update_formula": (
-                    "q=s_hat[0];r=s_hat[K-1];z=r/(C+1e-6);"
-                    "remaining=1-z;"
-                    "target_clip=clip(base_target_clipped_fraction*remaining,0,1);"
-                    "gamma=1-target_clip;"
-                    "C_next=clip(C*exp(eta*(gamma-q)),C_min,C_max)"
-                ),
+                "update_formula": controller_update_formula,
                 "numerical_log_step_bounds": [
                     -MAX_ABS_LOG_STEP,
                     MAX_ABS_LOG_STEP,
@@ -4359,9 +4672,17 @@ def main(argv: Sequence[str] | None = None) -> None:
                         else "exact, explicitly non-private CDF-proxy slots"
                     )
                     + " to derive a dynamic target; "
-                    "base_target_clipped_fraction (the paper/reference beta) "
-                    "is modulated by the estimated fraction of remaining "
-                    "non-small gradients, so it is not a fixed clipping target "
+                    + (
+                        "each gradient group uses its own canonical "
+                        "base_target_clipped_fraction_g (generalized full-"
+                        "SlaClip beta_g), and each beta_g "
+                        if groupwise_targets
+                        else "base_target_clipped_fraction (the paper/reference "
+                        "shared beta) "
+                    )
+                    + "is modulated by that group's estimated fraction of "
+                    "remaining non-small gradients, so it is not a fixed "
+                    "clipping target "
                     "and no calibration data enters the controller at runtime."
                 ),
                 "SlaClip is adapted to the paper-literal federated mechanism by releasing one joint gradient/slack vector per client and LoRA group, then updating each A/B threshold once after FedAvg.",
@@ -4386,6 +4707,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
             ]
         )
+        if args.slaclip_baseline_calibration_lock_sha256 is not None:
+            assumptions.append(
+                "The frozen SlaClip beta hyperparameters were selected from "
+                "exact, NON_DP_PRIVATE_DIAGNOSTIC fixed-baseline endpoints "
+                "under the immutable calibration lock recorded in the "
+                "algorithm contract; the controller consumes no calibration "
+                "artifact during this training run."
+            )
     dependency_versions = package_versions()
     backend_contract = execution_backend_contract(device)
     scientific_contract = {
@@ -4441,7 +4770,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             "epsilon": None,
             "sigma_is_not_epsilon": True,
             "diagnostics_are_private_non_dp_data": True,
-            "baseline_derived_calibration_is_non_dp": False,
+            "baseline_derived_calibration_is_non_dp": (
+                args.slaclip_baseline_calibration_lock_sha256 is not None
+            ),
+            "baseline_calibration_lock_sha256": (
+                args.slaclip_baseline_calibration_lock_sha256
+            ),
+            "baseline_calibration_consumed_at_runtime": False,
             "exact_cdf_diagnostics_are_non_dp": slaclip_contract is not None,
             "oracle_controller_uses_non_dp_exact_cdf": (
                 config.method == ORACLE_SLACLIP_METHOD

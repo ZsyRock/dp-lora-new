@@ -90,6 +90,13 @@ ORACLE_NOISY_MATCH_FIELDS = (
     "slaclip_base_target_clipped_fraction",
     "slaclip_beta",
 )
+ORACLE_NOISY_OPTIONAL_MATCH_FIELDS = (
+    "slaclip_base_target_clipped_fraction_by_group",
+    "slaclip_beta_by_group",
+    "slaclip_baseline_calibration_lock_sha256",
+    "acknowledge_slaclip_baseline_calibration_is_non_dp",
+    "slaclip_calibration_provenance",
+)
 ALLOWED_METHODS = {*ADAPTIVE_METHODS, FIXED_DP_METHOD, *CONTROL_METHODS}
 EXPECTED_MODELS = ("bert", "gpt2")
 SMALL_ARCHIVE_MAX_BYTES = 32 * 1024 * 1024
@@ -847,6 +854,211 @@ def validate_runtime_manifest(value: dict[str, Any]) -> None:
     ids = [arm.get("arm_id") for arm in arms if isinstance(arm, dict)]
     if len(ids) != len(arms) or len(ids) != len(set(ids)):
         raise RuntimeError("runtime manifest arm identities are invalid")
+    for index, arm in enumerate(arms):
+        assert isinstance(arm, dict)
+        _validate_runtime_arm(arm, index=index)
+
+
+def _validate_runtime_arm(arm: Mapping[str, Any], *, index: int) -> None:
+    """Fail closed on executable arm semantics, not only manifest hashes."""
+
+    required = {
+        "arm_id",
+        "family",
+        "analysis_role",
+        "method",
+        "seed",
+        "initial_clip_norm",
+        "slaclip_eta",
+        "slaclip_base_target_clipped_fraction",
+        "slaclip_beta",
+        "controller_input",
+        "reference_arm_id",
+        "rng_domain",
+        "models",
+        "num_clients",
+        "rounds",
+        "batch_size",
+        "noise_multiplier",
+        "learning_rate",
+        "rank",
+        "max_seq_length",
+        "max_validation_records",
+        "eval_every",
+        "checkpoint_every",
+        "data_split_seed",
+        "evaluation_seed",
+        "delta",
+        "slaclip_num_slots",
+        "slaclip_c_min",
+        "slaclip_c_max",
+        "index",
+        "wave",
+        "lane",
+    }
+    missing = sorted(required - set(arm))
+    if missing:
+        raise RuntimeError(f"runtime arm is missing fields: {missing}")
+    if (
+        not isinstance(arm["arm_id"], str)
+        or not arm["arm_id"]
+        or not isinstance(arm["family"], str)
+        or not arm["family"]
+        or not isinstance(arm["analysis_role"], str)
+        or not arm["analysis_role"]
+        or not isinstance(arm["rng_domain"], str)
+        or not arm["rng_domain"]
+    ):
+        raise RuntimeError("runtime arm string identity is invalid")
+    if (
+        arm["index"] != index
+        or arm["wave"] != index // 2
+        or arm["lane"] != index % 2
+    ):
+        raise RuntimeError("runtime arm index/wave/lane identity is invalid")
+    method = arm["method"]
+    if method not in ALLOWED_METHODS:
+        raise RuntimeError(f"runtime arm method is invalid: {method!r}")
+    models = arm["models"]
+    if (
+        not isinstance(models, list)
+        or not models
+        or len(models) != len(set(models))
+        or any(model not in EXPECTED_MODELS for model in models)
+    ):
+        raise RuntimeError("runtime arm model list is invalid")
+    for name in (
+        "num_clients",
+        "rounds",
+        "batch_size",
+        "rank",
+        "max_seq_length",
+        "max_validation_records",
+        "eval_every",
+        "checkpoint_every",
+    ):
+        try:
+            require_int(arm[name], f"runtime arm {name}")
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
+    for name in ("seed", "data_split_seed", "evaluation_seed"):
+        try:
+            require_int(arm[name], f"runtime arm {name}", positive=False)
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
+    try:
+        clip_norm = require_number(
+            arm["initial_clip_norm"], "runtime arm initial_clip_norm", positive=True
+        )
+        noise = require_number(
+            arm["noise_multiplier"], "runtime arm noise_multiplier"
+        )
+        require_number(
+            arm["learning_rate"], "runtime arm learning_rate", positive=True
+        )
+        delta = require_number(arm["delta"], "runtime arm delta", positive=True)
+    except ValueError as error:
+        raise RuntimeError(str(error)) from error
+    if noise < 0.0 or not 0.0 < delta < 1.0:
+        raise RuntimeError("runtime arm noise/delta domain is invalid")
+
+    adaptive = method in ADAPTIVE_METHODS
+    group_targets = arm.get("slaclip_base_target_clipped_fraction_by_group")
+    group_aliases = arm.get("slaclip_beta_by_group")
+    scalar_target = arm["slaclip_base_target_clipped_fraction"]
+    scalar_alias = arm["slaclip_beta"]
+    calibration_lock = arm.get("slaclip_baseline_calibration_lock_sha256")
+    calibration_acknowledged = arm.get(
+        "acknowledge_slaclip_baseline_calibration_is_non_dp", False
+    )
+    if adaptive:
+        try:
+            eta = require_number(arm["slaclip_eta"], "runtime arm eta")
+            slots = require_int(arm["slaclip_num_slots"], "runtime arm slots")
+            lower = require_number(
+                arm["slaclip_c_min"], "runtime arm C minimum", positive=True
+            )
+            upper = require_number(
+                arm["slaclip_c_max"], "runtime arm C maximum", positive=True
+            )
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
+        if eta < 0.0 or slots < 2 or upper < lower or not lower <= clip_norm <= upper:
+            raise RuntimeError("runtime adaptive controller domain is invalid")
+        if arm["controller_input"] != CONTROLLER_INPUT_BY_METHOD[method]:
+            raise RuntimeError("runtime adaptive controller input is invalid")
+        shared = scalar_target is not None or scalar_alias is not None
+        groupwise = group_targets is not None or group_aliases is not None
+        if shared == groupwise:
+            raise RuntimeError(
+                "runtime adaptive arm must select exactly one target mode"
+            )
+        if shared:
+            if scalar_target != scalar_alias:
+                raise RuntimeError("runtime shared target aliases disagree")
+            try:
+                target = require_number(scalar_target, "runtime shared target")
+            except ValueError as error:
+                raise RuntimeError(str(error)) from error
+            if not 0.0 <= target <= 1.0:
+                raise RuntimeError("runtime shared target is outside [0,1]")
+        else:
+            if (
+                not isinstance(group_targets, dict)
+                or set(group_targets) != {"A", "B"}
+                or group_aliases != group_targets
+            ):
+                raise RuntimeError("runtime groupwise target aliases disagree")
+            for group, raw_target in group_targets.items():
+                try:
+                    target = require_number(
+                        raw_target, f"runtime groupwise target {group}"
+                    )
+                except ValueError as error:
+                    raise RuntimeError(str(error)) from error
+                if not 0.0 <= target <= 1.0:
+                    raise RuntimeError(
+                        f"runtime groupwise target {group} is outside [0,1]"
+                    )
+        if calibration_lock is None:
+            if calibration_acknowledged is not False:
+                raise RuntimeError(
+                    "runtime baseline-calibration acknowledgement lacks a lock"
+                )
+        else:
+            if calibration_acknowledged is not True:
+                raise RuntimeError(
+                    "runtime baseline-calibration lock is not acknowledged"
+                )
+            if (
+                not isinstance(calibration_lock, str)
+                or len(calibration_lock) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in calibration_lock
+                )
+            ):
+                raise RuntimeError(
+                    "runtime baseline-calibration lock digest is invalid"
+                )
+    else:
+        optional_adaptive = (
+            arm["slaclip_eta"],
+            scalar_target,
+            scalar_alias,
+            group_targets,
+            group_aliases,
+            arm["controller_input"],
+            arm["slaclip_num_slots"],
+            arm["slaclip_c_min"],
+            arm["slaclip_c_max"],
+        )
+        if any(value is not None for value in optional_adaptive):
+            raise RuntimeError("runtime non-adaptive arm contains controller fields")
+        if calibration_lock is not None or calibration_acknowledged is not False:
+            raise RuntimeError(
+                "runtime non-adaptive arm contains SlaClip calibration provenance"
+            )
 
 
 def repository_sha(repository: Path) -> str:
@@ -965,7 +1177,13 @@ def _oracle_noisy_match_key(arm: Mapping[str, Any]) -> bytes:
             f"{arm.get('arm_id', '<unknown>')} {missing}"
         )
     return canonical_bytes(
-        {name: arm[name] for name in ORACLE_NOISY_MATCH_FIELDS}
+        {
+            **{name: arm[name] for name in ORACLE_NOISY_MATCH_FIELDS},
+            **{
+                name: arm.get(name)
+                for name in ORACLE_NOISY_OPTIONAL_MATCH_FIELDS
+            },
+        }
     )
 
 
@@ -1354,12 +1572,39 @@ def _arm_command(
         "--acknowledge-non-dp-diagnostics",
     ]
     if arm["method"] in ADAPTIVE_METHODS:
+        command.extend(["--slaclip-eta", str(arm["slaclip_eta"])])
+        group_targets = arm.get(
+            "slaclip_base_target_clipped_fraction_by_group"
+        )
+        group_aliases = arm.get("slaclip_beta_by_group")
+        if group_targets is not None or group_aliases is not None:
+            if (
+                not isinstance(group_targets, dict)
+                or set(group_targets) != {"A", "B"}
+                or group_aliases != group_targets
+                or arm.get("slaclip_base_target_clipped_fraction") is not None
+                or arm.get("slaclip_beta") is not None
+            ):
+                raise RuntimeError(
+                    "groupwise SlaClip arm has inconsistent target aliases"
+                )
+            command.extend(
+                [
+                    "--slaclip-base-target-clipped-fraction-a",
+                    str(group_targets["A"]),
+                    "--slaclip-base-target-clipped-fraction-b",
+                    str(group_targets["B"]),
+                ]
+            )
+        else:
+            command.extend(
+                [
+                    "--slaclip-base-target-clipped-fraction",
+                    str(arm["slaclip_base_target_clipped_fraction"]),
+                ]
+            )
         command.extend(
             [
-                "--slaclip-eta",
-                str(arm["slaclip_eta"]),
-                "--slaclip-base-target-clipped-fraction",
-                str(arm["slaclip_base_target_clipped_fraction"]),
                 "--slaclip-num-slots",
                 str(arm["slaclip_num_slots"]),
                 "--slaclip-c-min",
@@ -1368,6 +1613,32 @@ def _arm_command(
                 str(arm["slaclip_c_max"]),
             ]
         )
+        calibration_lock = arm.get(
+            "slaclip_baseline_calibration_lock_sha256"
+        )
+        calibration_acknowledged = arm.get(
+            "acknowledge_slaclip_baseline_calibration_is_non_dp", False
+        )
+        if calibration_lock is not None or calibration_acknowledged is not False:
+            if (
+                not isinstance(calibration_lock, str)
+                or len(calibration_lock) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in calibration_lock
+                )
+                or calibration_acknowledged is not True
+            ):
+                raise RuntimeError(
+                    "adaptive arm has invalid baseline-calibration provenance"
+                )
+            command.extend(
+                [
+                    "--slaclip-baseline-calibration-lock-sha256",
+                    calibration_lock,
+                    "--acknowledge-slaclip-baseline-calibration-is-non-dp",
+                ]
+            )
     if output_dir.exists():
         command.append("--resume")
     return command
@@ -1816,6 +2087,30 @@ def _model_metrics(
             "slaclip_base_target_clipped_fraction"
         ],
         "slaclip_beta": arm["slaclip_beta"],
+        "slaclip_base_target_clipped_fraction_A": (
+            arm.get("slaclip_base_target_clipped_fraction_by_group", {}).get("A")
+            if isinstance(
+                arm.get("slaclip_base_target_clipped_fraction_by_group"), dict
+            )
+            else None
+        ),
+        "slaclip_base_target_clipped_fraction_B": (
+            arm.get("slaclip_base_target_clipped_fraction_by_group", {}).get("B")
+            if isinstance(
+                arm.get("slaclip_base_target_clipped_fraction_by_group"), dict
+            )
+            else None
+        ),
+        "slaclip_beta_A": (
+            arm.get("slaclip_beta_by_group", {}).get("A")
+            if isinstance(arm.get("slaclip_beta_by_group"), dict)
+            else None
+        ),
+        "slaclip_beta_B": (
+            arm.get("slaclip_beta_by_group", {}).get("B")
+            if isinstance(arm.get("slaclip_beta_by_group"), dict)
+            else None
+        ),
         "reference_arm_id": arm["reference_arm_id"],
         "model": model,
         "initial_loss": initial_loss,
@@ -1951,6 +2246,10 @@ BASE_METRIC_COLUMNS = (
     "slaclip_eta",
     "slaclip_base_target_clipped_fraction",
     "slaclip_beta",
+    "slaclip_base_target_clipped_fraction_A",
+    "slaclip_base_target_clipped_fraction_B",
+    "slaclip_beta_A",
+    "slaclip_beta_B",
     "reference_arm_id",
     "model",
     "initial_loss",

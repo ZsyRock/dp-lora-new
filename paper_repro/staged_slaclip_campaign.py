@@ -30,12 +30,17 @@ from typing import Any, Iterable, Mapping, Sequence
 
 try:
     from paper_repro import full_slaclip_campaign as full
-    from paper_repro.slaclip import build_slack_vector, normalize_noisy_slack
+    from paper_repro.slaclip import (
+        build_slack_vector,
+        normalize_noisy_slack,
+        stationary_beta_from_exact_endpoints,
+    )
 except ModuleNotFoundError:  # Support direct ``python paper_repro/...py`` use.
     import full_slaclip_campaign as full  # type: ignore[no-redef]
     from slaclip import (  # type: ignore[no-redef]
         build_slack_vector,
         normalize_noisy_slack,
+        stationary_beta_from_exact_endpoints,
     )
 
 
@@ -240,7 +245,8 @@ def load_spec(path: Path) -> dict[str, Any]:
         or beta["actual_clipped_fraction_field"] != "B.clipped_fraction"
         or beta["exact_near_zero_formula"]
         != "z=exact_normalized_slack_endpoint_K/(C+epsilon)"
-        or beta["conditional_beta_formula"] != "beta_t=p_t/(1-z_t)"
+        or beta["conditional_beta_formula"]
+        != "beta_stationary_t=(1-q_exact_t)/(1-z_exact_t)"
         or beta["quantile_interval"] != [0.1, 0.9]
         or beta["num_points"] != 5
         or beta["degenerate_interval_policy"] != "fail_closed"
@@ -756,9 +762,18 @@ def _fixed_beta_calibration(
             exact_proxy = normalize_noisy_slack(
                 signal_sum, clip_norm, num_slots, len(records)
             )
+            exact_near_threshold = float(exact_proxy[0])
             exact_endpoint = float(exact_proxy[-1])
-            z_value = exact_endpoint / (clip_norm + epsilon)
-            remaining = 1.0 - z_value
+            stationary_calibration = stationary_beta_from_exact_endpoints(
+                clip_norm,
+                exact_near_threshold,
+                exact_endpoint,
+                epsilon=epsilon,
+            )
+            z_value = stationary_calibration["near_zero_adjusted"]
+            remaining = stationary_calibration[
+                "one_minus_threshold_adjusted_near_zero_signal"
+            ]
             try:
                 clipped_fraction = float(summary["B"]["clipped_fraction"])
                 any_fraction = float(summary["any_group_clipped_fraction"])
@@ -766,11 +781,26 @@ def _fixed_beta_calibration(
                 raise RuntimeError("fixed calibration clipping fraction is missing") from error
             if not 0.0 < remaining <= 1.0 + 1e-12:
                 raise RuntimeError("fixed calibration has no valid remaining mass")
-            conditional = clipped_fraction / remaining
-            if not -1e-12 <= conditional <= 1.0 + 1e-12:
-                raise RuntimeError("fixed calibration conditional beta lies outside [0,1]")
-            conditional = max(0.0, min(1.0, conditional))
-            conditional_values.append(conditional)
+            # The controller compares gamma with the first slack endpoint q;
+            # it does not compare gamma with the exact unclipped fraction
+            # 1-p.  Therefore the beta that makes this fixed-C point
+            # stationary is (1-q)/(1-z).  p/(1-z) is retained only as a
+            # finite-K tracking diagnostic.
+            stationary = stationary_calibration["stationary_beta"]
+            actual_target_calibration = clipped_fraction / remaining
+            for label, value in (
+                ("stationary beta", stationary),
+                ("actual-clipping diagnostic beta", actual_target_calibration),
+            ):
+                if not -1e-12 <= value <= 1.0 + 1e-12:
+                    raise RuntimeError(
+                        f"fixed calibration {label} lies outside [0,1]"
+                    )
+            stationary = max(0.0, min(1.0, stationary))
+            actual_target_calibration = max(
+                0.0, min(1.0, actual_target_calibration)
+            )
+            conditional_values.append(stationary)
             rows.append(
                 {
                     "arm_id": arm["arm_id"],
@@ -780,10 +810,24 @@ def _fixed_beta_calibration(
                     "selected_fixed_C": clip_norm,
                     "B_clipped_fraction": clipped_fraction,
                     "any_group_clipped_fraction": any_fraction,
+                    "exact_normalized_slack_endpoint_1": exact_near_threshold,
                     "exact_normalized_slack_endpoint_K": exact_endpoint,
                     "near_zero_adjusted_z": z_value,
                     "remaining_non_small_gradient_fraction": remaining,
-                    "conditional_beta": conditional,
+                    "stationary_target_clipped_surrogate": (
+                        1.0 - exact_near_threshold
+                    ),
+                    "actual_clipped_fraction_tracking_bias": (
+                        (1.0 - exact_near_threshold) - clipped_fraction
+                    ),
+                    "actual_clipped_fraction_calibrated_beta": (
+                        actual_target_calibration
+                    ),
+                    "stationary_beta": stationary,
+                    # Compatibility field for old analysis readers.  Its
+                    # value now has the explicitly documented stationary
+                    # controller semantics above.
+                    "conditional_beta": stationary,
                 }
             )
     return conditional_values, rows
@@ -1081,12 +1125,12 @@ def lock_fixed_selection(args: argparse.Namespace) -> None:
             "beta_calibration": {
                 "group": "B",
                 "sample_count": len(conditional),
-                "conditional_beta_min": min(conditional),
-                "conditional_beta_q10": q10,
-                "conditional_beta_median": statistics.median(conditional),
-                "conditional_beta_q90": q90,
-                "conditional_beta_max": max(conditional),
-                "formula": "p_t/(1-z_t)",
+                "stationary_beta_min": min(conditional),
+                "stationary_beta_q10": q10,
+                "stationary_beta_median": statistics.median(conditional),
+                "stationary_beta_q90": q90,
+                "stationary_beta_max": max(conditional),
+                "formula": "(1-q_exact_t)/(1-z_exact_t)",
                 "z_formula": "exact_normalized_slack_endpoint_K/(C+epsilon)",
                 "num_slots": spec["common"]["slaclip_num_slots"],
             },
@@ -1104,9 +1148,14 @@ def lock_fixed_selection(args: argparse.Namespace) -> None:
             "selected_fixed_C",
             "B_clipped_fraction",
             "any_group_clipped_fraction",
+            "exact_normalized_slack_endpoint_1",
             "exact_normalized_slack_endpoint_K",
             "near_zero_adjusted_z",
             "remaining_non_small_gradient_fraction",
+            "stationary_target_clipped_surrogate",
+            "actual_clipped_fraction_tracking_bias",
+            "actual_clipped_fraction_calibrated_beta",
+            "stationary_beta",
             "conditional_beta",
         ),
     )

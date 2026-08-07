@@ -30,6 +30,7 @@ from paper_repro.train_federated import (
     round_update_statistics,
     clone_trainable_state,
     restore_trainable_state,
+    resolve_slaclip_base_targets,
     seed_model_stochasticity,
     validate_adapter_artifact,
     validate_checkpoint_trainer_state,
@@ -267,6 +268,9 @@ class PaperReproTests(unittest.TestCase):
         default = parse_args(["--input-manifest", "inputs.json"])
         self.assertEqual(default.slaclip_base_target_clipped_fraction, 0.5)
         self.assertEqual(default.slaclip_beta, 0.5)
+        self.assertIsNone(
+            default.slaclip_base_target_clipped_fraction_by_group
+        )
         self.assertEqual(
             default.slaclip_base_target_clipped_fraction_source,
             "default",
@@ -327,6 +331,107 @@ class PaperReproTests(unittest.TestCase):
                     "0.5",
                 ]
             )
+
+    def test_groupwise_full_slaclip_base_target_cli_is_canonical_and_exclusive(
+        self,
+    ) -> None:
+        groupwise = parse_args(
+            [
+                "--input-manifest",
+                "inputs.json",
+                "--slaclip-base-target-clipped-fraction-a",
+                "0.3333333333333333",
+                "--slaclip-base-target-clipped-fraction-b",
+                "0.8",
+            ]
+        )
+        self.assertIsNone(groupwise.slaclip_base_target_clipped_fraction)
+        self.assertIsNone(groupwise.slaclip_beta)
+        self.assertEqual(
+            groupwise.slaclip_base_target_clipped_fraction_by_group,
+            {"A": 1.0 / 3.0, "B": 0.8},
+        )
+        self.assertEqual(
+            groupwise.slaclip_base_target_clipped_fraction_source,
+            "groupwise_canonical_cli",
+        )
+
+        invalid_argv = (
+            [
+                "--slaclip-base-target-clipped-fraction-a",
+                "0.4",
+            ],
+            [
+                "--slaclip-base-target-clipped-fraction-b",
+                "0.4",
+            ],
+            [
+                "--slaclip-base-target-clipped-fraction-a",
+                "0.4",
+                "--slaclip-base-target-clipped-fraction-b",
+                "0.6",
+                "--slaclip-base-target-clipped-fraction",
+                "0.5",
+            ],
+            [
+                "--slaclip-base-target-clipped-fraction-a",
+                "0.4",
+                "--slaclip-base-target-clipped-fraction-b",
+                "0.6",
+                "--slaclip-beta",
+                "0.5",
+            ],
+            [
+                "--slaclip-base-target-clipped-fraction-a",
+                "-0.1",
+                "--slaclip-base-target-clipped-fraction-b",
+                "0.6",
+            ],
+        )
+        for options in invalid_argv:
+            with self.subTest(options=options), self.assertRaises(SystemExit):
+                parse_args(["--input-manifest", "inputs.json", *options])
+
+        with self.assertRaisesRegex(ValueError, "exactly A and B"):
+            resolve_slaclip_base_targets(
+                base_target_clipped_fraction_by_group={"A": 0.5}
+            )
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            resolve_slaclip_base_targets(
+                beta=0.5,
+                base_target_clipped_fraction_by_group={"A": 0.5, "B": 0.5},
+            )
+
+    def test_non_dp_baseline_calibration_provenance_requires_a_lock_and_ack(self) -> None:
+        digest = "a" * 64
+        parsed = parse_args(
+            [
+                "--input-manifest",
+                "inputs.json",
+                "--slaclip-baseline-calibration-lock-sha256",
+                digest,
+                "--acknowledge-slaclip-baseline-calibration-is-non-dp",
+            ]
+        )
+        self.assertEqual(
+            parsed.slaclip_baseline_calibration_lock_sha256,
+            digest,
+        )
+        self.assertTrue(
+            parsed.acknowledge_slaclip_baseline_calibration_is_non_dp
+        )
+        invalid_argv = (
+            ["--slaclip-baseline-calibration-lock-sha256", digest],
+            ["--acknowledge-slaclip-baseline-calibration-is-non-dp"],
+            [
+                "--slaclip-baseline-calibration-lock-sha256",
+                "A" * 64,
+                "--acknowledge-slaclip-baseline-calibration-is-non-dp",
+            ],
+        )
+        for options in invalid_argv:
+            with self.subTest(options=options), self.assertRaises(SystemExit):
+                parse_args(["--input-manifest", "inputs.json", *options])
 
     def test_completed_root_summary_validation_rejects_derived_mismatch(self) -> None:
         config = paper_config()
@@ -628,6 +733,9 @@ class PaperReproTests(unittest.TestCase):
         self.assertEqual(summary["variant"], "full_slaclip_cdf_endpoints")
         self.assertEqual(summary["base_target_clipped_fraction"], 0.5)
         self.assertEqual(summary["beta"], 0.5)
+        self.assertNotIn("base_target_clipped_fraction_by_group", summary)
+        self.assertNotIn("beta_by_group", summary)
+        self.assertNotIn("target_parameterization", summary)
         self.assertEqual(summary["near_threshold_index"], 0)
         self.assertEqual(summary["near_zero_index"], 1)
         self.assertEqual(summary["A"]["clip_threshold_used"], 2.0)
@@ -739,6 +847,91 @@ class PaperReproTests(unittest.TestCase):
                 beta=0.5,
                 c_min=0.1,
                 c_max=50.0,
+            )
+
+    def test_groupwise_full_slaclip_betas_back_substitute_stationary_targets(
+        self,
+    ) -> None:
+        epsilon = 1e-6
+        settings = {
+            "A": {"threshold": 2.0, "q": 0.7, "z": 0.1},
+            "B": {"threshold": 1.0, "q": 0.4, "z": 0.25},
+        }
+        targets = {
+            group: (1.0 - values["q"]) / (1.0 - values["z"])
+            for group, values in settings.items()
+        }
+        records = []
+        for _ in range(2):
+            gradient_groups = {}
+            for group, values in settings.items():
+                threshold = values["threshold"]
+                normalized_endpoint = values["z"] * (threshold + epsilon)
+                per_client_scale = threshold / np.sqrt(2.0)
+                slack = [
+                    values["q"] * per_client_scale,
+                    normalized_endpoint * per_client_scale,
+                ]
+                gradient_groups[group] = {
+                    "clip_threshold": threshold,
+                    "clipped": False,
+                    "slaclip": {
+                        "num_slots": 2,
+                        "noisy_slack": slack,
+                        "slack_signal": slack,
+                        "joint_sensitivity_bound_passed": True,
+                        "slack_noise_std_per_coordinate": per_client_scale,
+                    },
+                }
+            records.append({"gradient_groups": gradient_groups})
+
+        summary = slaclip_round_controller_summary(
+            records,
+            clip_thresholds={
+                group: values["threshold"]
+                for group, values in settings.items()
+            },
+            num_slots=2,
+            eta=0.2,
+            base_target_clipped_fraction_by_group=targets,
+            c_min=0.1,
+            c_max=50.0,
+            epsilon=epsilon,
+        )
+        self.assertEqual(
+            summary["variant"],
+            "groupwise_generalized_full_slaclip_beta",
+        )
+        self.assertEqual(summary["target_parameterization"], "per_gradient_group")
+        self.assertTrue(summary["generalized_full_slaclip_beta"])
+        self.assertEqual(
+            summary["base_target_clipped_fraction_by_group"], targets
+        )
+        self.assertEqual(summary["beta_by_group"], targets)
+        self.assertNotIn("base_target_clipped_fraction", summary)
+        self.assertNotIn("beta", summary)
+        for group, values in settings.items():
+            controller = summary[group]
+            self.assertAlmostEqual(
+                controller["base_target_clipped_fraction"], targets[group]
+            )
+            self.assertAlmostEqual(controller["beta"], targets[group])
+            self.assertAlmostEqual(
+                controller["remaining_non_small_gradient_fraction"],
+                1.0 - values["z"],
+            )
+            self.assertAlmostEqual(
+                controller["dynamic_target_clipped"],
+                1.0 - values["q"],
+            )
+            self.assertAlmostEqual(
+                controller["dynamic_target_unclipped"], values["q"]
+            )
+            self.assertAlmostEqual(controller["raw_log_step"], 0.0, places=12)
+            self.assertAlmostEqual(
+                controller["next_clip_threshold"],
+                values["threshold"],
+                places=12,
             )
 
     def test_recorded_signal_and_noise_reconstruct_fedavg_update(self) -> None:
@@ -919,6 +1112,72 @@ class PaperReproTests(unittest.TestCase):
             clients=[np.array([0]), np.array([1])],
             slaclip_contract=contract,
         )
+
+    def test_checkpoint_binds_groupwise_full_slaclip_base_targets(self) -> None:
+        config = replace(paper_config(rounds=2), method="slaclip_dp_lora")
+        state = valid_checkpoint_state(config, completed_round=2)
+        targets = {"A": 1.0 / 3.0, "B": 0.8}
+        state["last_round_summary"]["slaclip_controller"] = {
+            "A": {
+                "next_clip_threshold": 3.0,
+                "base_target_clipped_fraction": targets["A"],
+            },
+            "B": {
+                "next_clip_threshold": 1.0,
+                "base_target_clipped_fraction": targets["B"],
+            },
+        }
+        contract = {
+            "schema_version": (
+                "groupwise_generalized_full_slaclip_beta_contract_v1"
+            ),
+            "variant": "groupwise_generalized_full_slaclip_beta",
+            "controller_input": "noisy_endpoints",
+            "controller": {
+                "controller_input": "noisy_endpoints",
+                "eta": 0.05,
+                "base_target_clipped_fraction_by_group": targets,
+                "beta_by_group": targets,
+                "num_slots": 5,
+                "c_min": 0.1,
+                "c_max": 50.0,
+            },
+        }
+        state["slaclip_controller_state"] = {
+            "controller_contract_sha256": canonical_json_fingerprint(contract),
+            "controller_input": "noisy_endpoints",
+            "updates_completed": 2,
+            "next_clip_threshold_by_group": {"A": 3.0, "B": 1.0},
+            "base_target_clipped_fraction_by_group": targets,
+        }
+        validate_checkpoint_trainer_state(
+            state,
+            completed_round=2,
+            model_kind="bert",
+            config=config,
+            run_config_fingerprint="run-fingerprint",
+            private_key_commitment="key-commitment",
+            rng_domain="rng-domain",
+            clients=[np.array([0]), np.array([1])],
+            slaclip_contract=contract,
+        )
+
+        corrupted = copy.deepcopy(state)
+        corrupted["slaclip_controller_state"][
+            "base_target_clipped_fraction_by_group"
+        ]["A"] = 0.4
+        with self.assertRaisesRegex(RuntimeError, "base_target.*by_group"):
+            validate_checkpoint_trainer_state(
+                corrupted,
+                completed_round=2,
+                model_kind="bert",
+                config=config,
+                run_config_fingerprint="run-fingerprint",
+                private_key_commitment="key-commitment",
+                rng_domain="rng-domain",
+                clients=[np.array([0]), np.array([1])],
+                slaclip_contract=contract,
+            )
 
     def test_checkpoint_rejects_wrong_evaluation_round_sequence(self) -> None:
         config = paper_config()

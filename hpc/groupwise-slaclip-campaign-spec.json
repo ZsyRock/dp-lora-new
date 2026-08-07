@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "campaign_name": "groupwise_generalized_full_slaclip_k5_mechanism_v1",
+  "description": "One-allocation, three-stage groupwise generalized full-SlaClip-beta mechanism study. Fixed trajectories calibrate A and B separately; development selects a noisy controller; fresh seeds compare fixed, noisy, and a matched exact-endpoint NON_DP oracle.",
+  "expected_stage_arm_counts": {
+    "fixed_development": 6,
+    "slaclip_development": 180,
+    "confirmation": 120,
+    "total": 306
+  },
+  "common": {
+    "models": ["bert", "gpt2"],
+    "num_clients": 5,
+    "rounds": 50,
+    "batch_size": 8,
+    "noise_multiplier": 2.0,
+    "learning_rate": 0.0005,
+    "rank": 512,
+    "max_seq_length": 128,
+    "max_validation_records": 512,
+    "eval_every": 10,
+    "checkpoint_every": 25,
+    "data_split_seed": 1729,
+    "evaluation_seed": 2718,
+    "delta": 0.00001,
+    "slaclip_num_slots": 5,
+    "slaclip_c_min": 0.1,
+    "slaclip_c_max": 50.0,
+    "slaclip_endpoint_epsilon": 0.000001
+  },
+  "fixed_development": {
+    "method": "paper_dp_lora",
+    "clip_norm_by_model": {"bert": 3.0, "gpt2": 1.0},
+    "tuned_C_source": {
+      "campaign_run_id": "staged-slaclip-tuned-fixed-8bfa84c-20260805T073600Z",
+      "repository_sha": "8bfa84cd149b145d2873c8b8153f85ea51cd9e0d",
+      "fixed_lock_sha256": "6b1b9333afd15c316ae361f41e459b7115b36f5d8098218c70c01274175edefc",
+      "fixed_lock_file_sha256": "1a782ed0262afd14f026d4e008fe11eb2c7fdebc12502401dacae3111e48ae00",
+      "slurm_job_id": "1361071",
+      "selected_clip_norm_by_model": {"bert": 3.0, "gpt2": 1.0}
+    },
+    "seeds": [300, 301, 302],
+    "calibration": {
+      "groups": ["A", "B"],
+      "q_formula": "q=exact_normalized_slack_endpoint_1",
+      "z_formula": "z=exact_normalized_slack_endpoint_K/(C+epsilon)",
+      "stationary_beta_formula": "beta=(1-q)/(1-z)",
+      "A_policy": "median_allow_zero",
+      "B_policy": "five_linearly_spaced_points_between_q10_and_q90",
+      "tracking_bias": "actual_clipped_fraction-beta*(1-z)"
+    }
+  },
+  "slaclip_development": {
+    "method": "slaclip_dp_lora",
+    "seeds": [300, 301, 302],
+    "initial_clip_norms_by_model": {
+      "bert": [2.5, 3.0],
+      "gpt2": [0.75, 1.0]
+    },
+    "etas": [0.0025, 0.005, 0.01],
+    "selection_rule": [
+      "lowest_mean_paired_final_loss_delta_vs_tuned_fixed",
+      "lowest_mean_paired_normalized_loss_auc_delta",
+      "fewest_controller_instability_events",
+      "smaller_eta",
+      "smaller_beta_B",
+      "smaller_initial_C"
+    ]
+  },
+  "confirmation": {
+    "methods": ["paper_dp_lora", "slaclip_dp_lora", "oracle_slaclip_control"],
+    "seeds": [400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 416, 417, 418, 419],
+    "primary_metric": "final_internal_validation_loss",
+    "oracle_privacy_label": "NON_DP_PRIVATE_DIAGNOSTIC"
+  },
+  "scientific_boundary": {
+    "analysis_role": "mechanism_development_then_fresh_training_seed_confirmation",
+    "controller_family": "groupwise_generalized_full_SlaClip_beta_two_CDF_endpoints_K5",
+    "excluded_method_family": "SlaClip-Q",
+    "learning_rate_policy": "fixed_at_5e-4_to_avoid_controller_and_optimizer_confounding_in_this_campaign",
+    "K": 5,
+    "num_clients": 5,
+    "noise_multiplier": 2.0,
+    "cdf_endpoint_noise_std_theoretical": 2.0,
+    "development_only_warning": "K5_N5_sigma2_has_high_endpoint_noise_and_is_a_mechanism_study_not_a_journal_claim",
+    "oracle_privacy_label": "NON_DP_PRIVATE_DIAGNOSTIC",
+    "paper_result_reproduced": false,
+    "external_test_set_used": false,
+    "end_to_end_dp_certified": false,
+    "single_allocation": true,
+    "nested_sbatch_or_array": false,
+    "all_candidates_reported": true
+  }
+}

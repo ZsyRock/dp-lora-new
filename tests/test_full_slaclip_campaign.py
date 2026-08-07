@@ -9,6 +9,8 @@ import subprocess
 from collections import Counter
 from pathlib import Path
 
+import pytest
+
 import paper_repro.full_slaclip_campaign as campaign_module
 from paper_repro.full_slaclip_campaign import (
     FULL_SLACLIP_METHOD,
@@ -548,6 +550,57 @@ def test_arm_command_uses_full_controller_endpoints_without_q_inputs(tmp_path: P
     assert "--slaclip-num-slots" not in fixed_command
 
 
+def test_groupwise_full_controller_arm_is_validated_and_uses_canonical_ab_cli(
+    tmp_path: Path,
+) -> None:
+    adaptive = copy.deepcopy(
+        next(
+            arm
+            for arm in expand_spec(load_spec(SPEC))
+            if arm["method"] == FULL_SLACLIP_METHOD
+        )
+    )
+    adaptive["slaclip_base_target_clipped_fraction"] = None
+    adaptive["slaclip_beta"] = None
+    adaptive["slaclip_base_target_clipped_fraction_by_group"] = {
+        "A": 0.125,
+        "B": 0.875,
+    }
+    adaptive["slaclip_beta_by_group"] = {"A": 0.125, "B": 0.875}
+    adaptive["slaclip_baseline_calibration_lock_sha256"] = "c" * 64
+    adaptive["acknowledge_slaclip_baseline_calibration_is_non_dp"] = True
+    campaign_module._validate_runtime_arm(adaptive, index=adaptive["index"])
+
+    command = _arm_command(
+        adaptive,
+        repository=tmp_path / "repo",
+        python_bin=tmp_path / "env" / "bin" / "python",
+        input_manifest=tmp_path / "input.json",
+        output_dir=tmp_path / "adaptive",
+        private_key=tmp_path / "key",
+        stop_file=tmp_path / "stop",
+    )
+    assert "--slaclip-base-target-clipped-fraction" not in command
+    assert command[command.index("--slaclip-base-target-clipped-fraction-a") + 1] == "0.125"
+    assert command[command.index("--slaclip-base-target-clipped-fraction-b") + 1] == "0.875"
+    assert "--slaclip-beta" not in command
+    assert command[
+        command.index("--slaclip-baseline-calibration-lock-sha256") + 1
+    ] == "c" * 64
+    assert "--acknowledge-slaclip-baseline-calibration-is-non-dp" in command
+
+    invalid = copy.deepcopy(adaptive)
+    invalid["learning_rate"] = "0.0005"
+    with pytest.raises(RuntimeError, match="learning_rate must be numeric"):
+        campaign_module._validate_runtime_arm(invalid, index=invalid["index"])
+    invalid_ack = copy.deepcopy(adaptive)
+    invalid_ack["acknowledge_slaclip_baseline_calibration_is_non_dp"] = 1
+    with pytest.raises(RuntimeError, match="not acknowledged"):
+        campaign_module._validate_runtime_arm(
+            invalid_ack, index=invalid_ack["index"]
+        )
+
+
 def test_completed_arm_fast_path_avoids_python_and_key_reload(
     tmp_path: Path,
     monkeypatch,
@@ -1076,6 +1129,24 @@ def test_oracle_noisy_pair_resolution_is_exact_and_fails_closed() -> None:
     assert len(pairs) == 2
     assert pairs[0][0]["method"] == ORACLE_SLACLIP_METHOD
     assert pairs[0][1]["method"] == FULL_SLACLIP_METHOD
+
+    provenance_bound = copy.deepcopy(simple_runtime)
+    for arm in provenance_bound["arms"]:
+        if arm["method"] in {FULL_SLACLIP_METHOD, ORACLE_SLACLIP_METHOD}:
+            arm["slaclip_baseline_calibration_lock_sha256"] = "a" * 64
+            arm["acknowledge_slaclip_baseline_calibration_is_non_dp"] = True
+            arm["slaclip_calibration_provenance"] = (
+                "exact_NON_DP_fixed_trajectory_diagnostics_frozen_before_fresh_seeds"
+            )
+    assert len(resolve_oracle_noisy_arm_pairs(provenance_bound)) == 2
+    mismatched_provenance = copy.deepcopy(provenance_bound)
+    next(
+        arm
+        for arm in mismatched_provenance["arms"]
+        if arm["method"] == ORACLE_SLACLIP_METHOD
+    )["slaclip_baseline_calibration_lock_sha256"] = "b" * 64
+    with pytest.raises(RuntimeError, match="must be unique"):
+        resolve_oracle_noisy_arm_pairs(mismatched_provenance)
 
     missing = copy.deepcopy(simple_runtime)
     oracle = next(

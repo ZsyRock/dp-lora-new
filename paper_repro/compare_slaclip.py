@@ -3,9 +3,12 @@
 
 Full SlaClip reconstructs a noisy binned CDF and updates the clipping norm
 from its endpoint nearest the current threshold and its endpoint nearest zero.
-There is no baseline-derived calibration and no fixed target clipping rate in
-this comparison.  Exact CDF indicators remain non-DP diagnostic data; only
-the noisy endpoints are permitted to drive the controller.
+The historical shared-beta contract has no baseline-derived calibration.  The
+groupwise generalized-beta contract may freeze A/B beta hyperparameters chosen
+from an immutable NON-DP fixed-baseline development lock, but never consumes
+that calibration data at controller runtime.  Neither contract uses a fixed
+target clipping rate: exact CDF indicators remain NON-DP diagnostics and only
+the noisy endpoints are permitted to drive the online controller.
 """
 
 from __future__ import annotations
@@ -46,6 +49,15 @@ COMPARISON_SCHEMA_VERSION = 2
 COMPARISON_STATUS = "FULL_SLACLIP_COMPARISON_COMPLETE"
 SLACLIP_CONTRACT_SCHEMA = "full_slaclip_contract_v1"
 SLACLIP_VARIANT = "full_slaclip_cdf_endpoints"
+GROUPWISE_SLACLIP_CONTRACT_SCHEMA = (
+    "groupwise_generalized_full_slaclip_beta_contract_v1"
+)
+GROUPWISE_SLACLIP_VARIANT = "groupwise_generalized_full_slaclip_beta"
+SLACLIP_VARIANT_BY_CONTRACT_SCHEMA = {
+    SLACLIP_CONTRACT_SCHEMA: SLACLIP_VARIANT,
+    GROUPWISE_SLACLIP_CONTRACT_SCHEMA: GROUPWISE_SLACLIP_VARIANT,
+}
+NOISY_CONTROLLER_INPUT = "noisy_endpoints"
 ROUND_PREFIX_DOMAIN = b"dp-lora-round-shard-prefix-v1\0"
 EXACT_CDF_FLOAT32_TOLERANCE = 1e-6
 SLACLIP_Z_0995 = 2.5758293035489004
@@ -188,6 +200,15 @@ def _fraction(value: Any, description: str) -> float:
     return result
 
 
+def _group_fraction_mapping(value: Any, description: str) -> dict[str, float]:
+    if not isinstance(value, dict) or set(value) != set(LORA_GROUPS):
+        raise RuntimeError(f"{description} must contain exactly A and B")
+    return {
+        group: _fraction(value[group], f"{description}[{group}]")
+        for group in LORA_GROUPS
+    }
+
+
 def _positive_integer(value: Any, description: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise RuntimeError(f"{description} must be a positive integer")
@@ -230,16 +251,49 @@ def _require_claims(
     privacy = run_config.get("privacy_claim")
     if not isinstance(privacy, dict):
         raise RuntimeError("run config has no privacy claim")
+    scientific_contract = run_config.get("scientific_contract")
+    algorithm = (
+        scientific_contract.get("algorithm_contract")
+        if isinstance(scientific_contract, dict)
+        else None
+    )
+    slaclip_contract = (
+        algorithm.get("slaclip") if isinstance(algorithm, dict) else None
+    )
+    groupwise = bool(
+        adaptive
+        and isinstance(slaclip_contract, dict)
+        and slaclip_contract.get("schema_version")
+        == GROUPWISE_SLACLIP_CONTRACT_SCHEMA
+    )
     for key, expected in {
         "end_to_end_dp_certified": False,
         "epsilon": None,
         "sigma_is_not_epsilon": True,
         "diagnostics_are_private_non_dp_data": True,
-        "baseline_derived_calibration_is_non_dp": False,
+        "baseline_derived_calibration_is_non_dp": groupwise,
         "exact_cdf_diagnostics_are_non_dp": adaptive,
     }.items():
         if privacy.get(key) != expected:
             raise RuntimeError(f"unsafe privacy claim: {key}")
+    if groupwise:
+        _require_sha256(
+            privacy.get("baseline_calibration_lock_sha256"),
+            "groupwise SlaClip baseline calibration lock",
+        )
+        if privacy.get("baseline_calibration_consumed_at_runtime") is not False:
+            raise RuntimeError(
+                "unsafe privacy claim: baseline_calibration_consumed_at_runtime"
+            )
+    else:
+        if privacy.get("baseline_calibration_lock_sha256") not in (None,):
+            raise RuntimeError(
+                "shared SlaClip privacy claim unexpectedly contains a calibration lock"
+            )
+        if privacy.get("baseline_calibration_consumed_at_runtime", False) is not False:
+            raise RuntimeError(
+                "unsafe privacy claim: baseline_calibration_consumed_at_runtime"
+            )
 
     for key, expected in {
         "reproduction_claim_level": 1,
@@ -447,6 +501,7 @@ def _load_arm(directory: Path, method: str, *, adaptive: bool) -> dict[str, Any]
         "effective_config": effective,
         "algorithm_contract": algorithm,
         "slaclip_contract": slaclip_contract,
+        "privacy_claim": run_config["privacy_claim"],
         "rounds": rounds,
         "clients": clients,
         "models": model_records,
@@ -472,10 +527,13 @@ def _validate_contract(
 ) -> dict[str, Any]:
     contract = adaptive["slaclip_contract"]
     assert isinstance(contract, dict)
-    if contract.get("schema_version") != SLACLIP_CONTRACT_SCHEMA:
+    schema = contract.get("schema_version")
+    if schema not in SLACLIP_VARIANT_BY_CONTRACT_SCHEMA:
         raise RuntimeError("full-SlaClip contract schema mismatch")
-    if contract.get("variant") != SLACLIP_VARIANT:
+    variant = contract.get("variant")
+    if variant != SLACLIP_VARIANT_BY_CONTRACT_SCHEMA[schema]:
         raise RuntimeError("full-SlaClip contract variant mismatch")
+    groupwise = schema == GROUPWISE_SLACLIP_CONTRACT_SCHEMA
     forbidden_fields = {
         "calibration",
         "target_spec",
@@ -497,29 +555,166 @@ def _validate_contract(
             pending.extend(value)
     if contract.get("independently_privacy_certified") is not False:
         raise RuntimeError("full-SlaClip contract makes an unsafe privacy claim")
+    provenance = contract.get("hyperparameter_provenance")
+    calibration_lock: str | None = None
+    if groupwise:
+        if not isinstance(provenance, dict):
+            raise RuntimeError(
+                "groupwise full-SlaClip hyperparameter provenance is missing"
+            )
+        calibration_lock = _require_sha256(
+            provenance.get("calibration_lock_sha256"),
+            "groupwise SlaClip calibration lock",
+        )
+        expected_provenance = {
+            "source": "fixed_baseline_exact_endpoint_development_selection_lock",
+            "baseline_derived_calibration_is_non_dp": True,
+            "calibration_lock_sha256": calibration_lock,
+            "calibration_data_consumed_at_controller_runtime": False,
+            "frozen_scalar_hyperparameters_only": True,
+        }
+        if provenance != expected_provenance:
+            raise RuntimeError(
+                "groupwise full-SlaClip hyperparameter provenance mismatch"
+            )
+        privacy = adaptive.get("privacy_claim")
+        if not isinstance(privacy, dict):
+            raise RuntimeError("groupwise full-SlaClip privacy claim is missing")
+        if (
+            privacy.get("baseline_derived_calibration_is_non_dp") is not True
+            or privacy.get("baseline_calibration_lock_sha256")
+            != calibration_lock
+            or privacy.get("baseline_calibration_consumed_at_runtime") is not False
+        ):
+            raise RuntimeError(
+                "groupwise full-SlaClip calibration/privacy provenance mismatch"
+            )
+    elif provenance is not None:
+        # Newly generated shared-v1 runs carry explicit direct-CLI provenance;
+        # historical v1 artifacts did not.  Accept absence, but never accept a
+        # baseline-derived lock under the shared schema.
+        expected_provenance = {
+            "source": "direct_cli_not_declared_baseline_derived",
+            "baseline_derived_calibration_is_non_dp": False,
+            "calibration_lock_sha256": None,
+            "calibration_data_consumed_at_controller_runtime": False,
+            "frozen_scalar_hyperparameters_only": True,
+        }
+        if provenance != expected_provenance:
+            raise RuntimeError(
+                "shared full-SlaClip hyperparameter provenance mismatch"
+            )
+    # Historical shared-beta contracts predate these explicit input labels, so
+    # absence remains compatible.  If present, however, they must describe the
+    # noisy-endpoint controller used by this comparator.  The new groupwise
+    # schema requires the labels rather than silently defaulting them.
+    if contract.get("controller_input", NOISY_CONTROLLER_INPUT) != (
+        NOISY_CONTROLLER_INPUT
+    ):
+        raise RuntimeError("full-SlaClip controller input is not noisy endpoints")
+    if contract.get("non_private_oracle_control", False) is not False:
+        raise RuntimeError("full-SlaClip contract unexpectedly enables oracle control")
+    if groupwise:
+        for key, expected in {
+            "controller_input": NOISY_CONTROLLER_INPUT,
+            "non_private_oracle_control": False,
+        }.items():
+            if contract.get(key) != expected:
+                raise RuntimeError(
+                    f"groupwise full-SlaClip contract mismatch: {key}"
+                )
     controller = contract.get("controller")
     if not isinstance(controller, dict):
         raise RuntimeError("full-SlaClip controller contract is missing")
     num_slots = _positive_integer(controller.get("num_slots"), "SlaClip slots")
     eta = _finite_number(controller.get("eta"), "SlaClip eta")
-    beta = _finite_number(controller.get("beta"), "SlaClip beta")
-    base_target = _finite_number(
-        controller.get("base_target_clipped_fraction"),
-        "SlaClip base target clipped fraction",
-    )
-    if base_target != beta:
-        raise RuntimeError("full-SlaClip beta/base-target aliases disagree")
+    if groupwise:
+        if "beta" in controller or "base_target_clipped_fraction" in controller:
+            raise RuntimeError(
+                "groupwise full-SlaClip contract contains a shared target alias"
+            )
+        base_targets = _group_fraction_mapping(
+            controller.get("base_target_clipped_fraction_by_group"),
+            "SlaClip base target clipped fraction by group",
+        )
+        betas = _group_fraction_mapping(
+            controller.get("beta_by_group"), "SlaClip beta by group"
+        )
+        if base_targets != betas:
+            raise RuntimeError(
+                "groupwise full-SlaClip beta/base-target mappings disagree"
+            )
+        expected_groupwise_contract = {
+            "controller_input": NOISY_CONTROLLER_INPUT,
+            "slack_noise_method_scope": ADAPTIVE_METHOD,
+            "target_parameterization": "per_gradient_group",
+            "generalized_full_slaclip_beta": True,
+            "shared_beta_compatibility_alias_active": False,
+            "base_target_clipped_fraction_source": "groupwise_canonical_cli",
+        }
+        for key, expected in expected_groupwise_contract.items():
+            if controller.get(key) != expected:
+                raise RuntimeError(
+                    f"groupwise full-SlaClip controller contract mismatch: {key}"
+                )
+        expected_formula = (
+            "for each g in {A,B}:q_g=s_hat_g[0];"
+            "r_g=s_hat_g[K-1];z_g=r_g/(C_g+1e-6);"
+            "remaining_g=1-z_g;"
+            "target_clip_g=clip(beta_g*remaining_g,0,1);"
+            "gamma_g=1-target_clip_g;"
+            "C_g_next=clip(C_g*exp(eta*(gamma_g-q_g)),C_min,C_max)"
+        )
+        if controller.get("update_formula") != expected_formula:
+            raise RuntimeError("groupwise full-SlaClip update formula mismatch")
+    else:
+        unexpected_groupwise_fields = {
+            "base_target_clipped_fraction_by_group",
+            "beta_by_group",
+            "target_parameterization",
+            "generalized_full_slaclip_beta",
+            "shared_beta_compatibility_alias_active",
+        }.intersection(controller)
+        if unexpected_groupwise_fields:
+            raise RuntimeError(
+                "shared full-SlaClip contract contains groupwise target fields"
+            )
+        beta = _fraction(controller.get("beta"), "SlaClip beta")
+        base_target = _fraction(
+            controller.get("base_target_clipped_fraction"),
+            "SlaClip base target clipped fraction",
+        )
+        if base_target != beta:
+            raise RuntimeError("full-SlaClip beta/base-target aliases disagree")
+        base_targets = {group: beta for group in LORA_GROUPS}
+        betas = dict(base_targets)
+        if controller.get("controller_input", NOISY_CONTROLLER_INPUT) != (
+            NOISY_CONTROLLER_INPUT
+        ):
+            raise RuntimeError("full-SlaClip controller input is not noisy endpoints")
     lower = _finite_number(controller.get("c_min"), "SlaClip lower bound")
     upper = _finite_number(controller.get("c_max"), "SlaClip upper bound")
     epsilon = _finite_number(controller.get("epsilon"), "SlaClip endpoint epsilon")
     initial = _finite_number(
         controller.get("initial_clip_threshold"), "SlaClip initial threshold"
     )
-    if eta < 0.0 or not 0.0 <= beta <= 1.0 or epsilon <= 0.0:
+    if eta < 0.0 or epsilon <= 0.0:
         raise RuntimeError("full-SlaClip controller parameters are invalid")
+    if groupwise and epsilon != 1e-6:
+        raise RuntimeError(
+            "groupwise full-SlaClip epsilon/update-formula contract mismatch"
+        )
     if lower <= 0.0 or upper < lower or not lower <= initial <= upper:
         raise RuntimeError("full-SlaClip threshold contract is invalid")
-    if initial != baseline_clip_norm:
+    adaptive_initial = _finite_number(
+        adaptive["effective_config"].get("clip_norm"),
+        "adaptive effective initial clip norm",
+    )
+    if initial != adaptive_initial:
+        raise RuntimeError(
+            "adaptive initial C differs between effective config and contract"
+        )
+    if not groupwise and initial != baseline_clip_norm:
         raise RuntimeError("adaptive initial C differs from baseline C")
     if controller.get("near_threshold_index") != 0:
         raise RuntimeError("full-SlaClip near-threshold endpoint index mismatch")
@@ -570,9 +765,14 @@ def _validate_contract(
     ):
         raise RuntimeError("full-SlaClip K/noise audit mismatch: theoretical noise")
     return {
+        "schema_version": schema,
+        "variant": variant,
+        "groupwise": groupwise,
         "num_slots": num_slots,
         "eta": eta,
-        "beta": beta,
+        "beta_by_group": betas,
+        "base_target_clipped_fraction_by_group": base_targets,
+        "calibration_lock_sha256": calibration_lock,
         "min_clip_norm": lower,
         "max_clip_norm": upper,
         "epsilon": epsilon,
@@ -892,18 +1092,70 @@ def _validate_controller_trajectory(
         if not isinstance(value, dict):
             raise RuntimeError(f"adaptive/{model} controller round is missing")
         expected_header = {
-            "variant": SLACLIP_VARIANT,
+            "variant": parameters["variant"],
             "update_timing": "once_after_all_clients_for_use_in_next_round",
             "clients": adaptive["clients"],
             "num_slots": parameters["num_slots"],
             "eta": parameters["eta"],
-            "beta": parameters["beta"],
             "epsilon": parameters["epsilon"],
             "near_threshold_index": 0,
             "near_zero_index": parameters["num_slots"] - 1,
             "c_min": parameters["min_clip_norm"],
             "c_max": parameters["max_clip_norm"],
         }
+        if parameters["groupwise"]:
+            if "beta" in value or "base_target_clipped_fraction" in value:
+                raise RuntimeError(
+                    f"adaptive/{model} groupwise controller has a shared target"
+                )
+            round_targets = _group_fraction_mapping(
+                value.get("base_target_clipped_fraction_by_group"),
+                f"adaptive/{model} round base target by group",
+            )
+            round_betas = _group_fraction_mapping(
+                value.get("beta_by_group"),
+                f"adaptive/{model} round beta by group",
+            )
+            if (
+                round_targets
+                != parameters["base_target_clipped_fraction_by_group"]
+                or round_betas != parameters["beta_by_group"]
+                or round_targets != round_betas
+            ):
+                raise RuntimeError(
+                    f"adaptive/{model} groupwise controller target mapping mismatch"
+                )
+            expected_header.update(
+                {
+                    "controller_input": NOISY_CONTROLLER_INPUT,
+                    "controller_input_is_non_dp_exact": False,
+                    "target_parameterization": "per_gradient_group",
+                    "generalized_full_slaclip_beta": True,
+                    "base_target_clipped_fraction_by_group": round_targets,
+                    "beta_by_group": round_betas,
+                }
+            )
+        else:
+            if any(
+                key in value
+                for key in (
+                    "base_target_clipped_fraction_by_group",
+                    "beta_by_group",
+                    "target_parameterization",
+                    "generalized_full_slaclip_beta",
+                )
+            ):
+                raise RuntimeError(
+                    f"adaptive/{model} shared controller has groupwise targets"
+                )
+            expected_header.update(
+                {
+                    "base_target_clipped_fraction": parameters[
+                        "base_target_clipped_fraction_by_group"
+                    ]["A"],
+                    "beta": parameters["beta_by_group"]["A"],
+                }
+            )
         for key, expected in expected_header.items():
             if value.get(key) != expected:
                 raise RuntimeError(
@@ -914,6 +1166,15 @@ def _validate_controller_trajectory(
             group_value = value.get(group)
             if not isinstance(group_value, dict):
                 raise RuntimeError(f"adaptive/{model}/{group} controller is missing")
+            if parameters["groupwise"]:
+                for key, expected in {
+                    "controller_input": NOISY_CONTROLLER_INPUT,
+                    "controller_input_is_non_dp_exact": False,
+                }.items():
+                    if group_value.get(key) != expected:
+                        raise RuntimeError(
+                            f"adaptive/{model}/{group} controller input mismatch: {key}"
+                        )
             used = _finite_number(
                 group_value.get("clip_threshold_used"),
                 f"adaptive/{model}/{group} threshold",
@@ -966,7 +1227,7 @@ def _validate_controller_trajectory(
                 used,
                 noisy[0],
                 noisy[-1],
-                beta=parameters["beta"],
+                beta=parameters["beta_by_group"][group],
                 eta=parameters["eta"],
                 min_clip_norm=parameters["min_clip_norm"],
                 max_clip_norm=parameters["max_clip_norm"],
@@ -981,7 +1242,7 @@ def _validate_controller_trajectory(
                 used,
                 exact[0],
                 exact[-1],
-                beta=parameters["beta"],
+                beta=parameters["beta_by_group"][group],
                 eta=parameters["eta"],
                 min_clip_norm=parameters["min_clip_norm"],
                 max_clip_norm=parameters["max_clip_norm"],
@@ -1080,6 +1341,18 @@ def _validate_controller_trajectory(
                     == update_direction(oracle_log_step)
                 ),
             }
+            if parameters["groupwise"]:
+                expected_endpoint_telemetry.update(
+                    {
+                        "noisy_dynamic_target_clipped": float(
+                            recomputed["dynamic_target_clipped"]
+                        ),
+                        "noisy_raw_log_step": noisy_log_step,
+                        "noisy_next_clip_threshold": float(
+                            recomputed["next_clip_norm"]
+                        ),
+                    }
+                )
             for key, expected in expected_endpoint_telemetry.items():
                 if key not in group_value or group_value[key] != expected:
                     raise RuntimeError(
@@ -1120,12 +1393,83 @@ def _validate_controller_trajectory(
     if not isinstance(controller_summary, dict):
         raise RuntimeError(f"adaptive/{model} controller summary is missing")
     if (
-        controller_summary.get("variant") != SLACLIP_VARIANT
+        controller_summary.get("variant") != parameters["variant"]
         or controller_summary.get("rounds") != adaptive["rounds"]
         or controller_summary.get("trajectory_sha256")
         != canonical_json_fingerprint(trajectory)
     ):
         raise RuntimeError(f"adaptive/{model} controller trajectory digest mismatch")
+    if parameters["groupwise"]:
+        if "beta" in controller_summary or (
+            "base_target_clipped_fraction" in controller_summary
+        ):
+            raise RuntimeError(
+                f"adaptive/{model} groupwise controller summary has a shared target"
+            )
+        summary_targets = _group_fraction_mapping(
+            controller_summary.get("base_target_clipped_fraction_by_group"),
+            f"adaptive/{model} summary base target by group",
+        )
+        summary_betas = _group_fraction_mapping(
+            controller_summary.get("beta_by_group"),
+            f"adaptive/{model} summary beta by group",
+        )
+        expected_summary_header = {
+            "controller_input": NOISY_CONTROLLER_INPUT,
+            "controller_input_is_non_dp_exact": False,
+            "target_parameterization": "per_gradient_group",
+            "generalized_full_slaclip_beta": True,
+            "base_target_clipped_fraction_by_group": parameters[
+                "base_target_clipped_fraction_by_group"
+            ],
+            "beta_by_group": parameters["beta_by_group"],
+        }
+        if summary_targets != summary_betas:
+            raise RuntimeError(
+                f"adaptive/{model} controller summary target aliases disagree"
+            )
+        for key, expected in expected_summary_header.items():
+            if controller_summary.get(key) != expected:
+                raise RuntimeError(
+                    f"adaptive/{model} controller summary header mismatch: {key}"
+                )
+    else:
+        if any(
+            key in controller_summary
+            for key in (
+                "base_target_clipped_fraction_by_group",
+                "beta_by_group",
+                "target_parameterization",
+                "generalized_full_slaclip_beta",
+            )
+        ):
+            raise RuntimeError(
+                f"adaptive/{model} shared controller summary has groupwise targets"
+            )
+        # These scalar aliases were added after the v1 schema was deployed.
+        # Keep old summaries valid, while fail-closing if either alias appears
+        # with the wrong value or without its companion.
+        scalar_summary_aliases = {
+            key for key in ("base_target_clipped_fraction", "beta")
+            if key in controller_summary
+        }
+        if scalar_summary_aliases and scalar_summary_aliases != {
+            "base_target_clipped_fraction",
+            "beta",
+        }:
+            raise RuntimeError(
+                f"adaptive/{model} controller summary scalar aliases are incomplete"
+            )
+        if scalar_summary_aliases:
+            expected_beta = parameters["beta_by_group"]["A"]
+            if (
+                controller_summary["base_target_clipped_fraction"]
+                != expected_beta
+                or controller_summary["beta"] != expected_beta
+            ):
+                raise RuntimeError(
+                    f"adaptive/{model} controller summary scalar aliases disagree"
+                )
     model_contract = model_summary.get("slaclip")
     if not isinstance(model_contract, dict):
         raise RuntimeError(f"adaptive/{model} full-SlaClip model contract is missing")
@@ -1252,20 +1596,37 @@ def _validate_controller_trajectory(
             ),
             **accumulator,
         }
-    return {
+    result = {
         "rounds": adaptive["rounds"],
         "trajectory_sha256": controller_summary["trajectory_sha256"],
         "initial_clip_norm": parameters["initial_clip_norm"],
         "final_clip_norm_by_group": dict(expected_thresholds),
         "num_slots": parameters["num_slots"],
         "eta": parameters["eta"],
-        "base_target_clipped_fraction": parameters["beta"],
-        "beta": parameters["beta"],
         "epsilon": parameters["epsilon"],
         "near_threshold_index": 0,
         "near_zero_index": parameters["num_slots"] - 1,
         "groups": group_results,
     }
+    if parameters["groupwise"]:
+        result.update(
+            {
+                "target_parameterization": "per_gradient_group",
+                "generalized_full_slaclip_beta": True,
+                "base_target_clipped_fraction_by_group": dict(
+                    parameters["base_target_clipped_fraction_by_group"]
+                ),
+                "beta_by_group": dict(parameters["beta_by_group"]),
+            }
+        )
+    else:
+        result.update(
+            {
+                "base_target_clipped_fraction": parameters["beta_by_group"]["A"],
+                "beta": parameters["beta_by_group"]["A"],
+            }
+        )
+    return result
 
 
 def build_comparison(
@@ -1278,21 +1639,34 @@ def build_comparison(
     adaptive_path = _absolute_path(adaptive_dir)
     baseline = _load_arm(baseline_path, BASELINE_METHOD, adaptive=False)
     adaptive = _load_arm(adaptive_path, ADAPTIVE_METHOD, adaptive=True)
+    slaclip_contract = adaptive["slaclip_contract"]
+    assert isinstance(slaclip_contract, dict)
+    slaclip_schema = slaclip_contract.get("schema_version")
+    slaclip_variant = slaclip_contract.get("variant")
+    groupwise = slaclip_schema == GROUPWISE_SLACLIP_CONTRACT_SCHEMA
     normalized_baseline = _normalized_contract(baseline["contract"])
     normalized_adaptive = _normalized_contract(adaptive["contract"])
+    if groupwise:
+        # The generalized development protocol compares a tuned fixed-C arm
+        # with an independently selected adaptive C0.  Remove only this one
+        # explicitly reported hyperparameter before enforcing all other paired
+        # scientific-contract fields.
+        for normalized in (normalized_baseline, normalized_adaptive):
+            effective = normalized.get("effective_config")
+            if not isinstance(effective, dict):
+                raise RuntimeError("normalized effective config is missing")
+            effective.pop("clip_norm", None)
     if normalized_baseline != normalized_adaptive:
         raise RuntimeError("baseline and adaptive arms differ outside full SlaClip")
     normalized_fingerprint = canonical_json_fingerprint(normalized_baseline)
     baseline_clip_norm = _finite_number(
         baseline["effective_config"].get("clip_norm"), "baseline clip norm"
     )
-    if (
-        _finite_number(
-            adaptive["effective_config"].get("clip_norm"),
-            "adaptive initial clip norm",
-        )
-        != baseline_clip_norm
-    ):
+    adaptive_initial_clip_norm = _finite_number(
+        adaptive["effective_config"].get("clip_norm"),
+        "adaptive initial clip norm",
+    )
+    if not groupwise and adaptive_initial_clip_norm != baseline_clip_norm:
         raise RuntimeError("adaptive initial C differs from baseline C")
 
     model_comparisons: dict[str, Any] = {}
@@ -1378,8 +1752,8 @@ def build_comparison(
         "paper_result_reproduced": False,
         "paper_benchmarks_evaluated": False,
         "contains_slaclip": True,
-        "slaclip_variant": SLACLIP_VARIANT,
-        "uses_baseline_calibration": False,
+        "slaclip_variant": slaclip_variant,
+        "uses_baseline_calibration": groupwise,
         "uses_fixed_target_clip_fraction": False,
         "methods_in_order": list(EXPECTED_METHODS),
         "normalized_scientific_contract_sha256": normalized_fingerprint,
@@ -1402,12 +1776,33 @@ def build_comparison(
             "end_to_end_dp_certified": False,
             "epsilon": None,
             "sigma_is_not_epsilon": True,
-            "baseline_calibration_consumed": False,
+            "baseline_calibration_consumed": groupwise,
             "controller_consumes_noisy_cdf_endpoints": True,
             "exact_cdf_diagnostics_are_non_dp_private_data": True,
             "adaptive_arm_independently_privacy_certified": False,
         },
     }
+    if groupwise:
+        core.update(
+            {
+                "slaclip_contract_schema": slaclip_schema,
+                "target_parameterization": "per_gradient_group",
+                "generalized_full_slaclip_beta": True,
+                "baseline_clip_norm": baseline_clip_norm,
+                "adaptive_initial_clip_norm": adaptive_initial_clip_norm,
+                "baseline_calibration_lock_sha256": slaclip_contract[
+                    "hyperparameter_provenance"
+                ]["calibration_lock_sha256"],
+                "baseline_calibration_consumed_at_runtime": False,
+                "hyperparameters_derived_from_non_dp_fixed_development": True,
+            }
+        )
+        core["privacy_notice"].update(
+            {
+                "baseline_calibration_consumed_at_runtime": False,
+                "hyperparameters_derived_from_non_dp_fixed_development": True,
+            }
+        )
     core["comparison_fingerprint"] = canonical_json_fingerprint(core)
     return core
 

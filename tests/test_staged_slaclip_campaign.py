@@ -116,7 +116,7 @@ def test_fixed_trajectory_maps_to_conditional_full_slaclip_beta(
     arm = {"arm_id": "calibration-arm", "models": ["bert"], "seed": 110}
     shard_path = staged._round_shard_path(tmp_path, arm, 1)
     shard_path.parent.mkdir(parents=True, mode=0o700)
-    raw_norms = [0.0, 1.0, 2.0, 12.0]
+    raw_norms = [9.0, 9.0, 12.0, 12.0]
     full.atomic_json(
         shard_path,
         {
@@ -128,8 +128,8 @@ def test_fixed_trajectory_maps_to_conditional_full_slaclip_beta(
                 for norm in raw_norms
             ],
             "round_summary": {
-                "B": {"clipped_fraction": 0.25},
-                "any_group_clipped_fraction": 0.25,
+                "B": {"clipped_fraction": 0.5},
+                "any_group_clipped_fraction": 0.5,
             },
         },
     )
@@ -141,17 +141,30 @@ def test_fixed_trajectory_maps_to_conditional_full_slaclip_beta(
         epsilon=1e-6,
         rounds=1,
     )
-    # At K=5, the final exact CDF endpoint is 1, 1/2, 0, 0 across
-    # these four records, hence 0.375 after public-count normalization.
-    expected_z = 0.375 / (10.0 + 1e-6)
-    expected_beta = 0.25 / (1.0 - expected_z)
+    # At K=5, each norm-9 record contributes one half to the first
+    # normalized endpoint while both clipped records contribute zero.  Thus
+    # q=0.25 even though the exact unclipped fraction is 0.5: stationary
+    # calibration must use q rather than silently substituting 1-p.
+    expected_q = 0.25
+    expected_z = 0.0
+    expected_beta = (1.0 - expected_q) / (1.0 - expected_z)
     assert values == pytest.approx([expected_beta])
-    assert rows[0]["exact_normalized_slack_endpoint_K"] == pytest.approx(0.375)
+    assert rows[0]["exact_normalized_slack_endpoint_1"] == pytest.approx(
+        expected_q
+    )
+    assert rows[0]["exact_normalized_slack_endpoint_K"] == pytest.approx(0.0)
     assert rows[0]["near_zero_adjusted_z"] == pytest.approx(expected_z)
     assert rows[0]["remaining_non_small_gradient_fraction"] == pytest.approx(
         1.0 - expected_z
     )
+    assert rows[0]["stationary_beta"] == pytest.approx(expected_beta)
     assert rows[0]["conditional_beta"] == pytest.approx(expected_beta)
+    assert rows[0]["actual_clipped_fraction_calibrated_beta"] == pytest.approx(
+        0.5
+    )
+    assert rows[0]["actual_clipped_fraction_tracking_bias"] == pytest.approx(
+        0.25
+    )
 
 
 def test_initial_C_boundary_policy_uses_same_direction_neighbours() -> None:

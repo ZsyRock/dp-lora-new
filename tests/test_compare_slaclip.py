@@ -14,6 +14,8 @@ from paper_repro.compare_slaclip import (
     ADAPTIVE_METHOD,
     BASELINE_METHOD,
     COMPARISON_STATUS,
+    GROUPWISE_SLACLIP_CONTRACT_SCHEMA,
+    GROUPWISE_SLACLIP_VARIANT,
     SLACLIP_CONTRACT_SCHEMA,
     SLACLIP_VARIANT,
     _independent_full_slaclip_update,
@@ -43,6 +45,8 @@ NUM_SLOTS = 3
 NOISE_MULTIPLIER = 2.0
 ETA = 0.2
 BETA = 0.5
+GROUPWISE_BETA = {"A": 0.2, "B": 0.8}
+CALIBRATION_LOCK = "d" * 64
 EPSILON = 1e-6
 C_MIN = 0.1
 C_MAX = 50.0
@@ -83,7 +87,7 @@ def digest(value: bytes | str) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def effective_config(method: str) -> dict:
+def effective_config(method: str, *, clip_norm: float = INITIAL_C) -> dict:
     return {
         "method": method,
         "num_clients": CLIENTS,
@@ -91,7 +95,7 @@ def effective_config(method: str) -> dict:
         "batch_size": 8,
         "noise_multiplier": NOISE_MULTIPLIER,
         "learning_rate": 5e-4,
-        "clip_norm": INITIAL_C,
+        "clip_norm": clip_norm,
         "rank": 512,
         "max_seq_length": 128,
         "seed": 42,
@@ -105,11 +109,25 @@ def effective_config(method: str) -> dict:
     }
 
 
-def slaclip_contract() -> dict:
+def slaclip_contract(
+    *, groupwise: bool = False, initial_clip_norm: float = INITIAL_C
+) -> dict:
     automatic_slots = automatic_num_slots(CLIENTS, NOISE_MULTIPLIER)
-    return {
-        "schema_version": SLACLIP_CONTRACT_SCHEMA,
-        "variant": SLACLIP_VARIANT,
+    contract = {
+        "schema_version": (
+            GROUPWISE_SLACLIP_CONTRACT_SCHEMA
+            if groupwise
+            else SLACLIP_CONTRACT_SCHEMA
+        ),
+        "variant": GROUPWISE_SLACLIP_VARIANT if groupwise else SLACLIP_VARIANT,
+        **(
+            {
+                "controller_input": "noisy_endpoints",
+                "non_private_oracle_control": False,
+            }
+            if groupwise
+            else {}
+        ),
         "federated_adaptation": (
             "per_client_joint_gradient_slack_release_then_equal_fedavg_"
             "and_one_controller_update_per_round"
@@ -119,10 +137,44 @@ def slaclip_contract() -> dict:
             "repository": "https://github.com/ZsyRock/SlaClip",
             "revision": "c" * 40,
         },
+        **(
+            {
+                "hyperparameter_provenance": {
+                    "source": (
+                        "fixed_baseline_exact_endpoint_development_selection_lock"
+                    ),
+                    "baseline_derived_calibration_is_non_dp": True,
+                    "calibration_lock_sha256": CALIBRATION_LOCK,
+                    "calibration_data_consumed_at_controller_runtime": False,
+                    "frozen_scalar_hyperparameters_only": True,
+                }
+            }
+            if groupwise
+            else {}
+        ),
         "controller": {
             "eta": ETA,
-            "base_target_clipped_fraction": BETA,
-            "beta": BETA,
+            **(
+                {
+                    "controller_input": "noisy_endpoints",
+                    "slack_noise_method_scope": ADAPTIVE_METHOD,
+                    "target_parameterization": "per_gradient_group",
+                    "generalized_full_slaclip_beta": True,
+                    "base_target_clipped_fraction_by_group": dict(
+                        GROUPWISE_BETA
+                    ),
+                    "base_target_clipped_fraction_source": (
+                        "groupwise_canonical_cli"
+                    ),
+                    "beta_by_group": dict(GROUPWISE_BETA),
+                    "shared_beta_compatibility_alias_active": False,
+                }
+                if groupwise
+                else {
+                    "base_target_clipped_fraction": BETA,
+                    "beta": BETA,
+                }
+            ),
             "epsilon": EPSILON,
             "num_slots": NUM_SLOTS,
             "num_slots_selection": "explicit",
@@ -145,15 +197,36 @@ def slaclip_contract() -> dict:
             "numerical_safeguard": "recorded test safeguard",
             "c_min": C_MIN,
             "c_max": C_MAX,
-            "initial_clip_threshold": INITIAL_C,
+            "initial_clip_threshold": initial_clip_norm,
+            **(
+                {
+                    "update_formula": (
+                        "for each g in {A,B}:q_g=s_hat_g[0];"
+                        "r_g=s_hat_g[K-1];z_g=r_g/(C_g+1e-6);"
+                        "remaining_g=1-z_g;"
+                        "target_clip_g=clip(beta_g*remaining_g,0,1);"
+                        "gamma_g=1-target_clip_g;"
+                        "C_g_next=clip(C_g*exp(eta*(gamma_g-q_g)),"
+                        "C_min,C_max)"
+                    )
+                }
+                if groupwise
+                else {}
+            ),
             "controller_inputs": "noisy_joint_release_endpoints_only",
         },
         "exact_cdf_and_clipping_diagnostics": "NON_DP_PRIVATE_DIAGNOSTICS",
         "independently_privacy_certified": False,
     }
+    return contract
 
 
 def scientific_contract(method: str, adaptive_contract: dict | None) -> dict:
+    initial_clip_norm = (
+        adaptive_contract["controller"]["initial_clip_threshold"]
+        if adaptive_contract is not None
+        else INITIAL_C
+    )
     return {
         "schema_version": 2,
         "repository_sha": "a" * 40,
@@ -162,7 +235,7 @@ def scientific_contract(method: str, adaptive_contract: dict | None) -> dict:
         "dataset": {"repo_id": "dataset", "revision": "b" * 40},
         "data_protocol": "paper_union_minus_fixed_holdout",
         "method": asdict(METHOD_SPECS[method]),
-        "effective_config": effective_config(method),
+        "effective_config": effective_config(method, clip_norm=initial_clip_norm),
         "models": list(MODELS),
         "model_revisions": {"bert": "pinned", "gpt2": "pinned"},
         "private_key_commitment": digest("private-key"),
@@ -184,6 +257,13 @@ def scientific_contract(method: str, adaptive_contract: dict | None) -> dict:
 
 def run_config(method: str, contract: dict, *, adaptive: bool) -> dict:
     fingerprint = canonical_json_fingerprint(contract)
+    adaptive_contract = contract["algorithm_contract"]["slaclip"]
+    groupwise = bool(
+        adaptive
+        and isinstance(adaptive_contract, dict)
+        and adaptive_contract.get("schema_version")
+        == GROUPWISE_SLACLIP_CONTRACT_SCHEMA
+    )
     return {
         "schema_version": 2,
         "method": method,
@@ -203,7 +283,15 @@ def run_config(method: str, contract: dict, *, adaptive: bool) -> dict:
             "epsilon": None,
             "sigma_is_not_epsilon": True,
             "diagnostics_are_private_non_dp_data": True,
-            "baseline_derived_calibration_is_non_dp": False,
+            "baseline_derived_calibration_is_non_dp": groupwise,
+            **(
+                {
+                    "baseline_calibration_lock_sha256": CALIBRATION_LOCK,
+                    "baseline_calibration_consumed_at_runtime": False,
+                }
+                if groupwise
+                else {}
+            ),
             "exact_cdf_diagnostics_are_non_dp": adaptive,
         },
     }
@@ -379,16 +467,34 @@ def client_release_records(thresholds: dict[str, float]) -> list[dict]:
 
 
 def controller_round(
-    thresholds: dict[str, float], client_records: list[dict]
+    thresholds: dict[str, float],
+    client_records: list[dict],
+    *,
+    groupwise: bool = False,
 ) -> dict:
     value: dict = {
-        "variant": SLACLIP_VARIANT,
+        "variant": GROUPWISE_SLACLIP_VARIANT if groupwise else SLACLIP_VARIANT,
         "update_timing": "once_after_all_clients_for_use_in_next_round",
         "clients": CLIENTS,
         "num_slots": NUM_SLOTS,
         "eta": ETA,
-        "base_target_clipped_fraction": BETA,
-        "beta": BETA,
+        **(
+            {
+                "controller_input": "noisy_endpoints",
+                "controller_input_is_non_dp_exact": False,
+                "target_parameterization": "per_gradient_group",
+                "generalized_full_slaclip_beta": True,
+                "base_target_clipped_fraction_by_group": dict(
+                    GROUPWISE_BETA
+                ),
+                "beta_by_group": dict(GROUPWISE_BETA),
+            }
+            if groupwise
+            else {
+                "base_target_clipped_fraction": BETA,
+                "beta": BETA,
+            }
+        ),
         "epsilon": EPSILON,
         "near_threshold_index": 0,
         "near_zero_index": NUM_SLOTS - 1,
@@ -396,6 +502,7 @@ def controller_round(
         "c_max": C_MAX,
     }
     for group in GROUPS:
+        beta = GROUPWISE_BETA[group] if groupwise else BETA
         noisy_sum = [
             math.fsum(
                 record["gradient_groups"][group]["slaclip"]["noisy_slack"][slot]
@@ -424,7 +531,7 @@ def controller_round(
             thresholds[group],
             noisy[0],
             noisy[-1],
-            beta=BETA,
+            beta=beta,
             eta=ETA,
             min_clip_norm=C_MIN,
             max_clip_norm=C_MAX,
@@ -442,7 +549,7 @@ def controller_round(
             thresholds[group],
             exact[0],
             exact[-1],
-            beta=BETA,
+            beta=beta,
             eta=ETA,
             min_clip_norm=C_MIN,
             max_clip_norm=C_MAX,
@@ -468,6 +575,14 @@ def controller_round(
             "clip_threshold_used": thresholds[group],
             "noisy_cdf_proxy_by_slot": noisy,
             "exact_cdf_proxy_by_slot": exact,
+            **(
+                {
+                    "controller_input": "noisy_endpoints",
+                    "controller_input_is_non_dp_exact": False,
+                }
+                if groupwise
+                else {}
+            ),
             "normalized_proxy_noise_std_per_slot": normalized_noise,
             "cdf_error_mae": cdf_error_mae,
             "cdf_error_rmse": cdf_error_rmse,
@@ -510,6 +625,19 @@ def controller_round(
             ),
             "update_direction_agrees": (
                 direction(noisy_log_step) == direction(oracle_log_step)
+            ),
+            **(
+                {
+                    "noisy_dynamic_target_clipped": update_fields[
+                        "dynamic_target_clipped"
+                    ],
+                    "noisy_raw_log_step": noisy_log_step,
+                    "noisy_next_clip_threshold": update_fields[
+                        "next_clip_threshold"
+                    ],
+                }
+                if groupwise
+                else {}
             ),
             **update_fields,
         }
@@ -570,9 +698,16 @@ def controller_group_summary(
     }
 
 
-def write_adaptive(parent: Path) -> Path:
+def write_adaptive(
+    parent: Path,
+    *,
+    groupwise: bool = False,
+    initial_clip_norm: float = INITIAL_C,
+) -> Path:
     adaptive = private_directory(parent / "adaptive")
-    slaclip = slaclip_contract()
+    slaclip = slaclip_contract(
+        groupwise=groupwise, initial_clip_norm=initial_clip_norm
+    )
     contract = scientific_contract(ADAPTIVE_METHOD, slaclip)
     config = run_config(ADAPTIVE_METHOD, contract, adaptive=True)
     private_json(adaptive / "run_config.json", config)
@@ -583,11 +718,13 @@ def write_adaptive(parent: Path) -> Path:
         model_dir = private_directory(adaptive / model)
         diagnostics = private_directory(model_dir / "private_diagnostics")
         rounds_dir = private_directory(diagnostics / "rounds")
-        thresholds = {group: INITIAL_C for group in GROUPS}
+        thresholds = {group: initial_clip_norm for group in GROUPS}
         trajectory = []
         for round_index in range(1, ROUNDS + 1):
             client_records = client_release_records(thresholds)
-            controller = controller_round(thresholds, client_records)
+            controller = controller_round(
+                thresholds, client_records, groupwise=groupwise
+            )
             trajectory.append(controller)
             private_json(
                 rounds_dir / f"round-{round_index:05d}.json",
@@ -613,7 +750,23 @@ def write_adaptive(parent: Path) -> Path:
         schedule = digest(f"{model}:shared-samples")
         schedules[model] = schedule
         controller_summary = {
-            "variant": SLACLIP_VARIANT,
+            "variant": (
+                GROUPWISE_SLACLIP_VARIANT if groupwise else SLACLIP_VARIANT
+            ),
+            **(
+                {
+                    "controller_input": "noisy_endpoints",
+                    "controller_input_is_non_dp_exact": False,
+                    "target_parameterization": "per_gradient_group",
+                    "generalized_full_slaclip_beta": True,
+                    "base_target_clipped_fraction_by_group": dict(
+                        GROUPWISE_BETA
+                    ),
+                    "beta_by_group": dict(GROUPWISE_BETA),
+                }
+                if groupwise
+                else {}
+            ),
             "rounds": ROUNDS,
             "trajectory_sha256": canonical_json_fingerprint(trajectory),
             "groups": {
@@ -658,6 +811,12 @@ def write_adaptive(parent: Path) -> Path:
 
 def build_fixture(parent: Path) -> tuple[Path, Path]:
     return write_baseline(parent), write_adaptive(parent)
+
+
+def build_groupwise_fixture(parent: Path) -> tuple[Path, Path]:
+    return write_baseline(parent), write_adaptive(
+        parent, groupwise=True, initial_clip_norm=7.5
+    )
 
 
 def rewrite_adaptive_model_and_root(adaptive: Path, model: str, summary: dict) -> None:
@@ -769,6 +928,169 @@ class CompareSlaClipTests(unittest.TestCase):
             )
             self.assertNotIn("calibration_evidence", result)
             self.assertNotIn("active_target_spec", result)
+            # Adding the groupwise schema must not mutate the persisted shared
+            # v1 comparison core or its verify-existing fingerprint.
+            for key in (
+                "slaclip_contract_schema",
+                "target_parameterization",
+                "generalized_full_slaclip_beta",
+                "baseline_calibration_lock_sha256",
+                "baseline_calibration_consumed_at_runtime",
+                "hyperparameters_derived_from_non_dp_fixed_development",
+            ):
+                self.assertNotIn(key, result)
+            self.assertNotIn(
+                "baseline_calibration_consumed_at_runtime",
+                result["privacy_notice"],
+            )
+
+    def test_groupwise_pair_recomputes_distinct_a_b_beta_trajectories(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            baseline, adaptive = build_groupwise_fixture(Path(raw_root))
+            result = build_comparison(baseline, adaptive)
+            self.assertEqual(
+                result["slaclip_contract_schema"],
+                GROUPWISE_SLACLIP_CONTRACT_SCHEMA,
+            )
+            self.assertEqual(result["slaclip_variant"], GROUPWISE_SLACLIP_VARIANT)
+            self.assertTrue(result["uses_baseline_calibration"])
+            self.assertFalse(result["baseline_calibration_consumed_at_runtime"])
+            self.assertTrue(
+                result[
+                    "hyperparameters_derived_from_non_dp_fixed_development"
+                ]
+            )
+            self.assertEqual(
+                result["baseline_calibration_lock_sha256"], CALIBRATION_LOCK
+            )
+            self.assertEqual(result["baseline_clip_norm"], INITIAL_C)
+            self.assertEqual(result["adaptive_initial_clip_norm"], 7.5)
+            controller = result["models"]["bert"]["controller"]
+            self.assertEqual(controller["initial_clip_norm"], 7.5)
+            self.assertEqual(controller["beta_by_group"], GROUPWISE_BETA)
+            self.assertEqual(
+                controller["base_target_clipped_fraction_by_group"],
+                GROUPWISE_BETA,
+            )
+            self.assertNotIn("beta", controller)
+            self.assertNotEqual(
+                controller["final_clip_norm_by_group"]["A"],
+                controller["final_clip_norm_by_group"]["B"],
+            )
+            shard = load_json(
+                adaptive
+                / "bert"
+                / "private_diagnostics"
+                / "rounds"
+                / "round-00001.json"
+            )
+            self.assertEqual(
+                shard["client_records"][0]["gradient_groups"]["A"]["slaclip"][
+                    "variant"
+                ],
+                SLACLIP_VARIANT,
+            )
+            self.assertEqual(
+                shard["round_summary"]["slaclip_controller"]["variant"],
+                GROUPWISE_SLACLIP_VARIANT,
+            )
+
+    def test_shared_v1_still_requires_the_same_initial_clip_norm(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            baseline = write_baseline(root)
+            adaptive = write_adaptive(root, initial_clip_norm=7.5)
+            with self.assertRaisesRegex(
+                RuntimeError, "differ outside full SlaClip"
+            ):
+                build_comparison(baseline, adaptive)
+
+    def test_groupwise_schema_variant_pairing_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            baseline, adaptive = build_groupwise_fixture(Path(raw_root))
+            contract = load_json(adaptive / "run_config.json")[
+                "scientific_contract"
+            ]["algorithm_contract"]["slaclip"]
+            contract["variant"] = SLACLIP_VARIANT
+            rewrite_adaptive_contract(adaptive, contract)
+            with self.assertRaisesRegex(RuntimeError, "contract variant mismatch"):
+                build_comparison(baseline, adaptive)
+
+    def test_groupwise_contract_target_mapping_fails_closed(self) -> None:
+        for mutation, message in (
+            ("missing_b", "must contain exactly A and B"),
+            ("alias_disagrees", "mappings disagree"),
+        ):
+            with self.subTest(mutation=mutation):
+                with tempfile.TemporaryDirectory() as raw_root:
+                    baseline, adaptive = build_groupwise_fixture(Path(raw_root))
+                    contract = load_json(adaptive / "run_config.json")[
+                        "scientific_contract"
+                    ]["algorithm_contract"]["slaclip"]
+                    controller = contract["controller"]
+                    if mutation == "missing_b":
+                        del controller["beta_by_group"]["B"]
+                    else:
+                        controller["beta_by_group"]["B"] = 0.7
+                    rewrite_adaptive_contract(adaptive, contract)
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        build_comparison(baseline, adaptive)
+
+    def test_groupwise_round_target_and_per_group_formula_tampering_fail_closed(
+        self,
+    ) -> None:
+        for mutation, message in (
+            ("target", "target mapping mismatch"),
+            ("formula", "full-SlaClip formula mismatch: raw_log_step"),
+        ):
+            with self.subTest(mutation=mutation):
+                with tempfile.TemporaryDirectory() as raw_root:
+                    baseline, adaptive = build_groupwise_fixture(Path(raw_root))
+                    shard_path = (
+                        adaptive
+                        / "gpt2"
+                        / "private_diagnostics"
+                        / "rounds"
+                        / "round-00001.json"
+                    )
+                    shard = load_json(shard_path)
+                    controller = shard["round_summary"]["slaclip_controller"]
+                    if mutation == "target":
+                        controller["beta_by_group"]["B"] = 0.7
+                    else:
+                        controller["B"]["raw_log_step"] += 0.01
+                    private_json(shard_path, shard)
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        build_comparison(baseline, adaptive)
+
+    def test_groupwise_summary_mapping_and_provenance_tampering_fail_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            baseline, adaptive = build_groupwise_fixture(Path(raw_root))
+            summary = load_json(adaptive / "bert" / "final_summary.json")
+            controller = summary["behavior_summary"]["slaclip_controller"]
+            controller["beta_by_group"]["A"] = 0.3
+            summary["slaclip"]["controller_summary"] = controller
+            rewrite_adaptive_model_and_root(adaptive, "bert", summary)
+            with self.assertRaisesRegex(
+                RuntimeError, "controller summary target aliases disagree"
+            ):
+                build_comparison(baseline, adaptive)
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            baseline, adaptive = build_groupwise_fixture(Path(raw_root))
+            contract = load_json(adaptive / "run_config.json")[
+                "scientific_contract"
+            ]["algorithm_contract"]["slaclip"]
+            contract["hyperparameter_provenance"][
+                "calibration_data_consumed_at_controller_runtime"
+            ] = True
+            rewrite_adaptive_contract(adaptive, contract)
+            with self.assertRaisesRegex(
+                RuntimeError, "hyperparameter provenance mismatch"
+            ):
+                build_comparison(baseline, adaptive)
 
     def test_cli_create_and_verify_existing_has_no_calibration_argument(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
