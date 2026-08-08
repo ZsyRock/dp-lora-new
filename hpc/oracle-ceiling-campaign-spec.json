@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "campaign_name": "groupwise_fixed_oracle_ceiling_v1",
+  "description": "One-allocation strong groupwise-fixed search followed by an exact-endpoint Full-SlaClip oracle ceiling test. This is a NON_DP mechanism gate before any noisy-controller stabilization work.",
+  "expected_stage_arm_counts": {
+    "fixed_coarse": 60,
+    "fixed_refinement": 18,
+    "oracle_development": 168,
+    "confirmation": 80,
+    "total": 326
+  },
+  "common": {
+    "models": ["bert", "gpt2"],
+    "num_clients": 5,
+    "rounds": 50,
+    "batch_size": 8,
+    "noise_multiplier": 2.0,
+    "learning_rate": 0.0005,
+    "rank": 512,
+    "max_seq_length": 128,
+    "max_validation_records": 512,
+    "eval_every": 10,
+    "checkpoint_every": 25,
+    "data_split_seed": 1729,
+    "evaluation_seed": 2718,
+    "delta": 0.00001,
+    "slaclip_num_slots": 5,
+    "slaclip_c_min": 0.025,
+    "slaclip_c_max": 50.0,
+    "slaclip_endpoint_epsilon": 0.000001
+  },
+  "fixed_coarse": {
+    "method": "paper_dp_lora",
+    "seeds": [480, 481],
+    "top_k_per_model": 3,
+    "clip_norm_grid_by_model": {
+      "bert": {
+        "A": [0.5, 0.75, 1.0, 1.25, 1.5],
+        "B": [2.5, 3.0, 3.5]
+      },
+      "gpt2": {
+        "A": [0.075, 0.1, 0.125, 0.15, 0.175],
+        "B": [0.85, 1.0, 1.15]
+      }
+    },
+    "selection_rule": [
+      "lowest_mean_final_loss",
+      "lowest_mean_normalized_loss_auc",
+      "lowest_final_loss_sample_std",
+      "lowest_groupwise_noise_scale_l2",
+      "smaller_C_A",
+      "smaller_C_B"
+    ]
+  },
+  "fixed_refinement": {
+    "seeds": [490, 491, 492],
+    "selection_rule": [
+      "lowest_mean_final_loss_on_fresh_refinement_seeds",
+      "lowest_mean_normalized_loss_auc",
+      "lowest_final_loss_sample_std",
+      "lowest_groupwise_noise_scale_l2",
+      "smaller_C_A",
+      "smaller_C_B"
+    ],
+    "beta_calibration": {
+      "groups": ["A", "B"],
+      "quantiles": [0.1, 0.5, 0.9],
+      "formula": "beta=(1-q)/(1-r/(C_g+epsilon))",
+      "duplicate_quantile_fallback": "deterministic_farthest_points_from_median_in_[0,1]"
+    }
+  },
+  "oracle_development": {
+    "method": "oracle_slaclip_control",
+    "seeds": [500, 501, 502],
+    "etas": [0.01, 0.05, 0.2],
+    "selection_rule": [
+      "lowest_mean_paired_final_loss_delta_vs_strong_groupwise_fixed",
+      "lowest_mean_paired_normalized_loss_auc_delta",
+      "fewest_controller_instability_events",
+      "smaller_eta",
+      "smaller_beta_A",
+      "smaller_beta_B"
+    ]
+  },
+  "confirmation": {
+    "methods": ["paper_dp_lora", "oracle_slaclip_control"],
+    "seeds": [600, 601, 602, 603, 604, 605, 606, 607, 608, 609, 610, 611, 612, 613, 614, 615, 616, 617, 618, 619],
+    "primary_metric": "final_internal_validation_loss",
+    "secondary_metric": "normalized_internal_validation_loss_auc",
+    "oracle_privacy_label": "NON_DP_PRIVATE_DIAGNOSTIC",
+    "per_model_alpha_bonferroni_for_two_models": 0.025,
+    "minimum_practically_relevant_improvement": {
+      "bert": 0.0005,
+      "gpt2": 0.00006
+    },
+    "gate_requires": [
+      "paired_final_loss_mean_below_negative_MPRD",
+      "paired_final_loss_ci95_high_below_zero",
+      "exact_sign_flip_p_below_bonferroni_0.025",
+      "paired_normalized_loss_auc_mean_not_positive",
+      "controller_instability_events_per_seed_at_most_10"
+    ]
+  },
+  "scientific_boundary": {
+    "analysis_role": "strong_groupwise_fixed_then_exact_oracle_utility_ceiling_gate",
+    "controller_family": "groupwise_generalized_full_SlaClip_beta_two_exact_CDF_endpoints_K5",
+    "excluded_method_family": "SlaClip-Q",
+    "noisy_slaclip_efficacy_tested": false,
+    "endpoint_smoothing_tested": false,
+    "learning_rate_policy": "fixed_at_5e-4_to_avoid_controller_and_optimizer_confounding",
+    "K": 5,
+    "num_clients": 5,
+    "noise_multiplier": 2.0,
+    "cdf_endpoint_noise_std_theoretical_for_future_noisy_controller": 2.0,
+    "oracle_privacy_label": "NON_DP_PRIVATE_DIAGNOSTIC",
+    "external_test_set_used": false,
+    "paper_result_reproduced": false,
+    "end_to_end_dp_certified": false,
+    "single_allocation": true,
+    "nested_sbatch_or_array": false,
+    "all_candidates_reported": true
+  }
+}

@@ -27,6 +27,8 @@ Important overrides:
   DPLORA_STAGED_HOST_MEMORY         default: 12G
   DPLORA_STAGED_LANE_MEMORY         default: 12G
   DPLORA_STAGED_WALLTIME            default: 12:00:00
+  DPLORA_STAGED_DEPENDENCY          optional Slurm dependency, for example
+                                    afterany:123456
 
 The default scavenger partition can cancel the allocation for higher-priority
 work.  Resume the same DPLORA_STAGED_RUN_ID with --resume; completed arms and
@@ -229,6 +231,7 @@ host_memory="${DPLORA_STAGED_HOST_MEMORY:-12G}"
 lane_memory="${DPLORA_STAGED_LANE_MEMORY:-12G}"
 walltime="${DPLORA_STAGED_WALLTIME:-12:00:00}"
 job_name="${DPLORA_STAGED_JOB_NAME:-dp-lora-staged-slaclip}"
+dependency="${DPLORA_STAGED_DEPENDENCY:-}"
 if [[ "$gpu_gres" =~ ^gpu:([A-Za-z0-9_-]+):([12])$ ]]; then
     gpu_type="${BASH_REMATCH[1]}"
     gpu_lanes="${BASH_REMATCH[2]}"
@@ -257,6 +260,10 @@ if [[ ! "$job_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
     echo "ERROR: unsafe job name" >&2
     exit 1
 fi
+if [[ -n "$dependency" && ! "$dependency" =~ ^afterany:[1-9][0-9]*$ ]]; then
+    echo "ERROR: unsafe or unsupported Slurm dependency: $dependency" >&2
+    exit 1
+fi
 
 sbatch_bin="$(command -v sbatch || true)"
 [[ -n "$sbatch_bin" ]] || { echo "ERROR: sbatch is unavailable" >&2; exit 1; }
@@ -280,6 +287,9 @@ sbatch_args=(
 if [[ "$test_only" -eq 1 ]]; then
     sbatch_args+=(--test-only)
 fi
+if [[ -n "$dependency" ]]; then
+    sbatch_args+=("--dependency=$dependency")
+fi
 
 echo "Campaign:           $run_id"
 echo "Resume:             $resume"
@@ -291,6 +301,7 @@ echo "Scratch output:     $campaign_root"
 echo "Persistent archive: $archive_root"
 echo "Resources: account=$account partition=$partition gres=$gpu_gres nodes=1 lanes=$gpu_lanes cpus/lane=$cpus_per_task mem=$host_memory lane_mem=$lane_memory time=$walltime"
 echo "GPU gate: name_contains=$expected_gpu min_vram_gib=$min_vram_gib"
+echo "Dependency:         ${dependency:-none}"
 if [[ "$partition" == scavenger_* ]]; then
     echo "Preemption note: this partition may CANCEL the job; resume the same run ID with --resume."
 fi

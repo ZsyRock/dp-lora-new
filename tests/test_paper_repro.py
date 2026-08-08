@@ -23,6 +23,7 @@ from paper_repro.train_federated import (
     empty_mechanism_components,
     empty_state_like,
     illustrative_accounting_diagnostic,
+    make_effective_config,
     parameter_groups,
     parse_args,
     partition_indices,
@@ -402,6 +403,36 @@ class PaperReproTests(unittest.TestCase):
                 base_target_clipped_fraction_by_group={"A": 0.5, "B": 0.5},
             )
 
+    def test_groupwise_clip_norm_cli_is_paired_positive_and_effective(self) -> None:
+        shared_args = parse_args(["--input-manifest", "inputs.json"])
+        shared = make_effective_config(shared_args)
+        self.assertEqual(shared.clip_norm_by_group, {"A": 10.0, "B": 10.0})
+
+        groupwise_args = parse_args(
+            [
+                "--input-manifest",
+                "inputs.json",
+                "--clip-norm",
+                "3.0",
+                "--clip-norm-a",
+                "0.75",
+                "--clip-norm-b",
+                "3.0",
+            ]
+        )
+        groupwise = make_effective_config(groupwise_args)
+        self.assertEqual(groupwise.clip_norm, 3.0)
+        self.assertEqual(groupwise.clip_norm_by_group, {"A": 0.75, "B": 3.0})
+
+        for options in (
+            ["--clip-norm-a", "0.75"],
+            ["--clip-norm-b", "3.0"],
+            ["--clip-norm-a", "0", "--clip-norm-b", "3.0"],
+            ["--clip-norm-a", "nan", "--clip-norm-b", "3.0"],
+        ):
+            with self.subTest(options=options), self.assertRaises(SystemExit):
+                parse_args(["--input-manifest", "inputs.json", *options])
+
     def test_non_dp_baseline_calibration_provenance_requires_a_lock_and_ack(self) -> None:
         digest = "a" * 64
         parsed = parse_args(
@@ -595,6 +626,26 @@ class PaperReproTests(unittest.TestCase):
         self.assertTrue(
             torch.allclose(groups["B"][0][1], torch.tensor([[1.0], [0.0]]))
         )
+
+    def test_groupwise_fixed_thresholds_control_clipping_and_noise_per_group(self) -> None:
+        model = TinyLoRA()
+        groups = parameter_groups(model)
+        with torch.no_grad():
+            groups["A"][0][1].grad = torch.tensor([[3.0, 4.0]])
+            groups["B"][0][1].grad = torch.tensor([[0.0], [2.0]])
+        stats = clip_noise_and_step(
+            groups,
+            clip_norm_by_group={"A": 1.0, "B": 4.0},
+            noise_multiplier=0.5,
+            learning_rate=0.0,
+            generator=torch.Generator().manual_seed(7),
+        )
+        self.assertAlmostEqual(stats["A"]["clip_threshold"], 1.0)
+        self.assertAlmostEqual(stats["B"]["clip_threshold"], 4.0)
+        self.assertAlmostEqual(stats["A"]["clip_factor"], 0.2, places=6)
+        self.assertEqual(stats["B"]["clip_factor"], 1.0)
+        self.assertAlmostEqual(stats["A"]["noise_std_per_coordinate"], 0.5)
+        self.assertAlmostEqual(stats["B"]["noise_std_per_coordinate"], 2.0)
 
     def test_equal_weight_state_aggregation(self) -> None:
         model = TinyLoRA()

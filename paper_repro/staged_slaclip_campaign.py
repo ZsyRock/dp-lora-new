@@ -1625,6 +1625,10 @@ def _round_trajectory_rows(
         controller_root = controller_root if isinstance(controller_root, dict) else {}
         resources = summary.get("resource_telemetry")
         resources = resources if isinstance(resources, dict) else {}
+        initial_by_group = arm.get("initial_clip_norm_by_group")
+        target_by_group = arm.get(
+            "slaclip_base_target_clipped_fraction_by_group"
+        )
         for group in ("A", "B"):
             group_summary = summary.get(group)
             update = summary.get("federated_update", {}).get(group)
@@ -1646,6 +1650,17 @@ def _round_trajectory_rows(
             noise = _quantile_summary(
                 float(value["noise_l2_norm"]) for value in client_groups
             )
+            initial_c = (
+                float(initial_by_group[group])
+                if isinstance(initial_by_group, dict)
+                and set(initial_by_group) == {"A", "B"}
+                else float(arm["initial_clip_norm"])
+            )
+            beta = (
+                target_by_group.get(group)
+                if isinstance(target_by_group, dict)
+                else arm["slaclip_beta"]
+            )
             rows.append(
                 {
                     "stage": arm["stage"],
@@ -1657,13 +1672,13 @@ def _round_trajectory_rows(
                     "seed": arm["seed"],
                     "round": round_index,
                     "group": group,
-                    "initial_C": arm["initial_clip_norm"],
-                    "base_target_clipped_fraction_beta": arm["slaclip_beta"],
+                    "initial_C": initial_c,
+                    "base_target_clipped_fraction_beta": beta,
                     "clip_threshold_used": controller.get(
-                        "clip_threshold_used", arm["initial_clip_norm"]
+                        "clip_threshold_used", initial_c
                     ),
                     "next_clip_threshold": controller.get(
-                        "next_clip_threshold", arm["initial_clip_norm"]
+                        "next_clip_threshold", initial_c
                     ),
                     "actual_clipped_count": group_summary.get("clipped_count"),
                     "actual_clipped_fraction": group_summary.get("clipped_fraction"),

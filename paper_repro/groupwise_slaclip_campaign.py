@@ -892,7 +892,8 @@ def _validate_adaptive_contract(
     arm_root = root / "arms" / str(arm["arm_id"])
     run_config = full.load_object(arm_root / "run_config.json", "arm run config")
     try:
-        persisted_contract = run_config["scientific_contract"]["algorithm_contract"]["slaclip"]
+        algorithm_contract = run_config["scientific_contract"]["algorithm_contract"]
+        persisted_contract = algorithm_contract["slaclip"]
     except (KeyError, TypeError) as error:
         raise RuntimeError(f"persisted SlaClip contract is missing: {arm['arm_id']}") from error
     extension = model_summary.get("slaclip")
@@ -900,6 +901,21 @@ def _validate_adaptive_contract(
     controller = contract.get("controller") if isinstance(contract, dict) else None
     provenance = contract.get("hyperparameter_provenance") if isinstance(contract, dict) else None
     expected_targets = arm["slaclip_base_target_clipped_fraction_by_group"]
+    configured_initial = arm.get("initial_clip_norm_by_group")
+    expected_initial = (
+        {group: float(configured_initial[group]) for group in GROUPS}
+        if isinstance(configured_initial, dict) and set(configured_initial) == set(GROUPS)
+        else {group: float(arm["initial_clip_norm"]) for group in GROUPS}
+    )
+    persisted_controller_initial = (
+        controller.get("initial_clip_threshold_by_group")
+        if isinstance(controller, dict)
+        else None
+    )
+    if persisted_controller_initial is None and isinstance(controller, dict):
+        persisted_controller_initial = {
+            group: controller.get("initial_clip_threshold") for group in GROUPS
+        }
     if (
         not isinstance(contract, dict)
         or contract.get("schema_version") != "groupwise_generalized_full_slaclip_beta_contract_v1"
@@ -912,6 +928,8 @@ def _validate_adaptive_contract(
         or provenance.get("calibration_lock_sha256") != arm["slaclip_baseline_calibration_lock_sha256"]
         or provenance.get("baseline_derived_calibration_is_non_dp") is not True
         or provenance.get("calibration_data_consumed_at_controller_runtime") is not False
+        or persisted_controller_initial != expected_initial
+        or algorithm_contract.get("initial_clip_threshold_by_group") != expected_initial
     ):
         raise RuntimeError(f"groupwise runtime contract differs: {arm['arm_id']}")
     if persisted_contract != contract:

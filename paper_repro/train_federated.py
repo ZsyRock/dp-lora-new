@@ -236,6 +236,19 @@ class EffectiveConfig:
     delta: float
     pair_noise_across_methods: bool
     smoke: bool
+    # ``clip_norm`` is retained as the paper/shared-C compatibility field.
+    # Formal groupwise-fixed and groupwise-adaptive campaigns populate the two
+    # optional fields below; older callers that omit them continue to resolve
+    # both groups to the shared threshold bit-for-bit.
+    clip_norm_A: float | None = None
+    clip_norm_B: float | None = None
+
+    @property
+    def clip_norm_by_group(self) -> dict[str, float]:
+        return {
+            "A": float(self.clip_norm if self.clip_norm_A is None else self.clip_norm_A),
+            "B": float(self.clip_norm if self.clip_norm_B is None else self.clip_norm_B),
+        }
 
 
 @dataclass(frozen=True)
@@ -1206,6 +1219,16 @@ def seed_model_stochasticity(seed: int, device: torch.device) -> None:
 
 
 def make_effective_config(args: argparse.Namespace) -> EffectiveConfig:
+    clip_norm_a = getattr(args, "clip_norm_a", None)
+    clip_norm_b = getattr(args, "clip_norm_b", None)
+    if (clip_norm_a is None) != (clip_norm_b is None):
+        raise ValueError("groupwise clip norms must provide both A and B")
+    resolved_clip_norm_a = float(
+        args.clip_norm if clip_norm_a is None else clip_norm_a
+    )
+    resolved_clip_norm_b = float(
+        args.clip_norm if clip_norm_b is None else clip_norm_b
+    )
     if args.smoke:
         return EffectiveConfig(
             method=args.method,
@@ -1227,6 +1250,8 @@ def make_effective_config(args: argparse.Namespace) -> EffectiveConfig:
             delta=args.delta,
             pair_noise_across_methods=args.pair_noise_across_methods,
             smoke=True,
+            clip_norm_A=resolved_clip_norm_a,
+            clip_norm_B=resolved_clip_norm_b,
         )
     return EffectiveConfig(
         method=args.method,
@@ -1248,6 +1273,8 @@ def make_effective_config(args: argparse.Namespace) -> EffectiveConfig:
         delta=args.delta,
         pair_noise_across_methods=args.pair_noise_across_methods,
         smoke=False,
+        clip_norm_A=resolved_clip_norm_a,
+        clip_norm_B=resolved_clip_norm_b,
     )
 
 
@@ -1266,8 +1293,12 @@ def validate_config(config: EffectiveConfig) -> None:
         raise ValueError(f"unsupported method: {config.method}")
     if config.noise_multiplier < 0:
         raise ValueError("noise_multiplier must be non-negative")
-    if config.learning_rate <= 0 or config.clip_norm <= 0:
-        raise ValueError("learning_rate and clip_norm must be positive")
+    if (
+        config.learning_rate <= 0
+        or config.clip_norm <= 0
+        or any(value <= 0 for value in config.clip_norm_by_group.values())
+    ):
+        raise ValueError("learning_rate and all clip norms must be positive")
     if config.max_validation_records <= 0 or config.eval_every <= 0:
         raise ValueError("validation size and eval interval must be positive")
     if config.data_split_seed < 0 or config.evaluation_seed < 0:
@@ -2353,10 +2384,21 @@ def read_round_shards(
     controller: dict[str, Any] | None = None
     if slaclip_contract is not None:
         controller = slaclip_contract["controller"]
-        current_thresholds = {
-            "A": float(controller["initial_clip_threshold"]),
-            "B": float(controller["initial_clip_threshold"]),
-        }
+        groupwise_initial = controller.get("initial_clip_threshold_by_group")
+        if groupwise_initial is None:
+            current_thresholds = {
+                "A": float(controller["initial_clip_threshold"]),
+                "B": float(controller["initial_clip_threshold"]),
+            }
+        elif (
+            not isinstance(groupwise_initial, dict)
+            or set(groupwise_initial) != {"A", "B"}
+        ):
+            raise RuntimeError("SlaClip groupwise initial thresholds are invalid")
+        else:
+            current_thresholds = {
+                group: float(groupwise_initial[group]) for group in ("A", "B")
+            }
     shards: list[dict[str, Any]] = []
     expected_paths = {
         rounds_directory / f"round-{round_index:05d}.json"
@@ -3446,7 +3488,7 @@ def train_one_model(
         previous_active_seconds = 0.0
         checkpointed_shard_digest: str | None = None
         last_round_summary: dict[str, Any] | None = None
-        current_clip_thresholds = {"A": config.clip_norm, "B": config.clip_norm}
+        current_clip_thresholds = dict(config.clip_norm_by_group)
     else:
         if set(checkpoint.tensors) != set(global_state):
             raise RuntimeError("checkpoint LoRA tensor names do not match the model")
@@ -3496,10 +3538,7 @@ def train_one_model(
                 for group in ("A", "B")
             }
         else:
-            current_clip_thresholds = {
-                "A": config.clip_norm,
-                "B": config.clip_norm,
-            }
+            current_clip_thresholds = dict(config.clip_norm_by_group)
         last_shard_path = rounds_directory / f"round-{completed_round:05d}.json"
         validate_private_regular_file(last_shard_path, "round diagnostic shard")
         last_shard = load_json_object(last_shard_path, "round diagnostic shard")
@@ -4207,6 +4246,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--noise-multiplier", type=float, default=2.0)
     parser.add_argument("--learning-rate", type=float, default=5e-4)
     parser.add_argument("--clip-norm", type=float, default=10.0)
+    parser.add_argument(
+        "--clip-norm-a",
+        type=float,
+        help=(
+            "LoRA-A clipping threshold for a groupwise fixed threshold or "
+            "groupwise adaptive initial threshold; requires --clip-norm-b"
+        ),
+    )
+    parser.add_argument(
+        "--clip-norm-b",
+        type=float,
+        help=(
+            "LoRA-B clipping threshold for a groupwise fixed threshold or "
+            "groupwise adaptive initial threshold; requires --clip-norm-a"
+        ),
+    )
     parser.add_argument("--rank", type=int, default=512)
     parser.add_argument("--max-seq-length", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
@@ -4282,6 +4337,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--check-inputs", action="store_true")
     parser.add_argument("--acknowledge-non-dp-diagnostics", action="store_true")
     args = parser.parse_args(argv)
+    if (args.clip_norm_a is None) != (args.clip_norm_b is None):
+        parser.error("--clip-norm-a and --clip-norm-b must be supplied together")
+    if args.clip_norm_a is not None and (
+        not math.isfinite(args.clip_norm_a)
+        or not math.isfinite(args.clip_norm_b)
+        or args.clip_norm_a <= 0
+        or args.clip_norm_b <= 0
+    ):
+        parser.error("--clip-norm-a and --clip-norm-b must be finite and positive")
     canonical = args.slaclip_base_target_clipped_fraction
     alias = args.slaclip_beta
     group_a = args.slaclip_base_target_clipped_fraction_a
@@ -4477,6 +4541,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.slaclip_num_slots > 0
             and num_slots > automatic_release_num_slots
         )
+        initial_clip_norms = config.clip_norm_by_group
         if (
             not math.isfinite(args.slaclip_eta)
             or args.slaclip_eta < 0
@@ -4488,7 +4553,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             or not math.isfinite(args.slaclip_c_max)
             or args.slaclip_c_min <= 0
             or args.slaclip_c_max < args.slaclip_c_min
-            or not args.slaclip_c_min <= config.clip_norm <= args.slaclip_c_max
+            or any(
+                not args.slaclip_c_min <= value <= args.slaclip_c_max
+                for value in initial_clip_norms.values()
+            )
         ):
             raise SystemExit(
                 "invalid full-SlaClip base target, eta, or threshold bounds"
@@ -4602,6 +4670,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "c_min": float(args.slaclip_c_min),
                 "c_max": float(args.slaclip_c_max),
                 "initial_clip_threshold": config.clip_norm,
+                **(
+                    {
+                        "initial_clip_threshold_by_group": dict(
+                            initial_clip_norms
+                        )
+                    }
+                    if len(set(initial_clip_norms.values())) > 1
+                    else {}
+                ),
                 "update_formula": controller_update_formula,
                 "numerical_log_step_bounds": [
                     -MAX_ABS_LOG_STEP,
@@ -4659,6 +4736,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         "The internal LM loss is not any of the six paper benchmark scores and cannot establish paper metric reproduction.",
         "No independent epsilon is reported because the paper does not provide the constants/calibration needed to map sigma=2 to its epsilon sweep.",
     ]
+    if len(set(config.clip_norm_by_group.values())) > 1:
+        assumptions.append(
+            "This arm uses explicitly preregistered groupwise clipping "
+            "thresholds C_A and C_B; each group therefore also receives "
+            "Gaussian gradient noise scaled to its own threshold."
+        )
     if slaclip_contract is not None:
         assert config.method in ADAPTIVE_METHODS
         controller_input = CONTROLLER_INPUT_BY_METHOD[config.method]
@@ -4739,6 +4822,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             "federated_clients_simulated_sequentially": True,
             "client_weighting": "equal_one_over_K",
             "gradient_grouping": "aggregate_batch_gradient_separate_A_and_B",
+            "initial_clip_threshold_by_group": dict(
+                config.clip_norm_by_group
+            ),
+            "groupwise_fixed_thresholds": bool(
+                config.method not in ADAPTIVE_METHODS
+                and len(set(config.clip_norm_by_group.values())) > 1
+            ),
             "local_optimizer": "one_manual_sgd_step",
             "record_weighting": "equal_records_after_within_record_token_mean",
             "dropout_rng": "stateless_private_hmac_per_model_round_client",

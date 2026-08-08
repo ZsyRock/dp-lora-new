@@ -91,6 +91,7 @@ ORACLE_NOISY_MATCH_FIELDS = (
     "slaclip_beta",
 )
 ORACLE_NOISY_OPTIONAL_MATCH_FIELDS = (
+    "initial_clip_norm_by_group",
     "slaclip_base_target_clipped_fraction_by_group",
     "slaclip_beta_by_group",
     "slaclip_baseline_calibration_lock_sha256",
@@ -962,6 +963,31 @@ def _validate_runtime_arm(arm: Mapping[str, Any], *, index: int) -> None:
     if noise < 0.0 or not 0.0 < delta < 1.0:
         raise RuntimeError("runtime arm noise/delta domain is invalid")
 
+    initial_by_group = arm.get("initial_clip_norm_by_group")
+    if initial_by_group is not None:
+        if not isinstance(initial_by_group, dict) or set(initial_by_group) != {
+            "A",
+            "B",
+        }:
+            raise RuntimeError(
+                "runtime groupwise initial clip norms must contain A and B"
+            )
+        try:
+            initial_by_group = {
+                group: require_number(
+                    initial_by_group[group],
+                    f"runtime initial clip norm {group}",
+                    positive=True,
+                )
+                for group in ("A", "B")
+            }
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
+        if initial_by_group["B"] != clip_norm:
+            raise RuntimeError(
+                "runtime legacy clip norm must equal groupwise B clip norm"
+            )
+
     adaptive = method in ADAPTIVE_METHODS
     group_targets = arm.get("slaclip_base_target_clipped_fraction_by_group")
     group_aliases = arm.get("slaclip_beta_by_group")
@@ -983,7 +1009,17 @@ def _validate_runtime_arm(arm: Mapping[str, Any], *, index: int) -> None:
             )
         except ValueError as error:
             raise RuntimeError(str(error)) from error
-        if eta < 0.0 or slots < 2 or upper < lower or not lower <= clip_norm <= upper:
+        adaptive_initials = (
+            initial_by_group.values()
+            if isinstance(initial_by_group, dict)
+            else (clip_norm,)
+        )
+        if (
+            eta < 0.0
+            or slots < 2
+            or upper < lower
+            or any(not lower <= value <= upper for value in adaptive_initials)
+        ):
             raise RuntimeError("runtime adaptive controller domain is invalid")
         if arm["controller_input"] != CONTROLLER_INPUT_BY_METHOD[method]:
             raise RuntimeError("runtime adaptive controller input is invalid")
@@ -1571,6 +1607,21 @@ def _arm_command(
         str(stop_file),
         "--acknowledge-non-dp-diagnostics",
     ]
+    initial_by_group = arm.get("initial_clip_norm_by_group")
+    if initial_by_group is not None:
+        if not isinstance(initial_by_group, dict) or set(initial_by_group) != {
+            "A",
+            "B",
+        }:
+            raise RuntimeError("arm groupwise initial clip norms are invalid")
+        command.extend(
+            [
+                "--clip-norm-a",
+                str(initial_by_group["A"]),
+                "--clip-norm-b",
+                str(initial_by_group["B"]),
+            ]
+        )
     if arm["method"] in ADAPTIVE_METHODS:
         command.extend(["--slaclip-eta", str(arm["slaclip_eta"])])
         group_targets = arm.get(
@@ -2081,6 +2132,16 @@ def _model_metrics(
             0.0 if arm["method"] in CONTROL_METHODS else arm["noise_multiplier"]
         ),
         "initial_clip_norm": arm["initial_clip_norm"],
+        "initial_clip_norm_A": (
+            arm.get("initial_clip_norm_by_group", {}).get("A")
+            if isinstance(arm.get("initial_clip_norm_by_group"), dict)
+            else arm["initial_clip_norm"]
+        ),
+        "initial_clip_norm_B": (
+            arm.get("initial_clip_norm_by_group", {}).get("B")
+            if isinstance(arm.get("initial_clip_norm_by_group"), dict)
+            else arm["initial_clip_norm"]
+        ),
         "slaclip_num_slots": arm["slaclip_num_slots"],
         "slaclip_eta": arm["slaclip_eta"],
         "slaclip_base_target_clipped_fraction": arm[
@@ -2242,6 +2303,8 @@ BASE_METRIC_COLUMNS = (
     "noise_multiplier",
     "effective_gradient_noise_multiplier",
     "initial_clip_norm",
+    "initial_clip_norm_A",
+    "initial_clip_norm_B",
     "slaclip_num_slots",
     "slaclip_eta",
     "slaclip_base_target_clipped_fraction",
@@ -3677,10 +3740,18 @@ def _archive_candidate(path: Path, root: Path) -> bool:
         "preflight-runtime-manifest.json",
         "stage2-runtime-manifest.json",
         "stage3-runtime-manifest.json",
+        "stage2-fixed-refinement-runtime-manifest.json",
+        "stage3-oracle-development-runtime-manifest.json",
+        "stage4-confirmation-runtime-manifest.json",
         "fixed-selection.lock.json",
         "slaclip-selection.lock.json",
+        "groupwise-fixed-coarse-selection.lock.json",
+        "strong-groupwise-fixed-selection.lock.json",
+        "oracle-ceiling-selection.lock.json",
+        "oracle-ceiling-gate.lock.json",
         "fixed_beta_calibration.csv",
         "fixed_groupwise_beta_calibration.csv",
+        "strong_groupwise_fixed_beta_calibration.csv",
         "fixed_trajectory.csv",
         "slaclip_trajectory.csv",
         "groupwise_slaclip_trajectory.csv",
