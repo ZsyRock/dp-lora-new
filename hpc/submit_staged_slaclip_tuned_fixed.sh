@@ -28,7 +28,14 @@ Important overrides:
   DPLORA_STAGED_LANE_MEMORY         default: 12G
   DPLORA_STAGED_WALLTIME            default: 12:00:00
   DPLORA_STAGED_DEPENDENCY          optional Slurm dependency, for example
-                                    afterany:123456
+                                    afterok:123456 or afterany:123456
+  DPLORA_STAGED_UPSTREAM_CAMPAIGN_ROOT
+  DPLORA_STAGED_UPSTREAM_REPOSITORY
+  DPLORA_STAGED_UPSTREAM_EXPECTED_SHA
+  DPLORA_STAGED_UPSTREAM_SPEC
+  DPLORA_STAGED_UPSTREAM_INPUT_MANIFEST
+                                    optional all-or-none upstream campaign
+                                    identity passed to specialized workers
 
 The default scavenger partition can cancel the allocation for higher-priority
 work.  Resume the same DPLORA_STAGED_RUN_ID with --resume; completed arms and
@@ -232,6 +239,11 @@ lane_memory="${DPLORA_STAGED_LANE_MEMORY:-12G}"
 walltime="${DPLORA_STAGED_WALLTIME:-12:00:00}"
 job_name="${DPLORA_STAGED_JOB_NAME:-dp-lora-staged-slaclip}"
 dependency="${DPLORA_STAGED_DEPENDENCY:-}"
+upstream_campaign_root="${DPLORA_STAGED_UPSTREAM_CAMPAIGN_ROOT:-}"
+upstream_repository="${DPLORA_STAGED_UPSTREAM_REPOSITORY:-}"
+upstream_expected_sha="${DPLORA_STAGED_UPSTREAM_EXPECTED_SHA:-}"
+upstream_spec="${DPLORA_STAGED_UPSTREAM_SPEC:-}"
+upstream_input_manifest="${DPLORA_STAGED_UPSTREAM_INPUT_MANIFEST:-}"
 if [[ "$gpu_gres" =~ ^gpu:([A-Za-z0-9_-]+):([12])$ ]]; then
     gpu_type="${BASH_REMATCH[1]}"
     gpu_lanes="${BASH_REMATCH[2]}"
@@ -260,9 +272,38 @@ if [[ ! "$job_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
     echo "ERROR: unsafe job name" >&2
     exit 1
 fi
-if [[ -n "$dependency" && ! "$dependency" =~ ^afterany:[1-9][0-9]*$ ]]; then
+if [[ -n "$dependency" && ! "$dependency" =~ ^(afterok|afterany):[1-9][0-9]*$ ]]; then
     echo "ERROR: unsafe or unsupported Slurm dependency: $dependency" >&2
     exit 1
+fi
+upstream_worker_args=()
+upstream_values=(
+    "$upstream_campaign_root" "$upstream_repository" "$upstream_expected_sha"
+    "$upstream_spec" "$upstream_input_manifest"
+)
+upstream_nonempty=0
+for value in "${upstream_values[@]}"; do
+    [[ -n "$value" ]] && upstream_nonempty=$((upstream_nonempty + 1))
+done
+if [[ "$upstream_nonempty" -ne 0 && "$upstream_nonempty" -ne 5 ]]; then
+    echo "ERROR: upstream campaign identity overrides are all-or-none" >&2
+    exit 1
+fi
+if [[ "$upstream_nonempty" -eq 5 ]]; then
+    if [[ "$upstream_campaign_root" != /* ]] ||
+        [[ ! -d "$upstream_repository" ]] ||
+        [[ ! "$upstream_expected_sha" =~ ^[0-9a-f]{40}$ ]] ||
+        [[ "$($git_bin -C "$upstream_repository" rev-parse HEAD 2>/dev/null || true)" != "$upstream_expected_sha" ]] ||
+        [[ -n "$($git_bin -C "$upstream_repository" status --porcelain --untracked-files=all 2>/dev/null || true)" ]] ||
+        [[ ! -f "$upstream_spec" ]] ||
+        [[ ! -f "$upstream_input_manifest" ]]; then
+        echo "ERROR: upstream campaign identity is invalid" >&2
+        exit 1
+    fi
+    upstream_worker_args=(
+        "$upstream_campaign_root" "$upstream_repository"
+        "$upstream_expected_sha" "$upstream_spec" "$upstream_input_manifest"
+    )
 fi
 
 sbatch_bin="$(command -v sbatch || true)"
@@ -302,6 +343,10 @@ echo "Persistent archive: $archive_root"
 echo "Resources: account=$account partition=$partition gres=$gpu_gres nodes=1 lanes=$gpu_lanes cpus/lane=$cpus_per_task mem=$host_memory lane_mem=$lane_memory time=$walltime"
 echo "GPU gate: name_contains=$expected_gpu min_vram_gib=$min_vram_gib"
 echo "Dependency:         ${dependency:-none}"
+if [[ "$upstream_nonempty" -eq 5 ]]; then
+    echo "Upstream campaign:  $upstream_campaign_root"
+    echo "Upstream snapshot:  $upstream_repository ($upstream_expected_sha)"
+fi
 if [[ "$partition" == scavenger_* ]]; then
     echo "Preemption note: this partition may CANCEL the job; resume the same run ID with --resume."
 fi
@@ -322,4 +367,5 @@ fi
     "$lane_memory" \
     "$lane_gres" \
     "$expected_gpu" \
-    "$min_vram_gib"
+    "$min_vram_gib" \
+    "${upstream_worker_args[@]}"

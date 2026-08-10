@@ -514,7 +514,7 @@ def test_submit_wrapper_safely_appends_optional_slurm_dependency() -> None:
     )
     assert (
         'if [[ -n "$dependency" && ! "$dependency" =~ '
-        '^afterany:[1-9][0-9]*$'
+        '^(afterok|afterany):[1-9][0-9]*$'
         in shared
     )
     assert 'sbatch_args+=("--dependency=$dependency")' in shared

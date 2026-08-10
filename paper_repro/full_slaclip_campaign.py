@@ -2080,6 +2080,11 @@ def _model_metrics(
     evaluations = summary.get("evaluations")
     initial_loss = final_loss = best_loss = normalized_loss_auc = None
     best_round = final_minus_best = None
+    loss_total_variation = loss_excess_total_variation = None
+    initial_token_accuracy = final_token_accuracy = best_token_accuracy = None
+    normalized_token_accuracy_auc = token_accuracy_total_variation = None
+    final_supervised_tokens = final_correct_tokens = None
+    token_accuracy_definition = None
     if isinstance(evaluations, list) and evaluations:
         points = [
             (int(value["round"]), float(value["loss"]))
@@ -2105,6 +2110,68 @@ def _model_metrics(
                         points[1:],
                     )
                 ) / span
+            loss_total_variation = math.fsum(
+                abs(right_loss - left_loss)
+                for (_left_round, left_loss), (_right_round, right_loss)
+                in zip(points, points[1:])
+            )
+            # Remove the unavoidable endpoint-to-endpoint movement so this
+            # measures reversals/backtracking rather than rewarding a method
+            # merely for learning less.  Numerical round-off is clamped only
+            # at zero; the underlying loss observations remain untouched.
+            loss_excess_total_variation = max(
+                0.0,
+                loss_total_variation - abs(final_loss - initial_loss),
+            )
+        accuracy_points = [
+            (int(value["round"]), float(value["token_accuracy"]))
+            for value in evaluations
+            if isinstance(value, dict)
+            and isinstance(value.get("round"), int)
+            and isinstance(value.get("token_accuracy"), (int, float))
+            and not isinstance(value.get("token_accuracy"), bool)
+            and math.isfinite(float(value["token_accuracy"]))
+            and 0.0 <= float(value["token_accuracy"]) <= 1.0
+        ]
+        if len(accuracy_points) == len(evaluations) and accuracy_points:
+            first_accuracy, last_accuracy = accuracy_points[0], accuracy_points[-1]
+            initial_token_accuracy = first_accuracy[1]
+            final_token_accuracy = last_accuracy[1]
+            best_token_accuracy = max(value for _round, value in accuracy_points)
+            accuracy_span = last_accuracy[0] - first_accuracy[0]
+            if accuracy_span > 0:
+                normalized_token_accuracy_auc = math.fsum(
+                    (right_round - left_round)
+                    * (left_accuracy + right_accuracy)
+                    / 2.0
+                    for (left_round, left_accuracy), (right_round, right_accuracy)
+                    in zip(accuracy_points, accuracy_points[1:])
+                ) / accuracy_span
+            token_accuracy_total_variation = math.fsum(
+                abs(right_accuracy - left_accuracy)
+                for (_left_round, left_accuracy), (_right_round, right_accuracy)
+                in zip(accuracy_points, accuracy_points[1:])
+            )
+            final_evaluation = evaluations[-1]
+            if (
+                final_evaluation.get("token_accuracy_definition")
+                == "supervised_token_top1_micro_accuracy"
+            ):
+                token_accuracy_definition = final_evaluation[
+                    "token_accuracy_definition"
+                ]
+            supervised = final_evaluation.get("supervised_tokens")
+            correct = final_evaluation.get("correct_tokens")
+            if (
+                isinstance(supervised, int)
+                and not isinstance(supervised, bool)
+                and supervised > 0
+                and isinstance(correct, int)
+                and not isinstance(correct, bool)
+                and 0 <= correct <= supervised
+            ):
+                final_supervised_tokens = supervised
+                final_correct_tokens = correct
     clipping = summary.get("clipping")
     clipping = clipping if isinstance(clipping, dict) else {}
     any_group = clipping.get("any_group")
@@ -2180,11 +2247,21 @@ def _model_metrics(
         "best_round": best_round,
         "final_minus_best": final_minus_best,
         "normalized_loss_auc": normalized_loss_auc,
+        "loss_total_variation": loss_total_variation,
+        "loss_excess_total_variation": loss_excess_total_variation,
         "loss_delta": (
             final_loss - initial_loss
             if initial_loss is not None and final_loss is not None
             else None
         ),
+        "initial_token_accuracy": initial_token_accuracy,
+        "final_token_accuracy": final_token_accuracy,
+        "best_token_accuracy": best_token_accuracy,
+        "normalized_token_accuracy_auc": normalized_token_accuracy_auc,
+        "token_accuracy_total_variation": token_accuracy_total_variation,
+        "final_supervised_tokens": final_supervised_tokens,
+        "final_correct_tokens": final_correct_tokens,
+        "token_accuracy_definition": token_accuracy_definition,
         "actual_clipped_fraction": any_group.get("fraction"),
         "would_clip_fraction": any_group.get("would_fraction"),
         "elapsed_seconds": summary.get("elapsed_seconds"),
@@ -2280,6 +2357,12 @@ def _model_metrics(
         result[f"would_clip_fraction_{group_name}"] = behavior_group.get(
             "would_clip_fraction"
         )
+        result[f"fully_clipped_round_count_{group_name}"] = behavior_group.get(
+            "fully_clipped_round_count"
+        )
+        result[f"fully_clipped_round_fraction_{group_name}"] = behavior_group.get(
+            "fully_clipped_round_fraction"
+        )
         for count_name in controller_count_names:
             result[f"{count_name}_{group_name}"] = group.get(count_name)
         for scalar_name in (
@@ -2321,7 +2404,17 @@ BASE_METRIC_COLUMNS = (
     "best_round",
     "final_minus_best",
     "normalized_loss_auc",
+    "loss_total_variation",
+    "loss_excess_total_variation",
     "loss_delta",
+    "initial_token_accuracy",
+    "final_token_accuracy",
+    "best_token_accuracy",
+    "normalized_token_accuracy_auc",
+    "token_accuracy_total_variation",
+    "final_supervised_tokens",
+    "final_correct_tokens",
+    "token_accuracy_definition",
     "actual_clipped_fraction",
     "would_clip_fraction",
     "elapsed_seconds",
@@ -2357,6 +2450,8 @@ GROUP_METRIC_COLUMNS = (
     "final_threshold",
     "actual_clipped_fraction",
     "would_clip_fraction",
+    "fully_clipped_round_count",
+    "fully_clipped_round_fraction",
     "raw_gradient_l2_median",
     "raw_to_threshold_ratio_median",
     "removed_gradient_l2_median",
@@ -2397,7 +2492,16 @@ AGGREGATED_METRICS = (
     "best_round",
     "final_minus_best",
     "normalized_loss_auc",
+    "loss_total_variation",
+    "loss_excess_total_variation",
     "loss_delta",
+    "initial_token_accuracy",
+    "final_token_accuracy",
+    "best_token_accuracy",
+    "normalized_token_accuracy_auc",
+    "token_accuracy_total_variation",
+    "final_supervised_tokens",
+    "final_correct_tokens",
     "actual_clipped_fraction",
     "elapsed_seconds",
     "cdf_endpoint_noise_std_theoretical",
@@ -2851,10 +2955,23 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
                 "final_loss",
                 "best_loss",
                 "normalized_loss_auc",
+                "loss_total_variation",
+                "loss_excess_total_variation",
+                "initial_token_accuracy",
+                "final_token_accuracy",
+                "best_token_accuracy",
+                "normalized_token_accuracy_auc",
+                "token_accuracy_total_variation",
+                "final_supervised_tokens",
+                "final_correct_tokens",
                 "elapsed_seconds",
                 "actual_clipped_fraction",
                 "raw_gradient_l2_median_A",
                 "raw_gradient_l2_median_B",
+                "fully_clipped_round_count_A",
+                "fully_clipped_round_count_B",
+                "fully_clipped_round_fraction_A",
+                "fully_clipped_round_fraction_B",
             ]
             if row["method"] in {FIXED_DP_METHOD, *ADAPTIVE_METHODS}:
                 required_metrics.extend(
@@ -2890,6 +3007,14 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
                 raise RuntimeError(
                     f"completed metric row has missing/non-finite evidence: "
                     f"{row['arm_id']}/{row['model']} {invalid[:4]}"
+                )
+            if (
+                row.get("token_accuracy_definition")
+                != "supervised_token_top1_micro_accuracy"
+            ):
+                raise RuntimeError(
+                    "completed metric row has an invalid token-accuracy "
+                    f"definition: {row['arm_id']}/{row['model']}"
                 )
 
     comparison_records = ensure_full_comparisons(
@@ -3749,14 +3874,21 @@ def _archive_candidate(path: Path, root: Path) -> bool:
         "strong-groupwise-fixed-selection.lock.json",
         "oracle-ceiling-selection.lock.json",
         "oracle-ceiling-gate.lock.json",
+        "stage2-confirmation-runtime-manifest.json",
+        "target-profile-calibration.lock.json",
+        "target-profile-development-selection.lock.json",
+        "target-profile-confirmation-gate.lock.json",
         "fixed_beta_calibration.csv",
         "fixed_groupwise_beta_calibration.csv",
         "strong_groupwise_fixed_beta_calibration.csv",
+        "target_profile_calibration.csv",
+        "target_profile_source_trajectory.csv",
         "fixed_trajectory.csv",
         "slaclip_trajectory.csv",
         "groupwise_slaclip_trajectory.csv",
         "confirmation_paired_metrics.csv",
         "confirmation_aggregate_metrics.csv",
+        "confirmation_hypothesis_metrics.csv",
         "oracle_vs_noisy_aggregate_metrics.csv",
     }:
         return True

@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "campaign_name": "full_slaclip_actual_target_profiles_v1",
+  "description": "A downstream, one-allocation Full-SlaClip campaign that reuses the immutable strong groupwise-fixed lock, defines five hard-clipping outcome labels, maps each label through bracketing hard-rate strata to the stationary endpoint surrogate 1-q, fits generalized Full-SlaClip beta by weighted least squares against beta*(1-z), selects feasible eta values on development seeds, and confirms every frozen profile on fresh seeds.",
+  "expected_stage_arm_counts": {
+    "development": 156,
+    "confirmation": 240,
+    "total": 396
+  },
+  "common": {
+    "models": ["bert", "gpt2"],
+    "num_clients": 5,
+    "rounds": 50,
+    "batch_size": 8,
+    "noise_multiplier": 2.0,
+    "learning_rate": 0.0005,
+    "rank": 512,
+    "max_seq_length": 128,
+    "max_validation_records": 512,
+    "eval_every": 5,
+    "checkpoint_every": 25,
+    "data_split_seed": 1729,
+    "evaluation_seed": 2718,
+    "delta": 0.00001,
+    "slaclip_num_slots": 5,
+    "slaclip_c_min": 0.025,
+    "slaclip_c_max": 50.0,
+    "slaclip_endpoint_epsilon": 0.000001
+  },
+  "upstream_oracle_ceiling": {
+    "campaign_name": "groupwise_fixed_oracle_ceiling_v1",
+    "repository_sha": "2c3d2c6b5911a6b87812ac1c806fc67a85926554",
+    "spec_sha256": "2fc1fbb380035647682c52b368db5559f7922004edee3585065d86d5e8ec4268",
+    "input_manifest_sha256": "55201963e8b77a851612877841fcb4e1cd129fdc79c57eb8769ff918f53b17ed",
+    "required_fixed_lock_status": "STRONG_GROUPWISE_FIXED_SELECTION_LOCKED",
+    "selected_fixed_trajectory_seed_count_per_model": 5,
+    "selected_fixed_trajectory_source_stages": ["fixed_coarse", "fixed_refinement"]
+  },
+  "target_profile_calibration": {
+    "groups": ["A", "B"],
+    "range_quantiles": [0.1, 0.9],
+    "profile_interpolation_positions": [0.0, 0.25, 0.5, 0.75, 1.0],
+    "desired_target_definition": "five_equally_spaced_per_group_hard_clip_rates_over_the_P10_to_P90_actual_clipped_fraction_interval_of_selected_strong_fixed_exact_trajectories",
+    "hard_rate_to_surrogate_mapping": "bracket_each_desired_hard_rate_by_observed_discrete_hard_clip_levels_and_mix_the_two_strata_to_reproduce_the_desired_hard_rate_exactly",
+    "beta_semantics": "desired_hard_clip_rate_is_an_outcome_label_not_beta_or_the_controller_dynamic_target;the_controller_dynamic_target_is_beta_times_one_minus_z",
+    "beta_fit": "box_constrained_weighted_least_squares_over_bracketing_hard_rate_strata_minimize_(beta*(1-z)-(1-q))^2",
+    "beta_bounds": [0.0, 1.0],
+    "private_diagnostic_label": "NON_DP_PRIVATE_DIAGNOSTIC",
+    "consumed_at_controller_runtime": false
+  },
+  "development": {
+    "reference_method": "paper_dp_lora",
+    "method": "slaclip_dp_lora",
+    "seeds": [700, 701, 702],
+    "etas": [0.0005, 0.001, 0.0025, 0.005, 0.01],
+    "initial_C_policy": "selected_strong_groupwise_fixed_C_A_and_C_B",
+    "selection_scope": "select_eta_separately_for_each_model_and_target_profile",
+    "hard_target_absolute_tolerance": 0.15,
+    "controller_tracking_absolute_error_tolerance": 0.25,
+    "selection_rule": [
+      "feasible_mean_hard_target_error_for_both_groups_at_most_0.15_and_mean_controller_tracking_error_for_both_groups_at_most_0.25",
+      "lowest_mean_paired_final_validation_loss_delta_vs_strong_fixed",
+      "lowest_mean_paired_normalized_loss_auc_delta_vs_strong_fixed",
+      "fewest_controller_instability_events",
+      "smaller_eta"
+    ]
+  },
+  "confirmation": {
+    "methods": ["paper_dp_lora", "slaclip_dp_lora"],
+    "seeds": [800, 801, 802, 803, 804, 805, 806, 807, 808, 809, 810, 811, 812, 813, 814, 815, 816, 817, 818, 819],
+    "primary_metric": "final_internal_validation_loss",
+    "secondary_metrics": [
+      "normalized_internal_validation_loss_auc",
+      "final_internal_supervised_token_accuracy",
+      "cross_seed_final_loss_sample_std",
+      "mean_loss_excess_total_variation",
+      "mean_final_minus_best"
+    ],
+    "hypothesis_count": 10,
+    "familywise_alpha": 0.05,
+    "bonferroni_alpha_per_hypothesis": 0.005,
+    "minimum_practically_relevant_improvement": {
+      "bert": 0.0005,
+      "gpt2": 0.00006
+    },
+    "target_achievement_absolute_tolerance": 0.075,
+    "target_achievement_rule": "mean_actual_clipped_fraction_for_each_of_A_and_B_within_absolute_tolerance_of_its_desired_hard_clip_rate",
+    "controller_tracking_absolute_error_tolerance": 0.2,
+    "controller_tracking_rule": "confirmation_mean_of_per_seed_actual_target_absolute_error_median_for_each_of_A_and_B_at_most_tolerance",
+    "full_clipped_round_fraction_cap": 0.2,
+    "full_clipped_round_fraction_rule": "confirmation_mean_fully_clipped_round_fraction_for_each_group_at_most_cap_when_desired_hard_rate_below_0.95",
+    "utility_stability_definition": [
+      "paired_loss_excess_total_variation_delta_mean_not_positive_and_ci95_high_below_zero",
+      "paired_final_minus_best_delta_mean_not_positive_and_ci95_high_below_zero",
+      "cross_seed_final_loss_sample_std_is_descriptive_only"
+    ],
+    "primary_gate_requires": [
+      "paired_final_loss_mean_below_negative_model_MPRD",
+      "paired_final_loss_ci95_high_below_zero",
+      "exact_sign_flip_p_below_bonferroni_0.005",
+      "paired_normalized_loss_auc_mean_not_positive",
+      "hard_target_achieved_for_both_groups",
+      "controller_surrogate_tracking_achieved_for_both_groups",
+      "full_clipped_round_fraction_cap_achieved_for_both_groups"
+    ],
+    "joint_claim_requires": [
+      "primary_gate_passed",
+      "utility_stability_gate_passed",
+      "paired_final_internal_supervised_token_accuracy_delta_ci95_low_above_zero",
+      "paired_final_internal_supervised_token_accuracy_exact_sign_flip_p_below_bonferroni_0.005"
+    ]
+  },
+  "scientific_boundary": {
+    "analysis_role": "actual_clipping_target_profile_full_slaclip_vs_strong_groupwise_fixed_confirmation",
+    "controller_family": "groupwise_generalized_full_SlaClip_beta_two_noisy_CDF_endpoints_K5",
+    "excluded_method_family": "SlaClip-Q",
+    "full_slaclip_only": true,
+    "desired_hard_clip_rate_is_distinct_from_beta_and_dynamic_target": true,
+    "target_profiles_derived_before_development": true,
+    "development_and_confirmation_seeds_disjoint": true,
+    "utility_stability_not_threshold_stability": true,
+    "external_test_set_used": false,
+    "paper_result_reproduced": false,
+    "end_to_end_dp_certified": false,
+    "single_allocation": true,
+    "nested_sbatch_or_array": false,
+    "all_candidates_reported": true
+  }
+}

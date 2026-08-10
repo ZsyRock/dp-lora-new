@@ -29,6 +29,7 @@ from paper_repro.train_federated import (
     partition_indices,
     load_data_protocol,
     round_update_statistics,
+    supervised_token_prediction_counts,
     clone_trainable_state,
     restore_trainable_state,
     resolve_slaclip_base_targets,
@@ -98,7 +99,16 @@ def valid_checkpoint_state(config: EffectiveConfig, completed_round: int) -> dic
         "clipped_counts": {"A": 0, "B": 0, "any": 0},
         "would_clip_counts": {"A": 0, "B": 0, "any": 0},
         "evaluations": [
-            {"round": round_index, "loss": 1.0}
+            {
+                "round": round_index,
+                "loss": 1.0,
+                "supervised_tokens": 10,
+                "correct_tokens": 5,
+                "token_accuracy": 0.5,
+                "token_accuracy_definition": (
+                    "supervised_token_top1_micro_accuracy"
+                ),
+            }
             for round_index in evaluation_rounds
         ],
         "sampled_unique_indices": [[0], [1]],
@@ -590,6 +600,39 @@ class PaperReproTests(unittest.TestCase):
             + torch.log1p(torch.exp(torch.tensor(-4.0)))
         ) / 2
         self.assertTrue(torch.allclose(loss, expected, atol=1e-7))
+
+    def test_bert_token_accuracy_counts_only_masked_labels(self) -> None:
+        logits = torch.tensor(
+            [
+                [
+                    [0.0, 4.0, 0.0],
+                    [4.0, 0.0, 0.0],
+                    [0.0, 0.0, 4.0],
+                ]
+            ]
+        )
+        labels = torch.tensor([[1, -100, 0]])
+        correct, total = supervised_token_prediction_counts(
+            logits, labels, "bert"
+        )
+        self.assertEqual((correct, total), (1, 2))
+
+    def test_gpt2_token_accuracy_uses_shifted_causal_labels(self) -> None:
+        logits = torch.tensor(
+            [
+                [
+                    [0.0, 4.0, 0.0],
+                    [4.0, 0.0, 0.0],
+                    [0.0, 0.0, 4.0],
+                    [0.0, 4.0, 0.0],
+                ]
+            ]
+        )
+        labels = torch.tensor([[2, 1, -100, 0]])
+        correct, total = supervised_token_prediction_counts(
+            logits, labels, "gpt2"
+        )
+        self.assertEqual((correct, total), (1, 2))
 
     def test_partitions_are_disjoint_and_complete(self) -> None:
         parts = partition_indices(103, 5, 42)
@@ -1266,6 +1309,24 @@ class PaperReproTests(unittest.TestCase):
                         rng_domain="rng-domain",
                         clients=[np.array([0]), np.array([1])],
                     )
+
+    def test_checkpoint_rejects_inconsistent_token_accuracy(self) -> None:
+        config = paper_config()
+        state = valid_checkpoint_state(config, completed_round=2)
+        state["evaluations"][0]["token_accuracy"] = 0.4
+        with self.assertRaisesRegex(
+            RuntimeError, "supervised-token accuracy is invalid"
+        ):
+            validate_checkpoint_trainer_state(
+                state,
+                completed_round=2,
+                model_kind="bert",
+                config=config,
+                run_config_fingerprint="run-fingerprint",
+                private_key_commitment="key-commitment",
+                rng_domain="rng-domain",
+                clients=[np.array([0]), np.array([1])],
+            )
 
     def test_round_shards_reject_unsupported_schema(self) -> None:
         with tempfile.TemporaryDirectory() as root:

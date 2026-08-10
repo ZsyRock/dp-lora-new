@@ -1882,18 +1882,40 @@ def equal_record_loss(
 ) -> torch.Tensor:
     """Average token loss within each record, then average the B records."""
 
-    import torch.nn.functional as functional
-
     outputs = model(
         input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]
     )
-    logits = outputs.logits
-    labels = batch["labels"]
+    logits, labels = align_supervised_logits_and_labels(
+        outputs.logits, batch["labels"], model_kind
+    )
+    return _equal_record_loss_from_aligned(logits, labels)
+
+
+def align_supervised_logits_and_labels(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    model_kind: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Align logits with the labels that each LM objective supervises."""
+
     if model_kind == "gpt2":
         logits = logits[:, :-1, :].contiguous()
         labels = labels[:, 1:].contiguous()
     elif model_kind != "bert":
         raise ValueError(f"unsupported model kind: {model_kind}")
+    if logits.shape[:-1] != labels.shape:
+        raise RuntimeError("aligned logits and labels have incompatible shapes")
+    return logits, labels
+
+
+def _equal_record_loss_from_aligned(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+) -> torch.Tensor:
+    """Compute the established equal-record objective from aligned tensors."""
+
+    import torch.nn.functional as functional
+
     token_losses = functional.cross_entropy(
         logits.float().view(-1, logits.shape[-1]),
         labels.view(-1),
@@ -1906,6 +1928,38 @@ def equal_record_loss(
         raise RuntimeError("a batch record has no supervised tokens")
     record_losses = (token_losses * valid).sum(dim=1) / counts
     return record_losses.mean()
+
+
+def supervised_token_prediction_counts(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    model_kind: str,
+) -> tuple[int, int]:
+    """Return ``(correct, total)`` over valid masked/next-token labels."""
+
+    aligned_logits, aligned_labels = align_supervised_logits_and_labels(
+        logits, labels, model_kind
+    )
+    return _supervised_token_prediction_counts_from_aligned(
+        aligned_logits, aligned_labels
+    )
+
+
+def _supervised_token_prediction_counts_from_aligned(
+    aligned_logits: torch.Tensor,
+    aligned_labels: torch.Tensor,
+) -> tuple[int, int]:
+    """Count correct supervised tokens after objective-specific alignment."""
+
+    if aligned_logits.shape[:-1] != aligned_labels.shape:
+        raise RuntimeError("aligned logits and labels have incompatible shapes")
+    valid = aligned_labels.ne(-100)
+    total = int(valid.sum().item())
+    if total <= 0:
+        raise RuntimeError("a validation batch has no supervised tokens")
+    predictions = aligned_logits.argmax(dim=-1)
+    correct = int(predictions.eq(aligned_labels).logical_and(valid).sum().item())
+    return correct, total
 
 
 def evaluate(
@@ -1921,6 +1975,8 @@ def evaluate(
     model.eval()
     weighted_loss_sum = 0.0
     evaluated_records = 0
+    supervised_tokens = 0
+    correct_tokens = 0
     batches = 0
     with torch.no_grad():
         for offset in range(0, len(validation_indices), config.batch_size):
@@ -1933,22 +1989,44 @@ def evaluate(
                 device,
                 seed + offset,
             )
-            loss = equal_record_loss(model, batch, model_kind)
+            outputs = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+            )
+            aligned_logits, aligned_labels = align_supervised_logits_and_labels(
+                outputs.logits, batch["labels"], model_kind
+            )
+            loss = _equal_record_loss_from_aligned(
+                aligned_logits, aligned_labels
+            )
+            batch_correct, batch_supervised = (
+                _supervised_token_prediction_counts_from_aligned(
+                    aligned_logits, aligned_labels
+                )
+            )
             value = float(loss.detach().float().item())
             if not math.isfinite(value):
                 raise FloatingPointError("non-finite validation loss")
             batch_records = int(len(indices))
             weighted_loss_sum += value * batch_records
             evaluated_records += batch_records
+            supervised_tokens += batch_supervised
+            correct_tokens += batch_correct
             batches += 1
     if evaluated_records != len(validation_indices) or evaluated_records <= 0:
         raise RuntimeError("validation record accounting mismatch")
+    if supervised_tokens <= 0 or not 0 <= correct_tokens <= supervised_tokens:
+        raise RuntimeError("validation supervised-token accounting mismatch")
     mean_loss = float(weighted_loss_sum / evaluated_records)
     model.train()
     return {
         "objective": "masked_lm" if model_kind == "bert" else "causal_lm",
         "records": int(len(validation_indices)),
         "batches": batches,
+        "supervised_tokens": supervised_tokens,
+        "correct_tokens": correct_tokens,
+        "token_accuracy": float(correct_tokens / supervised_tokens),
+        "token_accuracy_definition": "supervised_token_top1_micro_accuracy",
         "loss": mean_loss,
         "exp_loss": math.exp(min(mean_loss, 20.0)),
         "exp_loss_capped_at_20": mean_loss > 20.0,
@@ -2556,6 +2634,10 @@ def behavior_summary(shards: Sequence[dict[str, Any]]) -> dict[str, Any]:
         clipped_rounds = [
             record["round"] for record, value in zip(clients, values) if value["clipped"]
         ]
+        fully_clipped_round_count = sum(
+            float(round_record[group]["clipped_fraction"]) == 1.0
+            for round_record in rounds
+        )
         group_summaries[group] = {
             "actual_clipped_count": sum(bool(value["clipped"]) for value in values),
             "actual_clipped_fraction": safe_ratio(
@@ -2568,6 +2650,14 @@ def behavior_summary(shards: Sequence[dict[str, Any]]) -> dict[str, Any]:
             "first_actual_clipped_round": min(clipped_rounds)
             if clipped_rounds
             else None,
+            "fully_clipped_round_count": fully_clipped_round_count,
+            "fully_clipped_round_fraction": safe_ratio(
+                fully_clipped_round_count, len(rounds)
+            ),
+            "round_actual_clipped_fraction": safe_quantiles(
+                round_record[group]["clipped_fraction"]
+                for round_record in rounds
+            ),
             "raw_gradient_l2": safe_quantiles(value["raw_norm"] for value in values),
             "raw_to_threshold_ratio": safe_quantiles(
                 value["raw_to_threshold_ratio"] for value in values
@@ -3040,6 +3130,32 @@ def validate_checkpoint_trainer_state(
             or not math.isfinite(float(loss))
         ):
             raise RuntimeError("checkpoint evaluation loss is invalid")
+        supervised_tokens = evaluation.get("supervised_tokens")
+        correct_tokens = evaluation.get("correct_tokens")
+        token_accuracy = evaluation.get("token_accuracy")
+        if (
+            not isinstance(supervised_tokens, int)
+            or isinstance(supervised_tokens, bool)
+            or supervised_tokens <= 0
+            or not isinstance(correct_tokens, int)
+            or isinstance(correct_tokens, bool)
+            or not 0 <= correct_tokens <= supervised_tokens
+            or not isinstance(token_accuracy, (int, float))
+            or isinstance(token_accuracy, bool)
+            or not math.isfinite(float(token_accuracy))
+            or not 0.0 <= float(token_accuracy) <= 1.0
+            or float(token_accuracy) != correct_tokens / supervised_tokens
+        ):
+            raise RuntimeError(
+                "checkpoint evaluation supervised-token accuracy is invalid"
+            )
+        if (
+            evaluation.get("token_accuracy_definition")
+            != "supervised_token_top1_micro_accuracy"
+        ):
+            raise RuntimeError(
+                "checkpoint evaluation token-accuracy definition is invalid"
+            )
     sampled = state.get("sampled_unique_indices")
     if not isinstance(sampled, list) or len(sampled) != config.num_clients:
         raise RuntimeError("checkpoint sample-coverage state is invalid")

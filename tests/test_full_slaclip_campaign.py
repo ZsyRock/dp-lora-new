@@ -728,15 +728,50 @@ def test_model_metrics_reports_trapezoid_auc_and_best_checkpoint() -> None:
     arm = expand_spec(load_spec(SPEC))[0]
     summary = _fake_model_summary(adaptive=False, final_loss=3.0)
     summary["evaluations"] = [
-        {"round": 0, "loss": 4.0},
-        {"round": 10, "loss": 2.0},
-        {"round": 50, "loss": 3.0},
+        {
+            "round": 0, "loss": 4.0, "token_accuracy": 0.2,
+            "supervised_tokens": 100, "correct_tokens": 20,
+            "token_accuracy_definition": "supervised_token_top1_micro_accuracy",
+        },
+        {
+            "round": 10, "loss": 2.0, "token_accuracy": 0.5,
+            "supervised_tokens": 100, "correct_tokens": 50,
+            "token_accuracy_definition": "supervised_token_top1_micro_accuracy",
+        },
+        {
+            "round": 50, "loss": 3.0, "token_accuracy": 0.4,
+            "supervised_tokens": 100, "correct_tokens": 40,
+            "token_accuracy_definition": "supervised_token_top1_micro_accuracy",
+        },
     ]
     metrics = _model_metrics(arm, "bert", summary)
     assert metrics["best_loss"] == 2.0
     assert metrics["best_round"] == 10
     assert metrics["final_minus_best"] == 1.0
     assert math.isclose(metrics["normalized_loss_auc"], 2.6)
+    assert math.isclose(metrics["loss_total_variation"], 3.0)
+    assert math.isclose(metrics["loss_excess_total_variation"], 2.0)
+    assert math.isclose(metrics["initial_token_accuracy"], 0.2)
+    assert math.isclose(metrics["final_token_accuracy"], 0.4)
+    assert math.isclose(metrics["best_token_accuracy"], 0.5)
+    assert math.isclose(metrics["normalized_token_accuracy_auc"], 0.43)
+    assert math.isclose(metrics["token_accuracy_total_variation"], 0.4)
+    assert metrics["final_supervised_tokens"] == 100
+    assert metrics["final_correct_tokens"] == 40
+    assert (
+        metrics["token_accuracy_definition"]
+        == "supervised_token_top1_micro_accuracy"
+    )
+    for name in (
+        "loss_total_variation",
+        "loss_excess_total_variation",
+        "final_token_accuracy",
+        "normalized_token_accuracy_auc",
+        "final_supervised_tokens",
+        "final_correct_tokens",
+    ):
+        assert name in campaign_module.BASE_METRIC_COLUMNS
+        assert name in campaign_module.AGGREGATED_METRICS
 
 
 def test_paired_inference_reports_effect_size_interval_and_exact_sign_flip() -> None:
@@ -784,6 +819,8 @@ def _fake_model_summary(*, adaptive: bool, final_loss: float) -> dict[str, objec
     behavior_group = {
         "actual_clipped_fraction": 0.1,
         "would_clip_fraction": 0.1,
+        "fully_clipped_round_count": 0,
+        "fully_clipped_round_fraction": 0.0,
         **{
             name: {"quantiles": {"0.5": float(index)}}
             for index, name in enumerate(
@@ -807,7 +844,28 @@ def _fake_model_summary(*, adaptive: bool, final_loss: float) -> dict[str, objec
         },
     }
     return {
-        "evaluations": [{"round": 0, "loss": 4.0}, {"round": 50, "loss": final_loss}],
+        "evaluations": [
+            {
+                "round": 0,
+                "loss": 4.0,
+                "supervised_tokens": 100,
+                "correct_tokens": 20,
+                "token_accuracy": 0.2,
+                "token_accuracy_definition": (
+                    "supervised_token_top1_micro_accuracy"
+                ),
+            },
+            {
+                "round": 50,
+                "loss": final_loss,
+                "supervised_tokens": 100,
+                "correct_tokens": 40,
+                "token_accuracy": 0.4,
+                "token_accuracy_definition": (
+                    "supervised_token_top1_micro_accuracy"
+                ),
+            },
+        ],
         "clipping": {"any_group": {"fraction": 0.1, "would_fraction": 0.1}},
         "behavior_summary": {
             "sample_schedule_sha256": "a" * 64,
