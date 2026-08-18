@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "campaign_name": "dp_lora_paper_axes_full_slaclip_rank_noise_v1",
+  "description": "One-allocation paired study of executable DP-LoRA paper axes: the paper C=10/r=512 setting, the paper's LoRA-rank communication sweep, sigma sensitivity, and non-private/clip-only mechanism controls, with K=5 Full SlaClip and no SlaClip-Q arms.",
+  "expected_arm_count": 70,
+  "common": {
+    "models": ["bert", "gpt2"],
+    "num_clients": 5,
+    "rounds": 50,
+    "batch_size": 8,
+    "noise_multiplier": 2.0,
+    "learning_rate": 0.0005,
+    "rank": 512,
+    "max_seq_length": 128,
+    "max_validation_records": 512,
+    "eval_every": 10,
+    "checkpoint_every": 10,
+    "data_split_seed": 1729,
+    "evaluation_seed": 2718,
+    "delta": 0.00001,
+    "slaclip_num_slots": 5,
+    "slaclip_c_min": 0.025,
+    "slaclip_c_max": 50.0,
+    "default_eta": 0.2,
+    "default_beta": 0.76
+  },
+  "primary": {
+    "initial_clip_norms": [10.0],
+    "seeds": [900, 901, 902, 903, 904],
+    "methods": ["paper_dp_lora", "slaclip_dp_lora"]
+  },
+  "threshold_robustness": {
+    "initial_clip_norms": [],
+    "seeds": [],
+    "methods": ["paper_dp_lora", "slaclip_dp_lora"]
+  },
+  "sensitivity": {
+    "initial_clip_norm": 10.0,
+    "seeds": [],
+    "etas": [],
+    "betas": [],
+    "method": "slaclip_dp_lora",
+    "exclude_primary_default": true
+  },
+  "noise_sensitivity": {
+    "initial_clip_norm": 10.0,
+    "seeds": [900, 901, 902],
+    "noise_multipliers": [0.5, 1.0, 4.0],
+    "methods": ["paper_dp_lora", "slaclip_dp_lora"]
+  },
+  "client_sensitivity": {
+    "initial_clip_norm": 10.0,
+    "seeds": [],
+    "num_clients": [],
+    "methods": ["paper_dp_lora", "slaclip_dp_lora"]
+  },
+  "rank_sensitivity": {
+    "initial_clip_norm": 10.0,
+    "seeds": [900, 901, 902],
+    "ranks": [4, 16, 64, 128, 256, 1024],
+    "methods": ["paper_dp_lora", "slaclip_dp_lora"]
+  },
+  "controls": {
+    "initial_clip_norm": 10.0,
+    "seeds": [900, 901, 902],
+    "methods": ["no_dp_lora_control", "clip_only_control"]
+  },
+  "oracle_controls": {
+    "initial_clip_norm": 10.0,
+    "seeds": [],
+    "etas": [],
+    "betas": [],
+    "method": "oracle_slaclip_control"
+  },
+  "scientific_boundary": {
+    "claim_level": 1,
+    "analysis_role": "paper_rank_and_noise_axes_mechanism_extension_not_external_benchmark_confirmation",
+    "training_dataset": "MedDialog_HealthcareMagic_plus_iCliniq_public_reconstruction",
+    "models": ["bert-base-uncased", "gpt2-small"],
+    "paper_result_reproduced": false,
+    "paper_benchmarks_evaluated": false,
+    "external_test_set_used": false,
+    "end_to_end_dp_certified": false,
+    "exact_diagnostics_privacy_label": "NON_DP_PRIVATE_DIAGNOSTIC",
+    "controller_family": "full_SlaClip_two_noisy_CDF_endpoints_K5_only",
+    "excluded_method_family": "SlaClip-Q_and_all_fixed-target-quantile-controllers",
+    "paper_fixed_constants": {
+      "num_clients": 5,
+      "rounds": 50,
+      "batch_size": 8,
+      "noise_multiplier": 2.0,
+      "learning_rate": 0.0005,
+      "clip_norm": 10.0,
+      "rank": 512
+    },
+    "rank_values": [4, 16, 64, 128, 256, 512, 1024],
+    "rank_512_role": "covered_by_the_five_seed_primary_pair",
+    "rank_sweep_role": "paper_communication_utility_axis_extended_with_a_matched_full_SlaClip_arm",
+    "noise_multiplier_values": [0.5, 1.0, 2.0, 4.0],
+    "noise_warning": "sigma sensitivity only; values are not epsilon labels and do not establish equal privacy budgets",
+    "full_slaclip_configuration": {
+      "num_slots": 5,
+      "eta": 0.2,
+      "base_target_clipped_fraction": 0.76,
+      "selection_source": "previous_C10_MedDialog_development_campaigns",
+      "target_semantics": "dynamic_target_clipped=beta*(1-noisy_near_zero/(C_t+epsilon))"
+    },
+    "mechanism_controls": ["no_dp_lora_control", "clip_only_control_C10"],
+    "omitted_original_fl_baselines": {
+      "methods": ["Vanilla_FL_full_model", "T-FedAvg", "CMFL"],
+      "reason": "not implemented or pinned in the reconstructed repository; adding unverifiable approximations would not be a faithful baseline"
+    },
+    "omitted_models_and_tasks": {
+      "models": ["ChatGLM2-6B", "Llama2-7B"],
+      "tasks": ["BoolQ", "PIQA", "WinoGrande", "FPB", "FiQA-SA", "TFNS", "MedQuAD", "LiveQA", "MEDIQA-Ans"],
+      "reason": "pinned model snapshots and frozen downstream evaluation protocols are not yet staged"
+    },
+    "reporting_rule": "report every rank, sigma, method, model, and seed; rank and sigma axes are development/mechanism evidence and must not be presented as downstream benchmark reproduction",
+    "single_allocation": true,
+    "nested_sbatch_or_array": false
+  }
+}

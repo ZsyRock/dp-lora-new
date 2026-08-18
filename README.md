@@ -196,6 +196,26 @@ journal-complete result package.
 See `docs/CURRENT_RESULT_ASSESSMENT.md` for the evidence-based interpretation
 of legacy job `1298681` and its 7-minute-31-second wall time.
 
+## Executable DP-LoRA paper axes with Full SlaClip
+
+`hpc/submit_paper_axes_full_slaclip.sh` launches one one-A100 allocation for
+the DP-LoRA paper axes that this reconstruction can execute without inventing
+an unstated downstream protocol.  The 70-arm manifest pairs fixed-C DP-LoRA
+and noisy-endpoint Full SlaClip for the paper setting (`C=10`, `r=512`), the
+paper's LoRA rank values `4, 16, 64, 128, 256, 512, 1024`, and the labelled
+sigma sensitivity values `0.5, 1, 2, 4`.  It also includes no-DP LoRA and
+clip-only LoRA controls.  Every arm runs both BERT-base and GPT-2 small on the
+pinned MedDialog reconstruction and records rank in all per-run, paired, and
+aggregate tables so results from different ranks cannot be pooled silently.
+
+The campaign uses Full SlaClip only (`K=5`, `eta=0.2`, base target clipped
+fraction `beta=0.76`); SlaClip-Q is excluded.  Sigma values are mechanism
+sensitivity settings, not epsilon labels.  Vanilla full-model FL, T-FedAvg,
+CMFL, ChatGLM2-6B, Llama2-7B, and the paper's external benchmark tasks remain
+outside this launch because their pinned implementations or frozen evaluation
+protocols are not present in this repository.  Consequently this campaign is
+Level 1 mechanism evidence, not a reproduction of a downstream paper table.
+
 # Upstream project description
 
 The financial industry has experienced significant strides in Natural Language Processing (NLP) facilitated by Language Model (LM) technologies. However, the escalating concerns regarding data privacy present a formidable barrier to the ongoing enhancement of these models. A notable challenge involves potential adversarial attackers exploiting the weight of Language Models trained by individual banks, thereby jeopardizing user data confidentiality.

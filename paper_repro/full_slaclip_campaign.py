@@ -286,9 +286,7 @@ def _common_values(spec: Mapping[str, Any]) -> dict[str, Any]:
 
 def load_spec(path: Path) -> dict[str, Any]:
     spec = load_object(path, "campaign specification")
-    require_exact_keys(
-        spec,
-        {
+    required_keys = {
             "schema_version",
             "campaign_name",
             "description",
@@ -302,9 +300,15 @@ def load_spec(path: Path) -> dict[str, Any]:
             "controls",
             "oracle_controls",
             "scientific_boundary",
-        },
-        "campaign specification",
-    )
+    }
+    optional_keys = {"rank_sensitivity"}
+    missing = sorted(required_keys - set(spec))
+    extra = sorted(set(spec) - required_keys - optional_keys)
+    if missing or extra:
+        raise ValueError(
+            "campaign specification keys differ; "
+            f"missing={missing}, extra={extra}"
+        )
     if spec["schema_version"] != SCHEMA_VERSION:
         raise ValueError("unsupported campaign-spec schema")
     if not isinstance(spec["campaign_name"], str) or not spec["campaign_name"]:
@@ -329,6 +333,7 @@ def _base_arm(
     reference_arm_id: str | None,
     num_clients: int | None = None,
     noise_multiplier: float | None = None,
+    rank: int | None = None,
 ) -> dict[str, Any]:
     if method not in ALLOWED_METHODS:
         raise ValueError(f"unsupported method: {method}")
@@ -345,6 +350,8 @@ def _base_arm(
         analysis_role = "pre_registered_noise_multiplier_sensitivity"
     elif family == "client_sensitivity":
         analysis_role = "pre_registered_cdf_record_count_sensitivity"
+    elif family == "rank_sensitivity":
+        analysis_role = "paper_rank_communication_utility_sensitivity"
     elif family == "control":
         analysis_role = "mechanism_control"
     elif family == "oracle_control":
@@ -382,7 +389,7 @@ def _base_arm(
             else noise_multiplier
         ),
         "learning_rate": common["learning_rate"],
-        "rank": common["rank"],
+        "rank": common["rank"] if rank is None else rank,
         "max_seq_length": common["max_seq_length"],
         "max_validation_records": common["max_validation_records"],
         "eval_every": common["eval_every"],
@@ -403,6 +410,15 @@ def expand_spec(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
     sensitivity = spec.get("sensitivity")
     noise_sensitivity = spec.get("noise_sensitivity")
     client_sensitivity = spec.get("client_sensitivity")
+    rank_sensitivity = spec.get(
+        "rank_sensitivity",
+        {
+            "initial_clip_norm": 10.0,
+            "seeds": [],
+            "ranks": [],
+            "methods": [FIXED_DP_METHOD, FULL_SLACLIP_METHOD],
+        },
+    )
     controls = spec.get("controls")
     oracle_controls = spec.get("oracle_controls")
     named_sections = {
@@ -411,6 +427,7 @@ def expand_spec(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
         "sensitivity": sensitivity,
         "noise_sensitivity": noise_sensitivity,
         "client_sensitivity": client_sensitivity,
+        "rank_sensitivity": rank_sensitivity,
         "controls": controls,
         "oracle_controls": oracle_controls,
     }
@@ -421,6 +438,7 @@ def expand_spec(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
     assert isinstance(sensitivity, dict)
     assert isinstance(noise_sensitivity, dict)
     assert isinstance(client_sensitivity, dict)
+    assert isinstance(rank_sensitivity, dict)
     assert isinstance(controls, dict)
     assert isinstance(oracle_controls, dict)
     require_exact_keys(primary, {"initial_clip_norms", "seeds", "methods"}, "primary")
@@ -443,6 +461,11 @@ def expand_spec(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
         client_sensitivity,
         {"initial_clip_norm", "seeds", "num_clients", "methods"},
         "client_sensitivity",
+    )
+    require_exact_keys(
+        rank_sensitivity,
+        {"initial_clip_norm", "seeds", "ranks", "methods"},
+        "rank_sensitivity",
     )
     require_exact_keys(controls, {"initial_clip_norm", "seeds", "methods"}, "controls")
     require_exact_keys(
@@ -484,6 +507,7 @@ def expand_spec(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
         clip_norm: float,
         num_clients: int | None = None,
         noise_multiplier: float | None = None,
+        rank: int | None = None,
     ) -> None:
         fixed_id = f"{stem}-fixed"
         arms.append(
@@ -499,6 +523,7 @@ def expand_spec(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
                 reference_arm_id=None,
                 num_clients=num_clients,
                 noise_multiplier=noise_multiplier,
+                rank=rank,
             )
         )
         arms.append(
@@ -514,6 +539,7 @@ def expand_spec(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
                 reference_arm_id=fixed_id,
                 num_clients=num_clients,
                 noise_multiplier=noise_multiplier,
+                rank=rank,
             )
         )
 
@@ -704,6 +730,47 @@ def expand_spec(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
                 seed=seed,
                 clip_norm=client_clip,
                 num_clients=num_clients,
+            )
+
+    rank_clip = require_number(
+        rank_sensitivity["initial_clip_norm"],
+        "rank_sensitivity.initial_clip_norm",
+        positive=True,
+    )
+    rank_seeds = rank_sensitivity["seeds"]
+    rank_values = rank_sensitivity["ranks"]
+    rank_methods = rank_sensitivity["methods"]
+    if (
+        not isinstance(rank_seeds, list)
+        or not isinstance(rank_values, list)
+        or not isinstance(rank_methods, list)
+    ):
+        raise ValueError("rank sensitivity axes must be arrays")
+    rank_seeds = [
+        require_int(value, "rank_sensitivity.seed", positive=False)
+        for value in rank_seeds
+    ]
+    rank_values = [
+        require_int(value, "rank_sensitivity.rank") for value in rank_values
+    ]
+    if tuple(rank_methods) != (FIXED_DP_METHOD, FULL_SLACLIP_METHOD):
+        raise ValueError("rank sensitivity methods/order is invalid")
+    _unique(rank_seeds, "rank_sensitivity.seeds")
+    _unique(rank_values, "rank_sensitivity.ranks")
+    if int(common["rank"]) in rank_values:
+        raise ValueError("rank sensitivity must not duplicate common rank")
+    if not common["slaclip_c_min"] <= rank_clip <= common["slaclip_c_max"]:
+        raise ValueError("rank sensitivity threshold is outside controller bounds")
+    for rank_value in rank_values:
+        for seed in rank_seeds:
+            append_pair(
+                family="rank_sensitivity",
+                stem=(
+                    f"rank-r{rank_value}-c{number_token(rank_clip)}-s{seed}"
+                ),
+                seed=seed,
+                clip_norm=rank_clip,
+                rank=rank_value,
             )
 
     control_clip = require_number(
@@ -2193,6 +2260,7 @@ def _model_metrics(
         "method": arm["method"],
         "controller_input": arm["controller_input"],
         "seed": arm["seed"],
+        "rank": arm["rank"],
         "num_clients": arm["num_clients"],
         "noise_multiplier": arm["noise_multiplier"],
         "effective_gradient_noise_multiplier": (
@@ -2382,6 +2450,7 @@ BASE_METRIC_COLUMNS = (
     "method",
     "controller_input",
     "seed",
+    "rank",
     "num_clients",
     "noise_multiplier",
     "effective_gradient_noise_multiplier",
@@ -3041,6 +3110,7 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
                 "method": row["method"],
                 "controller_input": row["controller_input"],
                 "seed": row["seed"],
+                "rank": row["rank"],
                 "num_clients": row["num_clients"],
                 "noise_multiplier": row["noise_multiplier"],
                 "effective_gradient_noise_multiplier": row[
@@ -3153,6 +3223,7 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
                 "method": row["method"],
                 "controller_input": row["controller_input"],
                 "seed": row["seed"],
+                "rank": row["rank"],
                 "num_clients": row["num_clients"],
                 "noise_multiplier": row["noise_multiplier"],
                 "effective_gradient_noise_multiplier": row[
@@ -3274,6 +3345,7 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
                 "candidate_controller_input": candidate["controller_input"],
                 "noisy_controller_input": noisy["controller_input"],
                 "seed": candidate["seed"],
+                "rank": candidate["rank"],
                 "num_clients": candidate["num_clients"],
                 "noise_multiplier": candidate["noise_multiplier"],
                 "effective_gradient_noise_multiplier": candidate[
@@ -3311,6 +3383,7 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
         "family",
         "method",
         "controller_input",
+        "rank",
         "num_clients",
         "noise_multiplier",
         "effective_gradient_noise_multiplier",
@@ -3342,6 +3415,7 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
         "family",
         "method",
         "controller_input",
+        "rank",
         "num_clients",
         "noise_multiplier",
         "effective_gradient_noise_multiplier",
@@ -3406,6 +3480,7 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
         "comparison_role",
         "method",
         "controller_input",
+        "rank",
         "num_clients",
         "noise_multiplier",
         "effective_gradient_noise_multiplier",
@@ -3455,6 +3530,7 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
         diagnostic_paired_aggregate_rows.append(output)
 
     oracle_vs_noisy_group_keys = (
+        "rank",
         "num_clients",
         "noise_multiplier",
         "effective_gradient_noise_multiplier",
@@ -3510,6 +3586,7 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
     )
     expected_oracle_vs_noisy_aggregate_keys = {
         (
+            oracle_arm["rank"],
             oracle_arm["num_clients"],
             oracle_arm["noise_multiplier"],
             oracle_arm["noise_multiplier"],
@@ -3555,6 +3632,7 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
         "method",
         "controller_input",
         "seed",
+        "rank",
         "num_clients",
         "noise_multiplier",
         "effective_gradient_noise_multiplier",
@@ -3592,6 +3670,7 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
         "method",
         "controller_input",
         "seed",
+        "rank",
         "num_clients",
         "noise_multiplier",
         "effective_gradient_noise_multiplier",
@@ -3630,6 +3709,7 @@ def aggregate_campaign(args: argparse.Namespace) -> bool:
         "candidate_controller_input",
         "noisy_controller_input",
         "seed",
+        "rank",
         "num_clients",
         "noise_multiplier",
         "effective_gradient_noise_multiplier",
