@@ -216,6 +216,14 @@ outside this launch because their pinned implementations or frozen evaluation
 protocols are not present in this repository.  Consequently this campaign is
 Level 1 mechanism evidence, not a reproduction of a downstream paper table.
 
+The broader staged extension across MedDialog, SlimPajama, a labelled finance
+reconstruction, BERT, GPT-2, ChatGLM2-6B, and Llama2-7B is documented in
+[`docs/BROAD_SCOPE_FULL_SLACLIP.md`](docs/BROAD_SCOPE_FULL_SLACLIP.md).  It
+provides immutable input registration, a five-C fixed scan, correct generalized
+Full SlaClip beta derivation from exact endpoint diagnostics, resumable Slurm
+stage execution, and clipping-regime evidence gates.  It does not include
+SlaClip-Q or claim that missing downstream paper benchmarks were reproduced.
+
 # Upstream project description
 
 The financial industry has experienced significant strides in Natural Language Processing (NLP) facilitated by Language Model (LM) technologies. However, the escalating concerns regarding data privacy present a formidable barrier to the ongoing enhancement of these models. A notable challenge involves potential adversarial attackers exploiting the weight of Language Models trained by individual banks, thereby jeopardizing user data confidentiality.

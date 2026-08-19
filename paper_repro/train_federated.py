@@ -103,21 +103,68 @@ except ModuleNotFoundError:  # Support direct ``python paper_repro/...py`` use.
 PRIVACY_LABEL = "NON_DP_PRIVATE_DIAGNOSTIC"
 EXPECTED_DATASET_ID = "lighteval/med_dialog"
 EXPECTED_DATASET_REVISION = "ce8a234c92ea9a37743ad8154253ba897a4a70a5"
+EXPECTED_DATASETS = {
+    "meddialog": {
+        "repo_id": EXPECTED_DATASET_ID,
+        "revision": EXPECTED_DATASET_REVISION,
+        "text_format": "medical_dialogue_pair",
+        "paper_exactness": "public_reconstruction",
+    },
+    # The full 627B-token corpus is not practical for this fine-tuning study.
+    # A formal manifest must therefore identify and hash a deterministic public
+    # subset; it remains a reconstruction and is never labelled paper-exact.
+    "slimpajama": {
+        "repo_id": "cerebras/SlimPajama-627B",
+        "revision": "417f7eebaec467f82121948075e8b98d33ffb58a",
+        "text_format": "plain_text",
+        "paper_exactness": "public_subset_reconstruction",
+    },
+}
 EXPECTED_MODELS = {
     "bert": {
         "manifest_key": "bert-base-uncased",
         "repo_id": "google-bert/bert-base-uncased",
         "revision": "86b5e0934494bd15c9632b12f734a8a67f723594",
+        "model_type": "bert",
+        "objective": "masked_lm",
+        "target_modules": ["query", "key", "value"],
+        "trust_remote_code": False,
+        "seed_offset": 0,
     },
     "gpt2": {
         "manifest_key": "gpt2",
         "repo_id": "openai-community/gpt2",
         "revision": "607a30d783dfa663caf39e06633721c8d4cfcd7e",
+        "model_type": "gpt2",
+        "objective": "causal_lm",
+        "target_modules": ["c_attn"],
+        "trust_remote_code": False,
+        "seed_offset": 1_000_000,
+    },
+    "chatglm2": {
+        "manifest_key": "chatglm2-6b",
+        "repo_id": "zai-org/chatglm2-6b",
+        "revision": "d2e2d91789248536a747d9ce60642a336444186c",
+        "model_type": "chatglm",
+        "objective": "causal_lm",
+        "target_modules": ["query_key_value"],
+        "trust_remote_code": True,
+        "seed_offset": 2_000_000,
+    },
+    "llama2": {
+        "manifest_key": "llama2-7b",
+        "repo_id": "meta-llama/Llama-2-7b-hf",
+        "revision": "01c7f73d771dfac7d292323805ebc428287df4f9",
+        "model_type": "llama",
+        "objective": "causal_lm",
+        "target_modules": ["q_proj", "k_proj", "v_proj"],
+        "trust_remote_code": False,
+        "seed_offset": 3_000_000,
     },
 }
 EXPECTED_LORA_TARGETS = {
-    "bert": ["query", "key", "value"],
-    "gpt2": ["c_attn"],
+    model: list(spec["target_modules"])
+    for model, spec in EXPECTED_MODELS.items()
 }
 SLACLIP_METHOD = "slaclip_dp_lora"
 ORACLE_SLACLIP_METHOD = "oracle_slaclip_control"
@@ -135,6 +182,20 @@ SLACLIP_PAIRED_SLACK_NOISE_SCOPE = SLACLIP_METHOD
 SLACLIP_REFERENCE_REPOSITORY = "https://github.com/ZsyRock/SlaClip"
 SLACLIP_REFERENCE_REVISION = "d48b8e07aef33c58a3595ee18b4dccf9c75fa1f3"
 GROUPWISE_SLACLIP_VARIANT = "groupwise_generalized_full_slaclip_beta"
+
+
+def model_objective(model_kind: str) -> str:
+    try:
+        return str(EXPECTED_MODELS[model_kind]["objective"])
+    except KeyError as error:
+        raise ValueError(f"unsupported model kind: {model_kind}") from error
+
+
+def model_seed_offset(model_kind: str) -> int:
+    try:
+        return int(EXPECTED_MODELS[model_kind]["seed_offset"])
+    except KeyError as error:
+        raise ValueError(f"unsupported model kind: {model_kind}") from error
 
 
 def slaclip_slack_noise_method_scope(
@@ -851,10 +912,36 @@ def validate_input_manifest(path: Path) -> dict[str, Any]:
         inventory_bytes += actual_bytes
     if manifest.get("inventory_bytes") != inventory_bytes:
         raise RuntimeError("input manifest inventory byte total is invalid")
-    if dataset.get("repo_id") != EXPECTED_DATASET_ID:
-        raise RuntimeError(f"unexpected dataset: {dataset.get('repo_id')!r}")
-    if dataset.get("revision") != EXPECTED_DATASET_REVISION:
-        raise RuntimeError(f"unexpected dataset revision: {dataset.get('revision')!r}")
+    dataset_profile = dataset.get("profile", "meddialog")
+    if dataset_profile in EXPECTED_DATASETS:
+        expected_dataset = EXPECTED_DATASETS[str(dataset_profile)]
+        if dataset.get("repo_id") != expected_dataset["repo_id"]:
+            raise RuntimeError(f"unexpected dataset: {dataset.get('repo_id')!r}")
+        if dataset.get("revision") != expected_dataset["revision"]:
+            raise RuntimeError(
+                f"unexpected dataset revision: {dataset.get('revision')!r}"
+            )
+        if dataset.get("text_format", expected_dataset["text_format"]) != expected_dataset[
+            "text_format"
+        ]:
+            raise RuntimeError(f"unexpected text format for {dataset_profile}")
+    elif dataset_profile == "finance":
+        # The paper does not identify a uniquely recoverable 9,540-example
+        # finance corpus.  A user-supplied standardized reconstruction is
+        # accepted only when it labels that limitation explicitly.
+        if dataset.get("paper_exactness") != "paper_source_not_released":
+            raise RuntimeError(
+                "finance input must be labelled paper_source_not_released"
+            )
+        if dataset.get("text_format") != "financial_sentiment_pair":
+            raise RuntimeError("finance input must use financial_sentiment_pair")
+        if not isinstance(dataset.get("repo_id"), str) or not dataset["repo_id"]:
+            raise RuntimeError("finance reconstruction must identify its source")
+        revision = dataset.get("revision")
+        if not isinstance(revision, str) or len(revision) < 7:
+            raise RuntimeError("finance reconstruction must pin a source revision")
+    else:
+        raise RuntimeError(f"unsupported dataset profile: {dataset_profile!r}")
     combined = dataset.get("combined_splits")
     if not isinstance(combined, dict) or set(combined) != {
         "train",
@@ -886,11 +973,17 @@ def validate_input_manifest(path: Path) -> dict[str, Any]:
     expected_model_keys = {
         expected["manifest_key"] for expected in EXPECTED_MODELS.values()
     }
-    if set(models) != expected_model_keys:
-        raise RuntimeError("input manifest model set is not exact")
+    if not set(models) or not set(models).issubset(expected_model_keys):
+        raise RuntimeError("input manifest contains no models or an unknown model")
     for model_name, expected in EXPECTED_MODELS.items():
         model_key = expected["manifest_key"]
         entry = models.get(model_key)
+        if entry is None:
+            if model_inventory_paths[model_key]:
+                raise RuntimeError(
+                    f"inventory contains unreferenced model bytes for {model_name}"
+                )
+            continue
         if not isinstance(entry, dict):
             raise RuntimeError(f"input manifest is missing {model_name}")
         if entry.get("repo_id") != expected["repo_id"]:
@@ -932,16 +1025,27 @@ def validate_input_manifest(path: Path) -> dict[str, Any]:
                 f"{model_name} references do not exactly match the hashed inventory; "
                 f"unreferenced={missing[:3]}, unhashed={unhashed[:3]}"
             )
-        for required_name in ("config.json", "model.safetensors"):
-            if snapshot / required_name not in referenced_model_paths:
-                raise RuntimeError(
-                    f"{model_name} inventory is missing required file: {required_name}"
-                )
+        if snapshot / "config.json" not in referenced_model_paths:
+            raise RuntimeError(
+                f"{model_name} inventory is missing required file: config.json"
+            )
+        weight_names = {path.name for path in referenced_model_paths}
+        has_weights = any(
+            name == "model.safetensors"
+            or name == "model.safetensors.index.json"
+            or name == "pytorch_model.bin"
+            or name == "pytorch_model.bin.index.json"
+            or (name.startswith("model-") and name.endswith(".safetensors"))
+            or (name.startswith("pytorch_model-") and name.endswith(".bin"))
+            for name in weight_names
+        )
+        if not has_weights:
+            raise RuntimeError(f"{model_name} inventory has no model weights")
     return manifest
 
 
 def deep_input_preflight(manifest: dict[str, Any]) -> dict[str, Any]:
-    """Check schemas, model-config readability, and safetensors headers."""
+    """Check schemas, model configs, and weight indexes/headers."""
 
     try:
         import pyarrow.parquet as pq
@@ -962,16 +1066,29 @@ def deep_input_preflight(manifest: dict[str, Any]) -> dict[str, Any]:
         split_rows[split] = rows
     model_headers: dict[str, Any] = {}
     for model_kind, expected in EXPECTED_MODELS.items():
+        if expected["manifest_key"] not in manifest["models"]:
+            continue
         snapshot = model_snapshot(manifest, model_kind)
         config = load_json_object(snapshot / "config.json", "base-model config")
-        expected_model_type = "bert" if model_kind == "bert" else "gpt2"
+        expected_model_type = expected["model_type"]
         if config.get("model_type") != expected_model_type:
             raise RuntimeError(f"base-model config type mismatch: {model_kind}")
-        weight_path = snapshot / "model.safetensors"
-        with safe_open(weight_path, framework="pt", device="cpu") as handle:
-            tensor_names = list(handle.keys())
+        safetensor_paths = sorted(snapshot.glob("*.safetensors"))
+        tensor_names: list[str] = []
+        for weight_path in safetensor_paths:
+            with safe_open(weight_path, framework="pt", device="cpu") as handle:
+                tensor_names.extend(handle.keys())
         if not tensor_names:
-            raise RuntimeError(f"base-model safetensors has no tensors: {weight_path}")
+            index_path = snapshot / "pytorch_model.bin.index.json"
+            if not index_path.is_file():
+                raise RuntimeError(f"base-model weight index is missing: {model_kind}")
+            index = load_json_object(index_path, "base-model weight index")
+            weight_map = index.get("weight_map")
+            if not isinstance(weight_map, dict) or not weight_map:
+                raise RuntimeError(f"base-model weight index is empty: {model_kind}")
+            tensor_names = [str(name) for name in weight_map]
+        if not tensor_names:
+            raise RuntimeError(f"base-model weights have no tensors: {model_kind}")
         model_headers[model_kind] = {
             "model_type": config["model_type"],
             "weight_tensors": len(tensor_names),
@@ -1000,8 +1117,13 @@ def manifest_summary(path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         "inventory_files": manifest.get("inventory_files"),
         "inventory_bytes": manifest.get("inventory_bytes"),
         "dataset": {
+            "profile": dataset.get("profile", "meddialog"),
             "repo_id": dataset["repo_id"],
             "revision": dataset["revision"],
+            "text_format": dataset.get("text_format", "medical_dialogue_pair"),
+            "paper_exactness": dataset.get(
+                "paper_exactness", "public_reconstruction"
+            ),
             "combined_splits": dataset["combined_splits"],
             "total_rows": dataset.get("total_rows"),
         },
@@ -1014,6 +1136,7 @@ def manifest_summary(path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
                 ],
             }
             for model, spec in EXPECTED_MODELS.items()
+            if spec["manifest_key"] in manifest["models"]
         },
     }
 
@@ -1021,12 +1144,12 @@ def manifest_summary(path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
 class ParquetTextTable:
     """In-memory Arrow table with deterministic indexed text access."""
 
-    def __init__(self, paths: Sequence[Path]):
+    def __init__(self, paths: Sequence[Path], *, text_format: str):
         try:
             import pyarrow as pa
             import pyarrow.parquet as pq
         except ImportError as error:
-            raise RuntimeError("pyarrow is required for the staged MedDialog data") from error
+            raise RuntimeError("pyarrow is required for staged text data") from error
         tables = []
         for path in paths:
             table = pq.read_table(path, columns=["src", "tgt"])
@@ -1035,6 +1158,13 @@ class ParquetTextTable:
             tables.append(table)
         self._pa = pa
         self._table = pa.concat_tables(tables).combine_chunks()
+        if text_format not in {
+            "medical_dialogue_pair",
+            "plain_text",
+            "financial_sentiment_pair",
+        }:
+            raise ValueError(f"unsupported staged text format: {text_format}")
+        self._text_format = text_format
 
     def __len__(self) -> int:
         return self._table.num_rows
@@ -1049,15 +1179,17 @@ class ParquetTextTable:
             source = str(row.get("src") or "").strip()
             target = str(row.get("tgt") or "").strip()
             if not source and not target:
-                raise RuntimeError("MedDialog record contains no text")
+                raise RuntimeError("staged record contains no text")
             normalized.append((source, target))
         return normalized
 
     def texts(self, indices: Sequence[int] | np.ndarray) -> list[str]:
-        return [
-            f"Patient: {source}\nDoctor: {target}"
-            for source, target in self._normalized_rows(indices)
-        ]
+        rows = self._normalized_rows(indices)
+        if self._text_format == "medical_dialogue_pair":
+            return [f"Patient: {source}\nDoctor: {target}" for source, target in rows]
+        if self._text_format == "financial_sentiment_pair":
+            return [f"Financial text: {source}\nSentiment: {target}" for source, target in rows]
+        return [source if not target else f"{source}\n{target}" for source, target in rows]
 
     def content_keys(self, indices: Sequence[int] | np.ndarray) -> list[str]:
         keys = []
@@ -1072,23 +1204,26 @@ class ParquetTextTable:
 def load_data_protocol(
     manifest: dict[str, Any], config: EffectiveConfig
 ) -> LoadedData:
-    splits = manifest["formal_dataset"]["combined_splits"]
+    formal_dataset = manifest["formal_dataset"]
+    splits = formal_dataset["combined_splits"]
     if config.data_protocol != "paper_union_minus_fixed_holdout":
         raise ValueError(f"unsupported data protocol: {config.data_protocol}")
-    # Keep the closest public approximation to the paper's 257,332-dialogue
-    # corpus, but remove the exact fixed diagnostic examples from training.
-    # This makes the internal loss genuinely held out without pretending it is
-    # one of the paper's downstream benchmark metrics.
+    text_format = formal_dataset.get("text_format", "medical_dialogue_pair")
+    # Use the pinned standardized corpus union but remove exact fixed diagnostic
+    # examples from training.  This internal LM loss is never substituted for
+    # the paper's domain-specific downstream benchmark metrics.
     training_split_names = ("train", "validation", "test")
     training = ParquetTextTable(
         [
             Path(path)
             for split_name in training_split_names
             for path in splits[split_name]["files"]
-        ]
+        ],
+        text_format=text_format,
     )
     validation = ParquetTextTable(
-        [Path(path) for path in splits["validation"]["files"]]
+        [Path(path) for path in splits["validation"]["files"]],
+        text_format=text_format,
     )
     expected_training_rows = sum(
         int(splits[split_name]["rows"]) for split_name in training_split_names
@@ -1144,6 +1279,15 @@ def load_data_protocol(
         raise RuntimeError("not every selected holdout record was found in the union")
     protocol = {
         "name": config.data_protocol,
+        "dataset_profile": formal_dataset.get("profile", "meddialog"),
+        "dataset_repo_id": formal_dataset.get("repo_id", EXPECTED_DATASET_ID),
+        "dataset_revision": formal_dataset.get(
+            "revision", EXPECTED_DATASET_REVISION
+        ),
+        "text_format": text_format,
+        "paper_exactness": formal_dataset.get(
+            "paper_exactness", "public_reconstruction"
+        ),
         "paper_benchmark_metric": False,
         "training_source_splits": list(training_split_names),
         "training_rows_before_holdout": len(training),
@@ -1842,17 +1986,18 @@ def make_batch(
     )
     input_ids = encoded["input_ids"]
     attention_mask = encoded["attention_mask"]
-    if model_kind == "bert":
+    objective = model_objective(model_kind)
+    if objective == "masked_lm":
         generator = torch.Generator(device="cpu").manual_seed(mask_seed)
         input_ids, labels = mask_bert_inputs(
             input_ids, attention_mask, tokenizer, generator
         )
-    elif model_kind == "gpt2":
+    elif objective == "causal_lm":
         labels = input_ids.clone()
         labels[attention_mask.eq(0)] = -100
     else:
-        raise ValueError(f"unsupported model kind: {model_kind}")
-    supervised = labels[:, 1:] if model_kind == "gpt2" else labels
+        raise ValueError(f"unsupported model objective: {objective}")
+    supervised = labels[:, 1:] if objective == "causal_lm" else labels
     sequence_lengths = attention_mask.sum(dim=1)
     telemetry = {
         "records": int(input_ids.shape[0]),
@@ -1898,11 +2043,12 @@ def align_supervised_logits_and_labels(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Align logits with the labels that each LM objective supervises."""
 
-    if model_kind == "gpt2":
+    objective = model_objective(model_kind)
+    if objective == "causal_lm":
         logits = logits[:, :-1, :].contiguous()
         labels = labels[:, 1:].contiguous()
-    elif model_kind != "bert":
-        raise ValueError(f"unsupported model kind: {model_kind}")
+    elif objective != "masked_lm":
+        raise ValueError(f"unsupported model objective: {objective}")
     if logits.shape[:-1] != labels.shape:
         raise RuntimeError("aligned logits and labels have incompatible shapes")
     return logits, labels
@@ -2020,7 +2166,7 @@ def evaluate(
     mean_loss = float(weighted_loss_sum / evaluated_records)
     model.train()
     return {
-        "objective": "masked_lm" if model_kind == "bert" else "causal_lm",
+        "objective": model_objective(model_kind),
         "records": int(len(validation_indices)),
         "batches": batches,
         "supervised_tokens": supervised_tokens,
@@ -2046,14 +2192,23 @@ def build_model(
         AutoTokenizer,
     )
 
+    spec = EXPECTED_MODELS[model_kind]
+    objective = model_objective(model_kind)
+    trust_remote_code = bool(spec["trust_remote_code"])
     tokenizer = AutoTokenizer.from_pretrained(
-        snapshot_path, local_files_only=True, use_fast=True
+        snapshot_path,
+        local_files_only=True,
+        use_fast=not trust_remote_code,
+        trust_remote_code=trust_remote_code,
     )
-    if model_kind == "bert":
+    targets = list(spec["target_modules"])
+    if objective == "masked_lm":
         base = AutoModelForMaskedLM.from_pretrained(
-            snapshot_path, local_files_only=True, torch_dtype=torch.float32
+            snapshot_path,
+            local_files_only=True,
+            torch_dtype=torch.float32,
+            trust_remote_code=trust_remote_code,
         )
-        targets = ["query", "key", "value"]
         lora_config = LoraConfig(
             r=rank,
             lora_alpha=rank,
@@ -2061,14 +2216,21 @@ def build_model(
             bias="none",
             target_modules=targets,
         )
-    elif model_kind == "gpt2":
+    elif objective == "causal_lm":
         if tokenizer.pad_token_id is None:
-            tokenizer.pad_token = tokenizer.eos_token
+            if tokenizer.eos_token_id is not None:
+                tokenizer.pad_token = tokenizer.eos_token
+            elif tokenizer.unk_token_id is not None:
+                tokenizer.pad_token = tokenizer.unk_token
+            else:
+                raise RuntimeError(f"{model_kind} tokenizer has no usable pad token")
         base = AutoModelForCausalLM.from_pretrained(
-            snapshot_path, local_files_only=True, torch_dtype=torch.float32
+            snapshot_path,
+            local_files_only=True,
+            torch_dtype=torch.float32,
+            trust_remote_code=trust_remote_code,
         )
         base.config.use_cache = False
-        targets = ["c_attn"]
         lora_config = LoraConfig(
             r=rank,
             lora_alpha=rank,
@@ -2078,7 +2240,7 @@ def build_model(
             task_type=TaskType.CAUSAL_LM,
         )
     else:
-        raise ValueError(f"unsupported model kind: {model_kind}")
+        raise ValueError(f"unsupported model objective: {objective}")
     model = get_peft_model(base, lora_config).to(device)
     model.train()
     return model, tokenizer, targets
@@ -3286,7 +3448,7 @@ def train_one_model(
     if adaptive != (slaclip_contract is not None):
         raise RuntimeError("SlaClip model contract mismatch")
     controller = slaclip_contract["controller"] if slaclip_contract else None
-    model_seed = config.seed + (0 if model_kind == "bert" else 1_000_000)
+    model_seed = config.seed + model_seed_offset(model_kind)
     snapshot = model_snapshot(manifest, model_kind)
     target_modules = EXPECTED_LORA_TARGETS[model_kind]
     train_limit = 16 if config.smoke else None
@@ -3572,9 +3734,7 @@ def train_one_model(
         if resume
         else None
     )
-    evaluation_seed = config.evaluation_seed + (
-        0 if model_kind == "bert" else 1_000_000
-    )
+    evaluation_seed = config.evaluation_seed + model_seed_offset(model_kind)
     if checkpoint is None:
         if resume:
             archive_round_shards_after(rounds_directory, completed_round=0)
@@ -4168,7 +4328,7 @@ def train_one_model(
         "model": model_kind,
         "base_model": EXPECTED_MODELS[model_kind],
         "snapshot_path": str(snapshot),
-        "objective": "masked_lm" if model_kind == "bert" else "causal_lm",
+        "objective": model_objective(model_kind),
         "target_modules": target_modules,
         "trainable_parameter_tensors": len(global_state),
         "trainable_parameter_elements": trainable_elements,
@@ -4343,7 +4503,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--models",
         nargs="+",
-        choices=["bert", "gpt2"],
+        choices=sorted(EXPECTED_MODELS),
         default=["bert", "gpt2"],
     )
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
@@ -4356,6 +4516,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--bert-revision", default=EXPECTED_MODELS["bert"]["revision"])
     parser.add_argument("--gpt2-model", default=EXPECTED_MODELS["gpt2"]["repo_id"])
     parser.add_argument("--gpt2-revision", default=EXPECTED_MODELS["gpt2"]["revision"])
+    parser.add_argument(
+        "--chatglm2-model", default=EXPECTED_MODELS["chatglm2"]["repo_id"]
+    )
+    parser.add_argument(
+        "--chatglm2-revision", default=EXPECTED_MODELS["chatglm2"]["revision"]
+    )
+    parser.add_argument(
+        "--llama2-model", default=EXPECTED_MODELS["llama2"]["repo_id"]
+    )
+    parser.add_argument(
+        "--llama2-revision", default=EXPECTED_MODELS["llama2"]["revision"]
+    )
     parser.add_argument("--num-clients", type=int, default=5)
     parser.add_argument("--rounds", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -4535,10 +4707,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def verify_requested_models(args: argparse.Namespace) -> None:
+def verify_requested_models(
+    args: argparse.Namespace, manifest: Mapping[str, Any] | None = None
+) -> None:
     requested = {
         "bert": (args.bert_model, args.bert_revision),
         "gpt2": (args.gpt2_model, args.gpt2_revision),
+        "chatglm2": (args.chatglm2_model, args.chatglm2_revision),
+        "llama2": (args.llama2_model, args.llama2_revision),
     }
     for model_kind, (repo_id, revision) in requested.items():
         expected = EXPECTED_MODELS[model_kind]
@@ -4547,6 +4723,14 @@ def verify_requested_models(args: argparse.Namespace) -> None:
                 f"{model_kind} must stay pinned to "
                 f"{expected['repo_id']}@{expected['revision']}"
             )
+        if (
+            manifest is not None
+            and model_kind in args.models
+            and expected["manifest_key"] not in manifest["models"]
+        ):
+            raise RuntimeError(
+                f"requested {model_kind} is absent from the immutable input manifest"
+            )
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -4554,7 +4738,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     args.input_manifest = args.input_manifest.expanduser().resolve()
     manifest = validate_input_manifest(args.input_manifest)
-    verify_requested_models(args)
+    verify_requested_models(args, manifest)
     summary = manifest_summary(args.input_manifest, manifest)
     if args.check_inputs:
         preflight = deep_input_preflight(manifest)
@@ -4838,17 +5022,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     assumptions = [
         "The paper says GPT-2 has 12 layers/hidden 768 despite also saying 1.5B; this run uses GPT-2 small.",
         "The paper does not publish model revisions; immutable public revisions are pinned here.",
-        "The paper does not publish LoRA targets; BERT query/key/value and GPT-2 fused c_attn are used.",
+        "The paper does not publish exact LoRA target-module names; every selected model uses the pinned architecture-specific targets recorded in model_revisions.",
         "The paper does not publish LoRA alpha/dropout; alpha=rank and dropout=0 are used.",
         "The paper says gradient descent but no optimizer; one manual SGD step is used per client/round.",
         "The local objective averages token loss within each record, then equally averages the B records before group clipping.",
-        "The paper does not publish its language-model objective; BERT uses masked LM and GPT-2 uses causal LM over the Patient/Doctor text.",
+        "The paper does not publish its language-model objective; BERT uses masked LM and autoregressive model families use causal LM over the manifest-defined standardized text.",
         "The paper clips aggregate A and B batch gradients separately; this run follows that literal grouping.",
         "Gaussian coordinates for A and B are independent and their secret seeds are never logged.",
         "The paper does not specify sequence length; 128 is used for formal runs.",
         "Torch deterministic algorithms are enforced, cuDNN benchmarking and TF32 are disabled, and CUDA uses a fixed cuBLAS workspace configuration.",
-        "The public MedDialog mirror has 257,469 records versus 257,332 reported in the paper; all public train/validation/test splits are united for training because the paper calls the full corpus its training dataset and does not publish a split.",
-        "A fixed subset of the public validation split is removed from the united corpus before it is used for the internal fixed-mask LM-loss diagnostic.",
+        "All pinned public train/validation/test splits are united for training because the paper does not publish a reproducible split for any training domain.",
+        "A fixed subset of the standardized validation split is removed from the united corpus before it is used for the internal fixed-mask LM-loss diagnostic.",
         "The internal LM loss is not any of the six paper benchmark scores and cannot establish paper metric reproduction.",
         "No independent epsilon is reported because the paper does not provide the constants/calibration needed to map sigma=2 to its epsilon sweep.",
     ]
@@ -4922,14 +5106,20 @@ def main(argv: Sequence[str] | None = None) -> None:
         "input_manifest_sha256": summary["manifest_sha256"],
         "input_inventory_sha256": summary["inventory_sha256"],
         "dataset": {
-            "repo_id": EXPECTED_DATASET_ID,
-            "revision": EXPECTED_DATASET_REVISION,
+            "profile": manifest["formal_dataset"].get("profile", "meddialog"),
+            "repo_id": manifest["formal_dataset"]["repo_id"],
+            "revision": manifest["formal_dataset"]["revision"],
+            "paper_exactness": manifest["formal_dataset"].get(
+                "paper_exactness", "public_reconstruction"
+            ),
         },
         "data_protocol": data.protocol,
         "method": asdict(METHOD_SPECS[config.method]),
         "effective_config": asdict(config),
         "models": args.models,
-        "model_revisions": EXPECTED_MODELS,
+        "model_revisions": {
+            model: EXPECTED_MODELS[model] for model in args.models
+        },
         "private_key_commitment": private_key_commitment,
         "rng_domain": args.rng_domain,
         "dependency_versions": dependency_versions,
@@ -5001,8 +5191,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         "input": summary,
         "training_corpus": {
             "source_splits": ["train", "validation", "test"],
-            "rows": manifest["formal_dataset"]["total_rows"],
-            "reason": "paper labels the full 257,332-dialogue corpus as training data and publishes no split",
+            "rows": manifest["formal_dataset"].get(
+                "total_rows",
+                sum(
+                    int(split["rows"])
+                    for split in manifest["formal_dataset"]["combined_splits"].values()
+                ),
+            ),
+            "reason": (
+                "the source paper publishes no reproducible train/validation split; "
+                "the pinned standardized reconstruction uses an internal fixed holdout"
+            ),
         },
         "internal_validation_diagnostic": {
             "source_split": "validation",

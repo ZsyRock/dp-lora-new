@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "campaign_name": "dp_lora_broad_scope_full_slaclip_v1",
+  "description": "Staged fixed-C discovery and fresh-seed Full SlaClip confirmation across all three paper training domains and four paper model families; SlaClip-Q is excluded.",
+  "domains": [
+    {
+      "id": "meddialog",
+      "paper_training_role": "medical_dialogue",
+      "input_manifest_env": "DPLORA_BROAD_MEDDIALOG_INPUT_MANIFEST",
+      "paper_exactness": "public_reconstruction",
+      "required_evaluation_tasks": ["MedQuAD", "LiveQA", "MEDIQA-Ans"]
+    },
+    {
+      "id": "slimpajama",
+      "paper_training_role": "general_language_modeling",
+      "input_manifest_env": "DPLORA_BROAD_SLIMPAJAMA_INPUT_MANIFEST",
+      "paper_exactness": "public_subset_reconstruction",
+      "required_evaluation_tasks": ["BoolQ", "PIQA", "WinoGrande"]
+    },
+    {
+      "id": "finance",
+      "paper_training_role": "financial_sentiment",
+      "input_manifest_env": "DPLORA_BROAD_FINANCE_INPUT_MANIFEST",
+      "paper_exactness": "paper_source_not_released",
+      "required_evaluation_tasks": ["FPB", "FiQA-SA", "TFNS"]
+    }
+  ],
+  "models": [
+    {
+      "id": "bert",
+      "paper_name": "BERT-base",
+      "manifest_key": "bert-base-uncased",
+      "access": "public",
+      "minimum_vram_gib": 24
+    },
+    {
+      "id": "gpt2",
+      "paper_name": "GPT-2 base architecture",
+      "manifest_key": "gpt2",
+      "access": "public",
+      "minimum_vram_gib": 24
+    },
+    {
+      "id": "chatglm2",
+      "paper_name": "ChatGLM2-6B",
+      "manifest_key": "chatglm2-6b",
+      "access": "public",
+      "minimum_vram_gib": 64
+    },
+    {
+      "id": "llama2",
+      "paper_name": "Llama2-7B",
+      "manifest_key": "llama2-7b",
+      "access": "gated_user_acceptance_required",
+      "minimum_vram_gib": 64
+    }
+  ],
+  "common": {
+    "num_clients": 5,
+    "rounds": 50,
+    "batch_size": 8,
+    "noise_multiplier": 2.0,
+    "learning_rate": 0.0005,
+    "rank": 512,
+    "max_seq_length": 128,
+    "delta": 0.00001,
+    "slaclip_num_slots": 5,
+    "slaclip_c_min": 0.025,
+    "slaclip_c_max": 50.0
+  },
+  "fixed_development": {
+    "clip_norms": [0.1, 0.3, 1.0, 3.0, 10.0],
+    "seeds": [1000, 1001, 1002]
+  },
+  "adaptive_development": {
+    "trajectory_quantiles": [0.0, 0.25, 0.5, 0.75, 1.0],
+    "eta_values": [0.025, 0.05, 0.1],
+    "seeds": [1010, 1011, 1012],
+    "target_mapping": "beta_equals_total_target_over_remaining_non_small_mass"
+  },
+  "confirmation": {
+    "seeds": [1100, 1101, 1102, 1103, 1104, 1105, 1106, 1107, 1108, 1109],
+    "methods": ["paper_dp_lora", "slaclip_dp_lora"],
+    "selection_lock_required": true
+  },
+  "analysis": {
+    "clipping_fraction_bin_edges": [0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0],
+    "minimum_seed_pairs_per_setting": 10,
+    "minimum_dataset_model_settings_per_bin": 2,
+    "primary_metric": "final_loss_difference_slaclip_minus_fixed",
+    "secondary_metrics": [
+      "normalized_loss_auc_difference_slaclip_minus_fixed",
+      "final_task_metric_difference_slaclip_minus_fixed",
+      "threshold_log_total_variation",
+      "fully_clipped_round_fraction",
+      "cdf_endpoint_rmse",
+      "privacy_epsilon"
+    ]
+  },
+  "scientific_boundary": {
+    "paper_result_reproduced": false,
+    "end_to_end_dp_certified": false,
+    "external_test_set_required": true,
+    "full_slaclip_only": true,
+    "universal_clipping_boundary_claim_allowed": false,
+    "finance_training_data_warning": "The paper does not publish a uniquely identifiable 9,540-sample training corpus; any public reconstruction must be labelled and hashed as a reconstruction, not an exact reproduction."
+  }
+}
