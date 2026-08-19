@@ -78,3 +78,24 @@ def test_finance_must_be_labelled_as_unreleased_reconstruction(
         manifest["formal_dataset"]["paper_exactness"]
         == "paper_source_not_released"
     )
+
+
+def test_source_provenance_is_bound_into_dataset_contract(tmp_path: Path) -> None:
+    dataset = _write_dataset(tmp_path)
+    hf_home, snapshot = _write_model(tmp_path)
+    args = argparse.Namespace(
+        profile="slimpajama",
+        dataset_root=dataset,
+        dataset_repo_id="cerebras/SlimPajama-627B",
+        dataset_revision="417f7eebaec467f82121948075e8b98d33ffb58a",
+        source_repo_id="iankur/SlimPajama-1B",
+        source_revision="60cbb9c02f5db40156e2f220bd5256853abbffd5",
+        source_selection_contract="all rows from pinned public mirror",
+        model_snapshot=[("gpt2", snapshot)],
+        hf_home=hf_home,
+        data_root=tmp_path / "datasets",
+    )
+    manifest = build_manifest(args)
+    provenance = manifest["formal_dataset"]["source_provenance"]
+    assert provenance["repo_id"] == args.source_repo_id
+    assert provenance["revision"] == args.source_revision

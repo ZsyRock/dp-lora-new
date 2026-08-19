@@ -95,3 +95,30 @@ CDF, threshold, noise, and update telemetry.  The nine downstream paper tasks
 (BoolQ, PIQA, WinoGrande, FPB, FiQA-SA, TFNS, MedQuAD, LiveQA, MEDIQA-Ans) are
 still an external-evaluation gate.  Journal claims about task accuracy require
 that evaluator and cannot substitute internal loss.
+
+## Paper-default baseline trajectory campaign
+
+Before any wider fixed-C or Full SlaClip search, the repository can run a
+paper-default baseline layer with `K_clients=5`, `T=50`, `B=8`, `sigma=2`,
+`learning_rate=5e-4`, `C=10`, and rank `512`.  The frozen campaign
+specification is `hpc/default-baseline-reproduction-spec.json` and its single
+allocation worker is `hpc/default_baseline_reproduction.sbatch`.
+
+The currently stageable matrix is MedDialog, a pinned public SlimPajama subset
+reconstruction, and a pinned 9,540-row FinGPT finance reconstruction crossed
+with BERT-base, GPT-2 small, and ChatGLM2-6B over three seeds (27 arms).  The
+paper's Llama2-7B arm is recorded as blocked until the user accepts the model
+license and configures authentication; the code does not bypass that gate.
+
+This baseline-only campaign writes three plot-ready long tables:
+
+- `baseline_round_telemetry.csv`: groupwise C, clipping, norm, retained-energy,
+  update, loss, exact endpoint, predicted endpoint-noise, and endpoint-SNR
+  trajectories;
+- `baseline_client_telemetry.csv`: per-client/per-group norm, clip factor,
+  removed gradient, retained energy, noise, update, and loss values; and
+- `baseline_evaluation_telemetry.csv`: fixed-holdout loss by evaluation round.
+
+Exact endpoint columns are `NON_DP_PRIVATE_DIAGNOSTIC` development telemetry.
+They are suitable for selecting a later target-clipping candidate before fresh
+confirmation seeds, but are not a privacy-preserving public release.

@@ -24,13 +24,19 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
-from paper_repro.reproducibility import canonical_json_fingerprint
-from paper_repro.train_federated import EXPECTED_DATASETS, EXPECTED_MODELS
+try:
+    from paper_repro.reproducibility import canonical_json_fingerprint
+    from paper_repro.train_federated import EXPECTED_DATASETS, EXPECTED_MODELS
+except ModuleNotFoundError:  # direct-script execution
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from paper_repro.reproducibility import canonical_json_fingerprint
+    from paper_repro.train_federated import EXPECTED_DATASETS, EXPECTED_MODELS
 
 
 TEXT_FORMATS = {
@@ -126,6 +132,7 @@ def dataset_contract(
     dataset_root: Path,
     repo_id: str,
     revision: str,
+    source_provenance: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     if profile in EXPECTED_DATASETS:
         expected = EXPECTED_DATASETS[profile]
@@ -151,23 +158,23 @@ def dataset_contract(
             "files": [entry["path"] for entry in entries],
         }
         inventory.extend({"role": "formal_dataset", **entry} for entry in entries)
-    return (
-        {
-            "profile": profile,
-            "repo_id": repo_id,
-            "revision": revision,
-            "snapshot_path": str(dataset_root),
-            "text_format": TEXT_FORMATS[profile],
-            "paper_exactness": PAPER_EXACTNESS[profile],
-            "combined_splits": combined,
-            "total_rows": sum(value["rows"] for value in combined.values()),
-            "selection_contract": (
-                "all registered rows; deterministic subset construction must be "
-                "documented upstream and is bound by the file inventory"
-            ),
-        },
-        inventory,
-    )
+    contract = {
+        "profile": profile,
+        "repo_id": repo_id,
+        "revision": revision,
+        "snapshot_path": str(dataset_root),
+        "text_format": TEXT_FORMATS[profile],
+        "paper_exactness": PAPER_EXACTNESS[profile],
+        "combined_splits": combined,
+        "total_rows": sum(value["rows"] for value in combined.values()),
+        "selection_contract": (
+            "all registered rows; deterministic subset construction must be "
+            "documented upstream and is bound by the file inventory"
+        ),
+    }
+    if source_provenance is not None:
+        contract["source_provenance"] = source_provenance
+    return contract, inventory
 
 
 def model_contract(
@@ -234,6 +241,15 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         dataset_root=dataset_root,
         repo_id=args.dataset_repo_id,
         revision=args.dataset_revision,
+        source_provenance=(
+            None
+            if getattr(args, "source_repo_id", None) is None
+            else {
+                "repo_id": args.source_repo_id,
+                "revision": args.source_revision,
+                "selection_contract": args.source_selection_contract,
+            }
+        ),
     )
     models: dict[str, Any] = {}
     seen_models: set[str] = set()
@@ -270,6 +286,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dataset-root", type=Path, required=True)
     parser.add_argument("--dataset-repo-id", required=True)
     parser.add_argument("--dataset-revision", required=True)
+    parser.add_argument("--source-repo-id")
+    parser.add_argument("--source-revision")
+    parser.add_argument("--source-selection-contract")
     parser.add_argument("--model-snapshot", action="append", type=parse_model_snapshot)
     parser.add_argument("--hf-home", type=Path, required=True)
     parser.add_argument("--data-root", type=Path, required=True)
@@ -286,6 +305,18 @@ def main(argv: Sequence[str] | None = None) -> None:
     args.dataset_root = args.dataset_root.expanduser().resolve()
     args.manifest = args.manifest.expanduser().resolve()
     args.model_snapshot = args.model_snapshot or []
+    source_values = (
+        args.source_repo_id,
+        args.source_revision,
+        args.source_selection_contract,
+    )
+    if any(value is not None for value in source_values) and not all(
+        isinstance(value, str) and value for value in source_values
+    ):
+        raise SystemExit(
+            "--source-repo-id, --source-revision, and "
+            "--source-selection-contract must be supplied together"
+        )
     args.model_snapshot = [
         (model, path.expanduser().absolute()) for model, path in args.model_snapshot
     ]

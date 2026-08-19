@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "campaign_name": "dp_lora_paper_default_baseline_reproduction_v1",
+  "description": "Paper-default fixed-C DP-LoRA trajectories across every currently stageable paper training domain and model; no SlaClip and no SlaClip-Q.",
+  "domains": [
+    {
+      "id": "meddialog",
+      "paper_exactness": "public_reconstruction"
+    },
+    {
+      "id": "slimpajama",
+      "paper_exactness": "public_subset_reconstruction"
+    },
+    {
+      "id": "finance",
+      "paper_exactness": "paper_source_not_released"
+    }
+  ],
+  "models": ["bert", "gpt2", "chatglm2"],
+  "blocked_paper_models": {
+    "llama2": "Meta Llama2-7B is manually gated and no authenticated Hugging Face credential is configured on this account. It must be added as a later, separately labelled completion of the same matrix."
+  },
+  "paper_default": {
+    "method": "paper_dp_lora",
+    "num_clients": 5,
+    "rounds": 50,
+    "batch_size": 8,
+    "noise_multiplier": 2.0,
+    "learning_rate": 0.0005,
+    "clip_norm": 10.0,
+    "rank": 512,
+    "max_seq_length": 128,
+    "delta": 0.00001,
+    "slaclip_num_slots_for_offline_diagnostics": 5
+  },
+  "seeds": [1200, 1201, 1202],
+  "evaluation": {
+    "internal_fixed_holdout_only": true,
+    "paper_downstream_tasks_evaluated": false
+  },
+  "scientific_boundary": {
+    "full_slaclip_run": false,
+    "slaclip_q_run": false,
+    "end_to_end_dp_certified": false,
+    "exact_paper_reproduction": false,
+    "finance_training_data_contamination_warning": "The paper's private 9,540-sample finance corpus was not released. A FinGPT-derived 9,540-row reconstruction can characterize optimization and clipping trajectories but cannot support uncontaminated FPB, FiQA-SA, or TFNS test claims without overlap auditing."
+  }
+}
