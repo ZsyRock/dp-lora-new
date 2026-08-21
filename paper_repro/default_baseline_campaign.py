@@ -11,17 +11,22 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import importlib
+import importlib.metadata
 import json
 import math
 import os
 import statistics
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 try:
     from paper_repro import broad_scope_campaign as broad
     from paper_repro.slaclip import (
+        automatic_num_slots,
         build_slack_vector,
         normalize_noisy_slack,
         stationary_beta_from_exact_endpoints,
@@ -29,6 +34,7 @@ try:
 except ModuleNotFoundError:  # direct-script execution
     import broad_scope_campaign as broad  # type: ignore[no-redef]
     from slaclip import (  # type: ignore[no-redef]
+        automatic_num_slots,
         build_slack_vector,
         normalize_noisy_slack,
         stationary_beta_from_exact_endpoints,
@@ -40,6 +46,119 @@ PAPER_MODELS = frozenset({"bert", "gpt2", "chatglm2", "llama2"})
 STAGEABLE_MODELS = frozenset({"bert", "gpt2", "chatglm2"})
 DOMAINS = frozenset({"meddialog", "slimpajama", "finance"})
 GROUPS = ("A", "B")
+RUNTIME_PACKAGES = frozenset({
+    "python", "torch", "transformers", "peft", "datasets", "pyarrow",
+    "safetensors", "numpy", "opacus", "sentencepiece",
+})
+CHATGLM_REPO_ID = "zai-org/chatglm2-6b"
+CHATGLM_REVISION = "d2e2d91789248536a747d9ce60642a336444186c"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def parse_runtime_lock(path: Path) -> dict[str, str]:
+    """Parse the exact runtime contract used by the queued campaign."""
+
+    resolved = path.resolve()
+    if not resolved.is_file():
+        raise ValueError(f"runtime lock is missing: {resolved}")
+    versions: dict[str, str] = {}
+    for line_number, raw in enumerate(
+        resolved.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.count("==") != 1:
+            raise ValueError(f"invalid runtime lock line {line_number}: {raw}")
+        name, version = (part.strip() for part in line.split("==", 1))
+        if not name or not version or name in versions:
+            raise ValueError(f"invalid runtime lock line {line_number}: {raw}")
+        versions[name] = version
+    if set(versions) != RUNTIME_PACKAGES:
+        raise ValueError(
+            "runtime lock package set differs; "
+            f"missing={sorted(RUNTIME_PACKAGES - set(versions))}, "
+            f"extra={sorted(set(versions) - RUNTIME_PACKAGES)}"
+        )
+    return versions
+
+
+def validate_runtime(runtime_lock: Path, hf_home: Path) -> dict[str, Any]:
+    """Validate pinned packages and ChatGLM's dynamic tokenizer on the login node.
+
+    ``pip check`` cannot discover optional imports in model-owned dynamic code.
+    Loading the pinned tokenizer offline makes the missing ``sentencepiece``
+    dependency fail before a scarce GPU allocation enters the queue.
+    """
+
+    expected = parse_runtime_lock(runtime_lock)
+    actual = {"python": ".".join(str(value) for value in sys.version_info[:3])}
+    for name in sorted(RUNTIME_PACKAGES - {"python"}):
+        try:
+            actual[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError as error:
+            raise RuntimeError(f"runtime package is missing: {name}") from error
+    mismatches = {
+        name: {"expected": expected[name], "actual": actual[name]}
+        for name in sorted(expected)
+        if actual[name] != expected[name]
+    }
+    if mismatches:
+        raise RuntimeError(f"runtime lock mismatch: {mismatches}")
+
+    # Import the package explicitly as well as checking its distribution
+    # metadata; a broken native wheel must fail before submission.
+    importlib.import_module("sentencepiece")
+    cache = hf_home.resolve()
+    if not cache.is_dir():
+        raise RuntimeError(f"Hugging Face cache root is missing: {cache}")
+    from huggingface_hub import snapshot_download
+    from transformers import AutoConfig, AutoTokenizer
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    snapshot = Path(snapshot_download(
+        repo_id=CHATGLM_REPO_ID,
+        revision=CHATGLM_REVISION,
+        cache_dir=cache,
+        local_files_only=True,
+    )).resolve()
+    if snapshot.name != CHATGLM_REVISION:
+        raise RuntimeError(f"ChatGLM snapshot revision mismatch: {snapshot}")
+    config = AutoConfig.from_pretrained(
+        snapshot, local_files_only=True, trust_remote_code=True
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        snapshot,
+        local_files_only=True,
+        use_fast=False,
+        trust_remote_code=True,
+    )
+    encoded = tokenizer("DP-LoRA runtime preflight", add_special_tokens=True)
+    if not encoded.get("input_ids"):
+        raise RuntimeError("ChatGLM tokenizer produced no input IDs")
+    model_class = get_class_from_dynamic_module(
+        "modeling_chatglm.ChatGLMForConditionalGeneration",
+        snapshot,
+        local_files_only=True,
+    )
+    return {
+        "status": "VALID",
+        "runtime_lock": str(runtime_lock.resolve()),
+        "runtime_lock_sha256": _sha256_file(runtime_lock.resolve()),
+        "versions": actual,
+        "chatglm_snapshot": str(snapshot),
+        "chatglm_model_type": config.model_type,
+        "chatglm_tokenizer_class": type(tokenizer).__name__,
+        "chatglm_model_class": model_class.__name__,
+        "chatglm_preflight_token_count": len(encoded["input_ids"]),
+    }
 
 
 def load(path: Path, label: str) -> dict[str, Any]:
@@ -250,28 +369,90 @@ def _mean(records: Sequence[Mapping[str, Any]], group: str, key: str) -> float:
     return statistics.fmean(float(record["gradient_groups"][group][key]) for record in records)
 
 
+def evaluation_telemetry_row(
+    identity: Mapping[str, Any], evaluation: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Project the trainer's complete utility diagnostic into campaign CSV."""
+
+    return {
+        **identity,
+        "round": evaluation["round"],
+        "loss": evaluation["loss"],
+        "exp_loss": evaluation["exp_loss"],
+        "records": evaluation["records"],
+        "batches": evaluation["batches"],
+        "objective": evaluation["objective"],
+        "supervised_tokens": evaluation["supervised_tokens"],
+        "correct_tokens": evaluation["correct_tokens"],
+        "token_accuracy": evaluation["token_accuracy"],
+        "token_accuracy_definition": evaluation[
+            "token_accuracy_definition"
+        ],
+    }
+
+
 def collect(
     spec: Mapping[str, Any], campaign_root: Path
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
     value = validate_spec(spec)
     root = campaign_root.resolve()
     slots = int(value["paper_default"]["slaclip_num_slots_for_offline_diagnostics"])
+    paper_exactness = {
+        str(item["id"]): str(item["paper_exactness"])
+        for item in value["domains"]
+    }
     round_rows: list[dict[str, Any]] = []
     client_rows: list[dict[str, Any]] = []
     evaluation_rows: list[dict[str, Any]] = []
+    arm_integrity: list[dict[str, Any]] = []
     for arm in expand_arms(spec):
-        model_root = root / "arms" / arm["arm_id"] / arm["model"]
+        arm_root = root / "arms" / arm["arm_id"]
+        model_root = arm_root / arm["model"]
         final = load(model_root / "final_summary.json", "model final summary")
         if final.get("status") != "COMPLETED":
             raise ValueError(f"incomplete baseline arm: {arm['arm_id']}")
+        run_config = load(arm_root / "run_config.json", "arm run configuration")
+        scientific = run_config.get("scientific_contract")
+        if not isinstance(scientific, dict):
+            raise ValueError(f"missing scientific contract: {arm['arm_id']}")
+        identity = {
+            "privacy_label": "NON_DP_PRIVATE_DIAGNOSTIC",
+            "arm_id": arm["arm_id"],
+            "rng_domain": arm["rng_domain"],
+            "domain": arm["domain"],
+            "domain_paper_exactness": paper_exactness[str(arm["domain"])],
+            "model": arm["model"],
+            "seed": arm["seed"],
+            "method": arm["method"],
+            "run_config_fingerprint": final["run_config_fingerprint"],
+            "repository_sha": scientific["repository_sha"],
+            "input_manifest_sha256": scientific["input_manifest_sha256"],
+            "input_inventory_sha256": scientific["input_inventory_sha256"],
+        }
+        arm_integrity.append({
+            **identity,
+            "model_config_fingerprint": final["model_config_fingerprint"],
+            "client_partition_sha256": final["client_partition_sha256"],
+            "round_shard_prefix_sha256": final["round_shard_prefix_sha256"],
+            "adapter_sha256": final["adapter_sha256"],
+            "adapter_state_sha256": final["adapter_state_sha256"],
+            "adapter_config_sha256": final["adapter_config_sha256"],
+            "base_model_repo_id": final["base_model"]["repo_id"],
+            "base_model_revision": final["base_model"]["revision"],
+            "last_round": final["last_round"],
+            "client_steps": final["client_steps"],
+            "status": final["status"],
+        })
         for evaluation in final.get("evaluations", []):
-            evaluation_rows.append({
-                "privacy_label": "NON_DP_PRIVATE_DIAGNOSTIC",
-                "domain": arm["domain"], "model": arm["model"],
-                "seed": arm["seed"], "round": evaluation["round"],
-                "loss": evaluation["loss"], "exp_loss": evaluation["exp_loss"],
-                "records": evaluation["records"], "objective": evaluation["objective"],
-            })
+            evaluation_rows.append(evaluation_telemetry_row(identity, evaluation))
+        automatic_slots = automatic_num_slots(
+            float(arm["num_clients"]), float(arm["noise_multiplier"])
+        )
         for round_index in range(1, int(arm["rounds"]) + 1):
             shard = load(
                 model_root / "private_diagnostics" / "rounds" / f"round-{round_index:05d}.json",
@@ -302,10 +483,11 @@ def collect(
                 group_summary = summary[group]
                 federated = summary["federated_update"][group]
                 round_rows.append({
-                    "privacy_label": "NON_DP_PRIVATE_DIAGNOSTIC",
-                    "domain": arm["domain"], "model": arm["model"],
-                    "seed": arm["seed"], "round": round_index, "group": group,
-                    "method": arm["method"], "clip_norm_initial": arm["clip_norm"],
+                    **identity,
+                    "round": round_index, "group": group,
+                    "initialization_transient_round": round_index == 1,
+                    "exclude_from_target_calibration_recommended": round_index == 1,
+                    "clip_norm_initial": arm["clip_norm"],
                     "clip_norm_current": arm["clip_norm"], "clip_norm_change": 0.0,
                     "actual_clipped_count": group_summary["clipped_count"],
                     "actual_clipped_fraction": group_summary["clipped_fraction"],
@@ -330,6 +512,11 @@ def collect(
                     "exact_cdf_near_zero_r": exact[-1],
                     "near_zero_adjusted_fraction": stationary["near_zero_adjusted"],
                     "stationary_full_slaclip_beta": stationary["stationary_beta"],
+                    "offline_diagnostic_num_slots": slots,
+                    "automatic_release_num_slots": automatic_slots,
+                    "offline_slots_exceed_automatic_release_bound": (
+                        slots > automatic_slots
+                    ),
                     "predicted_normalized_endpoint_noise_std": endpoint_noise_std,
                     "q_endpoint_signal_to_noise": exact[0] / endpoint_noise_std,
                     "r_endpoint_signal_to_noise": exact[-1] / endpoint_noise_std,
@@ -337,9 +524,10 @@ def collect(
                 for record in records:
                     metrics = record["gradient_groups"][group]
                     client_rows.append({
-                        "privacy_label": "NON_DP_PRIVATE_DIAGNOSTIC",
-                        "domain": arm["domain"], "model": arm["model"],
-                        "seed": arm["seed"], "round": round_index,
+                        **identity,
+                        "round": round_index,
+                        "initialization_transient_round": round_index == 1,
+                        "exclude_from_target_calibration_recommended": round_index == 1,
                         "client": record["client"], "group": group,
                         "clip_norm": metrics["clip_threshold"],
                         "raw_norm": metrics["raw_norm"],
@@ -355,7 +543,7 @@ def collect(
                         "relative_local_update": metrics["relative_local_update"],
                         "loss": record["loss"],
                     })
-    return round_rows, client_rows, evaluation_rows
+    return round_rows, client_rows, evaluation_rows, arm_integrity
 
 
 def write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
@@ -367,6 +555,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     commands = parser.add_subparsers(dest="command", required=True)
     validate = commands.add_parser("validate-spec")
     validate.add_argument("--spec", type=Path, required=True)
+    runtime = commands.add_parser("validate-runtime")
+    runtime.add_argument("--spec", type=Path, required=True)
+    runtime.add_argument("--runtime-lock", type=Path, required=True)
+    runtime.add_argument("--hf-home", type=Path, required=True)
     expand = commands.add_parser("expand")
     expand.add_argument("--spec", type=Path, required=True)
     for name in ("run-smokes", "run-campaign"):
@@ -396,6 +588,15 @@ def main(argv: Sequence[str] | None = None) -> None:
             "arm_count": len(expand_arms(spec)), "full_slaclip": False,
             "slaclip_q": False, "blocked_paper_models": value["blocked_paper_models"],
         }, indent=2, sort_keys=True))
+    elif args.command == "validate-runtime":
+        # Validate the campaign contract first so runtime readiness can never
+        # be reported for a malformed experimental matrix.
+        validate_spec(spec)
+        print(json.dumps(
+            validate_runtime(args.runtime_lock, args.hf_home),
+            indent=2,
+            sort_keys=True,
+        ))
     elif args.command == "expand":
         print(json.dumps({"arms": expand_arms(spec)}, indent=2, sort_keys=True))
     elif args.command in {"run-smokes", "run-campaign"}:
@@ -409,16 +610,42 @@ def main(argv: Sequence[str] | None = None) -> None:
         result = run_smokes(spec, **kwargs) if args.command == "run-smokes" else run_campaign(spec, **kwargs)
         broad._write_json(args.output.resolve(), result)
     elif args.command == "collect":
-        rounds, clients, evaluations = collect(spec, args.campaign_root)
+        validated = validate_spec(spec)
+        rounds, clients, evaluations, arm_integrity = collect(
+            spec, args.campaign_root
+        )
         output = args.output_directory.resolve()
         write_csv(output / "baseline_round_telemetry.csv", rounds)
         write_csv(output / "baseline_client_telemetry.csv", clients)
         write_csv(output / "baseline_evaluation_telemetry.csv", evaluations)
+        integrity_path = output / "baseline_arm_integrity.json"
+        broad._write_json(integrity_path, {
+            "status": "COMPLETE",
+            "spec_sha256": validated["spec_sha256"],
+            "arms": arm_integrity,
+        })
         broad._write_json(output / "baseline_telemetry_manifest.json", {
-            "status": "COMPLETE", "spec_sha256": validate_spec(spec)["spec_sha256"],
+            "status": "COMPLETE", "spec_sha256": validated["spec_sha256"],
             "round_rows": len(rounds), "client_rows": len(clients),
             "evaluation_rows": len(evaluations),
+            "arm_integrity_rows": len(arm_integrity),
+            "arm_integrity_sha256": _sha256_file(integrity_path),
             "privacy_label": "NON_DP_PRIVATE_DIAGNOSTIC",
+            "initialization_transient_policy": (
+                "round 1 is retained but explicitly flagged and should be excluded "
+                "from target calibration because zero-initialized LoRA-B makes the "
+                "companion A-gradient degenerate"
+            ),
+            "offline_slack_diagnostic": {
+                "num_slots": validated["paper_default"][
+                    "slaclip_num_slots_for_offline_diagnostics"
+                ],
+                "controller_semantics": (
+                    "official full-SlaClip two-endpoint equations pinned to "
+                    "ZsyRock/SlaClip@d48b8e07aef33c58a3595ee18b4dccf9c75fa1f3"
+                ),
+                "not_a_dp_release": True,
+            },
         })
 
 

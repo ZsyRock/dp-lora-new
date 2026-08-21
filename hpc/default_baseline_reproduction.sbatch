@@ -24,6 +24,7 @@ minimum_vram_gib="${11:?missing minimum GPU VRAM GiB}"
 
 python_bin="$env_prefix/bin/python"
 campaign="$repository/paper_repro/default_baseline_campaign.py"
+runtime_lock="$repository/environment/paper-repro-runtime.lock"
 step_cpus="${SLURM_CPUS_PER_TASK:-0}"
 
 if [[ "${SLURM_JOB_NUM_NODES:-0}" != 1 || "${SLURM_NTASKS:-0}" != 1 ]]; then
@@ -34,7 +35,7 @@ if [[ ! "$step_cpus" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: invalid CPU allocation: $step_cpus" >&2
     exit 2
 fi
-for path in "$python_bin" "$campaign" "$input_index" "$private_key" "$spec"; do
+for path in "$python_bin" "$campaign" "$runtime_lock" "$input_index" "$private_key" "$spec"; do
     [[ -e "$path" ]] || { echo "ERROR: missing runtime input: $path" >&2; exit 2; }
 done
 if [[ "$(git -C "$repository" rev-parse HEAD)" != "$expected_sha" || -n "$(git -C "$repository" status --porcelain --untracked-files=all)" ]]; then
@@ -80,6 +81,9 @@ if actual < minimum:
 PY
 srun --exact --nodes=1 --ntasks=1 "--cpus-per-task=$step_cpus" \
     "$python_bin" -m pip check
+srun --exact --nodes=1 --ntasks=1 "--cpus-per-task=$step_cpus" \
+    "$python_bin" "$campaign" validate-runtime --spec "$spec" \
+    --runtime-lock "$runtime_lock" --hf-home "$hf_home"
 srun --exact --nodes=1 --ntasks=1 "--cpus-per-task=$step_cpus" \
     "$python_bin" "$campaign" validate-spec --spec "$spec"
 

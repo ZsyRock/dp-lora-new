@@ -22,6 +22,7 @@ input_root="${DPLORA_DEFAULT_INPUT_ROOT:-$scratch_root/datasets/dp-lora-default-
 input_index="${DPLORA_DEFAULT_INPUT_INDEX:-$input_root/input-index.json}"
 worker="$repository/hpc/default_baseline_reproduction.sbatch"
 spec="$repository/hpc/default-baseline-reproduction-spec.json"
+runtime_lock="$repository/environment/paper-repro-runtime.lock"
 run_root="${DPLORA_DEFAULT_RUN_ROOT:-$scratch_root/runs/dp-lora-paper/default-baseline-campaigns}"
 run_id="${DPLORA_DEFAULT_RUN_ID:-default-baselines-$short_sha-$(date -u +%Y%m%dT%H%M%SZ)}"
 campaign_root="$run_root/$run_id"
@@ -37,7 +38,7 @@ host_memory="${DPLORA_DEFAULT_HOST_MEMORY:-200G}"
 walltime="${DPLORA_DEFAULT_WALLTIME:-2-12:00:00}"
 minimum_vram_gib="${DPLORA_DEFAULT_MINIMUM_VRAM_GIB:-75}"
 
-for path in "$repository" "$env_prefix/bin/python" "$hf_home" "$input_index" "$worker" "$spec"; do
+for path in "$repository" "$env_prefix/bin/python" "$hf_home" "$input_index" "$worker" "$spec" "$runtime_lock"; do
     [[ -e "$path" ]] || { echo "ERROR: missing submission input: $path" >&2; exit 2; }
 done
 if [[ "$(git -C "$repository" rev-parse HEAD)" != "$expected_sha" || -n "$(git -C "$repository" status --porcelain --untracked-files=all)" ]]; then
@@ -46,6 +47,11 @@ if [[ "$(git -C "$repository" rev-parse HEAD)" != "$expected_sha" || -n "$(git -
 fi
 "$env_prefix/bin/python" "$repository/paper_repro/default_baseline_campaign.py" \
     validate-spec --spec "$spec" >/dev/null
+"$env_prefix/bin/python" -m pip check
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+    "$env_prefix/bin/python" "$repository/paper_repro/default_baseline_campaign.py" \
+    validate-runtime --spec "$spec" --runtime-lock "$runtime_lock" \
+    --hf-home "$hf_home" >/dev/null
 
 mkdir -p "$campaign_root" "$private_key_root" "$slurm_root"
 chmod 700 "$campaign_root" "$private_key_root" "$slurm_root"

@@ -115,6 +115,45 @@ class FullSlaClipControllerTests(unittest.TestCase):
         self.assertFalse(result["gamma_clamped_low"])
         self.assertFalse(result["gamma_clamped_high"])
 
+    def test_raw_norm_to_controller_matches_pinned_reference_across_c(self) -> None:
+        """Golden end-to-end vector for ZsyRock/SlaClip@d48b8e07."""
+
+        for clip_norm in (0.1, 1.0, 10.0):
+            with self.subTest(clip_norm=clip_norm):
+                norms = [
+                    0.0,
+                    0.02 * clip_norm,
+                    0.25 * clip_norm,
+                    0.75 * clip_norm,
+                    1.2 * clip_norm,
+                ]
+                slots = 5
+                signals = [
+                    build_slack_vector(norm, clip_norm, slots)
+                    for norm in norms
+                ]
+                s_hat = normalize_noisy_slack(
+                    [sum(signal[k] for signal in signals) for k in range(slots)],
+                    clip_norm,
+                    slots,
+                    len(norms),
+                )
+                beta = 0.6
+                eta = 0.1
+                z_t = s_hat[-1] / (clip_norm + 1e-6)
+                gamma_t = max(0.0, min(1.0, 1.0 - beta * (1.0 - z_t)))
+                expected = clip_norm * math.exp(eta * (gamma_t - s_hat[0]))
+                result = full_slaclip_update(
+                    clip_norm,
+                    s_hat[0],
+                    s_hat[-1],
+                    beta=beta,
+                    eta=eta,
+                    min_clip_norm=clip_norm / 100.0,
+                    max_clip_norm=clip_norm * 100.0,
+                )
+                self.assertAlmostEqual(result["next_clip_norm"], expected)
+
     def test_beta_is_a_compatible_alias_for_the_canonical_base_target(self) -> None:
         canonical = self._update()
         alias = full_slaclip_update(

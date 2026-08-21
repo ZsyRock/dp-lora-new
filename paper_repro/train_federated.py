@@ -689,6 +689,8 @@ def package_versions() -> dict[str, str | None]:
         "pyarrow",
         "numpy",
         "safetensors",
+        "opacus",
+        "sentencepiece",
     ):
         try:
             result[name] = importlib.metadata.version(name)
