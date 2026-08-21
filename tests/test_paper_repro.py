@@ -16,6 +16,8 @@ from torch import nn
 from paper_repro.train_federated import (
     accumulate_state,
     acquire_run_lock,
+    apply_legacy_chatglm_config_compat,
+    apply_legacy_tokenizer_padding_compat,
     canonical_adapter_state_sha256,
     clip_noise_and_step,
     equal_record_loss,
@@ -57,6 +59,53 @@ class TinyLoRA(torch.nn.Module):
         self.lora_B = torch.nn.ModuleDict(
             {"default": torch.nn.Linear(1, 2, bias=False)}
         )
+
+
+class TokenizerPaddingCompatibilityTests(unittest.TestCase):
+    def test_legacy_chatglm_config_restores_transformers_427_defaults(self) -> None:
+        class LegacyConfig:
+            pass
+
+        config = LegacyConfig()
+        injected = apply_legacy_chatglm_config_compat(config)
+        self.assertEqual(
+            injected,
+            {"max_length": 20, "use_bfloat16": False, "use_cache": True},
+        )
+        self.assertEqual(config.max_length, 20)
+        self.assertTrue(config.use_cache)
+        self.assertEqual(apply_legacy_chatglm_config_compat(config), {})
+
+    def test_legacy_pad_receives_requested_side_without_persistent_mutation(self) -> None:
+        class LegacyTokenizer:
+            padding_side = "left"
+
+            def _pad(self, encoded_inputs, max_length=None):
+                return {
+                    "encoded_inputs": encoded_inputs,
+                    "max_length": max_length,
+                    "observed_padding_side": self.padding_side,
+                }
+
+        tokenizer = LegacyTokenizer()
+        self.assertTrue(apply_legacy_tokenizer_padding_compat(tokenizer))
+        result = tokenizer._pad(
+            {"input_ids": [1]}, max_length=4, padding_side="right"
+        )
+        self.assertEqual(result["observed_padding_side"], "right")
+        self.assertEqual(tokenizer.padding_side, "left")
+
+    def test_modern_pad_is_not_wrapped(self) -> None:
+        class ModernTokenizer:
+            padding_side = "left"
+
+            def _pad(self, encoded_inputs, padding_side=None):
+                return encoded_inputs, padding_side
+
+        tokenizer = ModernTokenizer()
+        original = tokenizer._pad
+        self.assertFalse(apply_legacy_tokenizer_padding_compat(tokenizer))
+        self.assertEqual(tokenizer._pad, original)
 
 
 def paper_config(*, rounds: int = 3, eval_every: int = 1) -> EffectiveConfig:

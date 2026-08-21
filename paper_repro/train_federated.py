@@ -19,6 +19,7 @@ import fcntl
 import gc
 import hashlib
 import importlib.metadata
+import inspect
 import json
 import math
 import os
@@ -189,6 +190,72 @@ def model_objective(model_kind: str) -> str:
         return str(EXPECTED_MODELS[model_kind]["objective"])
     except KeyError as error:
         raise ValueError(f"unsupported model kind: {model_kind}") from error
+
+
+def apply_legacy_tokenizer_padding_compat(tokenizer: Any) -> bool:
+    """Adapt a pinned legacy tokenizer to Transformers 5's ``_pad`` API.
+
+    ChatGLM2's immutable tokenizer predates the ``padding_side`` keyword now
+    passed by :meth:`PreTrainedTokenizerBase.pad`.  The shim is deliberately
+    instance-local: model-owned source files and their verified hashes remain
+    untouched, and a modern tokenizer is returned unchanged.
+    """
+
+    original_pad = getattr(tokenizer, "_pad", None)
+    if not callable(original_pad):
+        raise RuntimeError("tokenizer does not provide a callable _pad method")
+    parameters = inspect.signature(original_pad).parameters.values()
+    accepts_padding_side = any(
+        parameter.name == "padding_side"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    if accepts_padding_side:
+        setattr(tokenizer, "_dp_lora_padding_compat_applied", False)
+        return False
+
+    def compatible_pad(
+        *args: Any, padding_side: str | None = None, **kwargs: Any
+    ) -> Any:
+        if padding_side is None:
+            return original_pad(*args, **kwargs)
+        if padding_side not in {"left", "right"}:
+            raise ValueError(f"invalid tokenizer padding side: {padding_side}")
+        previous = tokenizer.padding_side
+        tokenizer.padding_side = padding_side
+        try:
+            return original_pad(*args, **kwargs)
+        finally:
+            tokenizer.padding_side = previous
+
+    setattr(tokenizer, "_pad", compatible_pad)
+    setattr(tokenizer, "_dp_lora_padding_compat_applied", True)
+    return True
+
+
+def apply_legacy_chatglm_config_compat(config: Any) -> dict[str, Any]:
+    """Restore attributes supplied by Transformers 4.27's base config.
+
+    The pinned ChatGLM2 snapshot declares Transformers 4.27.1.  Transformers
+    5 removed legacy generation attributes from ``PretrainedConfig`` and no
+    longer preserves the model's ``use_cache`` key on this remote config.
+    Reintroducing the old defaults on the in-memory config preserves the
+    immutable snapshot while making construction semantics explicit.
+    """
+
+    compatibility_values = {
+        "max_length": 20,
+        "use_bfloat16": False,
+        "use_cache": True,
+    }
+    injected: dict[str, Any] = {}
+    for name, value in compatibility_values.items():
+        try:
+            getattr(config, name)
+        except AttributeError:
+            setattr(config, name, value)
+            injected[name] = value
+    return injected
 
 
 def model_seed_offset(model_kind: str) -> int:
@@ -2186,9 +2253,10 @@ def build_model(
     snapshot_path: Path,
     rank: int,
     device: torch.device,
-) -> tuple[torch.nn.Module, Any, list[str]]:
+) -> tuple[torch.nn.Module, Any, list[str], dict[str, Any]]:
     from peft import LoraConfig, TaskType, get_peft_model
     from transformers import (
+        AutoConfig,
         AutoModelForCausalLM,
         AutoModelForMaskedLM,
         AutoTokenizer,
@@ -2203,13 +2271,31 @@ def build_model(
         use_fast=not trust_remote_code,
         trust_remote_code=trust_remote_code,
     )
+    legacy_padding_compat_applied = apply_legacy_tokenizer_padding_compat(
+        tokenizer
+    )
+    model_load_kwargs: dict[str, Any] = {
+        "local_files_only": True,
+        "torch_dtype": torch.float32,
+        "trust_remote_code": trust_remote_code,
+    }
+    injected_config_values: dict[str, Any] = {}
+    if trust_remote_code:
+        model_config = AutoConfig.from_pretrained(
+            snapshot_path,
+            local_files_only=True,
+            trust_remote_code=True,
+        )
+        if model_kind == "chatglm2":
+            injected_config_values = apply_legacy_chatglm_config_compat(
+                model_config
+            )
+        model_load_kwargs["config"] = model_config
     targets = list(spec["target_modules"])
     if objective == "masked_lm":
         base = AutoModelForMaskedLM.from_pretrained(
             snapshot_path,
-            local_files_only=True,
-            torch_dtype=torch.float32,
-            trust_remote_code=trust_remote_code,
+            **model_load_kwargs,
         )
         lora_config = LoraConfig(
             r=rank,
@@ -2228,9 +2314,7 @@ def build_model(
                 raise RuntimeError(f"{model_kind} tokenizer has no usable pad token")
         base = AutoModelForCausalLM.from_pretrained(
             snapshot_path,
-            local_files_only=True,
-            torch_dtype=torch.float32,
-            trust_remote_code=trust_remote_code,
+            **model_load_kwargs,
         )
         base.config.use_cache = False
         lora_config = LoraConfig(
@@ -2245,7 +2329,11 @@ def build_model(
         raise ValueError(f"unsupported model objective: {objective}")
     model = get_peft_model(base, lora_config).to(device)
     model.train()
-    return model, tokenizer, targets
+    return model, tokenizer, targets, {
+        "legacy_padding_api_shim_applied": legacy_padding_compat_applied,
+        "legacy_config_values_injected": injected_config_values,
+        "model_snapshot_modified": False,
+    }
 
 
 def model_snapshot(manifest: dict[str, Any], model_kind: str) -> Path:
@@ -3698,9 +3786,12 @@ def train_one_model(
 
     started = time.monotonic()
     seed_everything(model_seed)
-    model, tokenizer, built_target_modules = build_model(
-        model_kind, snapshot, config.rank, device
-    )
+    (
+        model,
+        tokenizer,
+        built_target_modules,
+        runtime_model_compatibility,
+    ) = build_model(model_kind, snapshot, config.rank, device)
     if sorted(built_target_modules) != sorted(target_modules):
         raise RuntimeError("built LoRA target modules differ from the run contract")
     groups = parameter_groups(model)
@@ -4329,6 +4420,7 @@ def train_one_model(
         "model_config_fingerprint": model_config_fingerprint,
         "model": model_kind,
         "base_model": EXPECTED_MODELS[model_kind],
+        "runtime_model_compatibility": runtime_model_compatibility,
         "snapshot_path": str(snapshot),
         "objective": model_objective(model_kind),
         "target_modules": target_modules,
@@ -5044,6 +5136,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             "thresholds C_A and C_B; each group therefore also receives "
             "Gaussian gradient noise scaled to its own threshold."
         )
+    if "chatglm2" in args.models:
+        assumptions.append(
+            "The immutable ChatGLM2 tokenizer predates the Transformers 5 "
+            "padding_side keyword; an instance-local compatibility shim is "
+            "applied without modifying the pinned model snapshot."
+        )
     if slaclip_contract is not None:
         assert config.method in ADAPTIVE_METHODS
         controller_input = CONTROLLER_INPUT_BY_METHOD[config.method]
@@ -5130,6 +5228,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             "federated_clients_simulated_sequentially": True,
             "client_weighting": "equal_one_over_K",
             "gradient_grouping": "aggregate_batch_gradient_separate_A_and_B",
+            "legacy_tokenizer_padding_compatibility": {
+                "eligible_models": ["chatglm2"],
+                "instance_local": True,
+                "model_snapshot_modified": False,
+            },
             "initial_clip_threshold_by_group": dict(
                 config.clip_norm_by_group
             ),

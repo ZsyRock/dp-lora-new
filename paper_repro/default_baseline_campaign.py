@@ -122,6 +122,16 @@ def validate_runtime(runtime_lock: Path, hf_home: Path) -> dict[str, Any]:
     from huggingface_hub import snapshot_download
     from transformers import AutoConfig, AutoTokenizer
     from transformers.dynamic_module_utils import get_class_from_dynamic_module
+    try:
+        from paper_repro.train_federated import (
+            apply_legacy_chatglm_config_compat,
+            apply_legacy_tokenizer_padding_compat,
+        )
+    except ModuleNotFoundError:  # direct-script execution
+        from train_federated import (  # type: ignore[no-redef]
+            apply_legacy_chatglm_config_compat,
+            apply_legacy_tokenizer_padding_compat,
+        )
 
     snapshot = Path(snapshot_download(
         repo_id=CHATGLM_REPO_ID,
@@ -134,12 +144,14 @@ def validate_runtime(runtime_lock: Path, hf_home: Path) -> dict[str, Any]:
     config = AutoConfig.from_pretrained(
         snapshot, local_files_only=True, trust_remote_code=True
     )
+    injected_config_values = apply_legacy_chatglm_config_compat(config)
     tokenizer = AutoTokenizer.from_pretrained(
         snapshot,
         local_files_only=True,
         use_fast=False,
         trust_remote_code=True,
     )
+    padding_compat_applied = apply_legacy_tokenizer_padding_compat(tokenizer)
     encoded = tokenizer("DP-LoRA runtime preflight", add_special_tokens=True)
     if not encoded.get("input_ids"):
         raise RuntimeError("ChatGLM tokenizer produced no input IDs")
@@ -148,6 +160,28 @@ def validate_runtime(runtime_lock: Path, hf_home: Path) -> dict[str, Any]:
         snapshot,
         local_files_only=True,
     )
+    from accelerate import init_empty_weights
+    from peft import LoraConfig, TaskType, get_peft_model
+
+    with init_empty_weights():
+        base = model_class(config)
+        base.config.use_cache = False
+        model = get_peft_model(base, LoraConfig(
+            r=512,
+            lora_alpha=512,
+            lora_dropout=0.0,
+            bias="none",
+            target_modules=["query_key_value"],
+            task_type=TaskType.CAUSAL_LM,
+        ))
+    lora_tensor_count = sum(
+        "lora_A" in name or "lora_B" in name
+        for name, _ in model.named_parameters()
+    )
+    if lora_tensor_count != 56:
+        raise RuntimeError(
+            f"unexpected ChatGLM LoRA tensor count: {lora_tensor_count}"
+        )
     return {
         "status": "VALID",
         "runtime_lock": str(runtime_lock.resolve()),
@@ -155,8 +189,11 @@ def validate_runtime(runtime_lock: Path, hf_home: Path) -> dict[str, Any]:
         "versions": actual,
         "chatglm_snapshot": str(snapshot),
         "chatglm_model_type": config.model_type,
+        "chatglm_legacy_config_values_injected": injected_config_values,
         "chatglm_tokenizer_class": type(tokenizer).__name__,
+        "chatglm_legacy_padding_compat_applied": padding_compat_applied,
         "chatglm_model_class": model_class.__name__,
+        "chatglm_lora_tensor_count": lora_tensor_count,
         "chatglm_preflight_token_count": len(encoded["input_ids"]),
     }
 
