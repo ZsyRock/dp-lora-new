@@ -1268,7 +1268,15 @@ class ParquetTextTable:
             table = pq.read_table(path, columns=["src", "tgt"])
             if table.column_names != ["src", "tgt"]:
                 raise RuntimeError(f"unexpected Parquet schema in {path}")
-            tables.append(table)
+            # Arrow's regular UTF-8 type uses signed 32-bit offsets. A
+            # multi-file corpus can exceed that 2 GiB logical-text limit even
+            # when a later ``take`` selects only a small batch, because the
+            # compute kernel may first concatenate the input chunks. Promote
+            # the offsets without changing any text bytes or row ordering.
+            tables.append(table.cast(pa.schema([
+                pa.field("src", pa.large_string()),
+                pa.field("tgt", pa.large_string()),
+            ])))
         self._pa = pa
         self._table = pa.concat_tables(tables).combine_chunks()
         if text_format not in {

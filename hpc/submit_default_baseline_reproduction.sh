@@ -34,8 +34,8 @@ account="${DPLORA_DEFAULT_ACCOUNT:-normal}"
 partition="${DPLORA_DEFAULT_PARTITION:-a100}"
 gres="${DPLORA_DEFAULT_GRES:-gpu:a100:1}"
 cpus="${DPLORA_DEFAULT_CPUS:-8}"
-host_memory="${DPLORA_DEFAULT_HOST_MEMORY:-200G}"
-walltime="${DPLORA_DEFAULT_WALLTIME:-2-12:00:00}"
+host_memory="${DPLORA_DEFAULT_HOST_MEMORY:-80G}"
+walltime="${DPLORA_DEFAULT_WALLTIME:-24:00:00}"
 minimum_vram_gib="${DPLORA_DEFAULT_MINIMUM_VRAM_GIB:-75}"
 
 for path in "$repository" "$env_prefix/bin/python" "$hf_home" "$input_index" "$worker" "$spec" "$runtime_lock"; do

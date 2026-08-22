@@ -30,6 +30,7 @@ from paper_repro.train_federated import (
     parameter_groups,
     parse_args,
     partition_indices,
+    ParquetTextTable,
     load_data_protocol,
     round_update_statistics,
     supervised_token_prediction_counts,
@@ -1551,6 +1552,33 @@ class PaperReproTests(unittest.TestCase):
                 RuntimeError, "dataset references do not exactly match"
             ):
                 validate_input_manifest(manifest_path)
+
+    def test_parquet_text_offsets_are_promoted_without_changing_rows(self) -> None:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        with tempfile.TemporaryDirectory() as root:
+            paths = []
+            expected = [("alpha", "one"), ("beta", "two"), ("gamma", "three")]
+            for index, rows in enumerate((expected[:2], expected[2:])):
+                path = Path(root) / f"part-{index}.parquet"
+                pq.write_table(pa.table({
+                    "src": [row[0] for row in rows],
+                    "tgt": [row[1] for row in rows],
+                }), path)
+                paths.append(path)
+            table = ParquetTextTable(paths, text_format="plain_text")
+            self.assertTrue(
+                pa.types.is_large_string(table._table.schema.field("src").type)
+            )
+            self.assertTrue(
+                pa.types.is_large_string(table._table.schema.field("tgt").type)
+            )
+            self.assertEqual(
+                table.texts(np.arange(len(expected))),
+                [f"{source}\n{target}" for source, target in expected],
+            )
+            self.assertEqual(len(table.content_keys([2, 0])), 2)
 
     def test_holdout_excludes_all_normalized_content_duplicates(self) -> None:
         import pyarrow as pa

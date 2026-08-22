@@ -10,6 +10,7 @@ from paper_repro.default_baseline_campaign import (
     evaluation_telemetry_row,
     expand_arms,
     parse_runtime_lock,
+    smoke_arms,
     validate_spec,
 )
 
@@ -41,6 +42,19 @@ def test_llama_blocker_and_no_slaclip_are_explicit() -> None:
     assert set(spec["blocked_paper_models"]) == {"llama2"}
     assert spec["scientific_boundary"]["full_slaclip_run"] is False
     assert spec["scientific_boundary"]["slaclip_q_run"] is False
+
+
+def test_smokes_cover_every_model_domain_and_worst_memory_pair() -> None:
+    arms = smoke_arms(value())
+    assert len(arms) == 5
+    assert {(arm["domain"], arm["model"]) for arm in arms} == {
+        ("meddialog", "bert"),
+        ("meddialog", "gpt2"),
+        ("meddialog", "chatglm2"),
+        ("slimpajama", "chatglm2"),
+        ("finance", "chatglm2"),
+    }
+    assert {arm["seed"] for arm in arms} == {1200}
 
 
 def test_default_hyperparameter_drift_fails_closed() -> None:
@@ -84,3 +98,5 @@ def test_submission_validates_dynamic_runtime_before_queueing() -> None:
     assert "validate-runtime" in submit
     assert "validate-runtime" in worker
     assert "paper-repro-runtime.lock" in submit
+    assert 'DPLORA_DEFAULT_HOST_MEMORY:-80G' in submit
+    assert 'DPLORA_DEFAULT_WALLTIME:-24:00:00' in submit

@@ -410,15 +410,32 @@ def _run_arms(
     }
 
 
-def run_smokes(spec: Mapping[str, Any], **kwargs: Any) -> dict[str, Any]:
+def smoke_arms(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Cover every model and domain before starting the formal matrix."""
+
     all_arms = expand_arms(spec)
-    selected = []
-    for model in validate_spec(spec)["models"]:
+    value = validate_spec(spec)
+    selected: list[dict[str, Any]] = []
+    for model in value["models"]:
         selected.append(next(
             arm for arm in all_arms
             if arm["domain"] == "meddialog" and arm["model"] == model
         ))
-    return _run_arms(spec, arms=selected, smoke=True, **kwargs)
+    # ChatGLM2 is the largest staged model. Pairing it with every additional
+    # domain gates both input loading and the worst host/GPU-memory combination
+    # while keeping all checks inside the user's single allocation.
+    for domain in value["domains"]:
+        if domain["id"] == "meddialog":
+            continue
+        selected.append(next(
+            arm for arm in all_arms
+            if arm["domain"] == domain["id"] and arm["model"] == "chatglm2"
+        ))
+    return selected
+
+
+def run_smokes(spec: Mapping[str, Any], **kwargs: Any) -> dict[str, Any]:
+    return _run_arms(spec, arms=smoke_arms(spec), smoke=True, **kwargs)
 
 
 def run_campaign(spec: Mapping[str, Any], **kwargs: Any) -> dict[str, Any]:
