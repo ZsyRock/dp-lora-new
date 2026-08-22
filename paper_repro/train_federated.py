@@ -258,6 +258,50 @@ def apply_legacy_chatglm_config_compat(config: Any) -> dict[str, Any]:
     return injected
 
 
+def apply_legacy_transformers_tied_weights_compat(
+    model_class: type[Any], config: Any
+) -> bool:
+    """Supply Transformers 5 tied-weight metadata for pinned ChatGLM2.
+
+    ChatGLM2's immutable Transformers-4.27 remote class never creates the new
+    ``all_tied_weights_keys`` mapping.  Transformers 5 unconditionally reads
+    it after loading checkpoints.  The pinned config explicitly disables word
+    embedding tying and the legacy class declares no tied-weight mapping, so
+    an empty in-memory class mapping is the exact compatible representation.
+    Fail closed if either premise changes instead of guessing a mapping.
+    """
+
+    marker = "_dp_lora_legacy_tied_weights_compat_applied"
+    existing = getattr(model_class, "all_tied_weights_keys", None)
+    if existing is not None:
+        if not isinstance(existing, dict):
+            raise RuntimeError("model class tied-weight metadata is not a mapping")
+        if getattr(model_class, marker, False):
+            if getattr(config, "tie_word_embeddings", None) is not False:
+                raise RuntimeError(
+                    "legacy tied-weight compatibility requires "
+                    "tie_word_embeddings=false"
+                )
+            legacy = getattr(model_class, "_tied_weights_keys", None)
+            if legacy not in (None, {}):
+                raise RuntimeError(
+                    "legacy model declares tied weights; an empty mapping is unsafe"
+                )
+        return False
+    if getattr(config, "tie_word_embeddings", None) is not False:
+        raise RuntimeError(
+            "legacy tied-weight compatibility requires tie_word_embeddings=false"
+        )
+    legacy = getattr(model_class, "_tied_weights_keys", None)
+    if legacy not in (None, {}):
+        raise RuntimeError(
+            "legacy model declares tied weights; an empty mapping is unsafe"
+        )
+    setattr(model_class, "all_tied_weights_keys", {})
+    setattr(model_class, marker, True)
+    return True
+
+
 def model_seed_offset(model_kind: str) -> int:
     try:
         return int(EXPECTED_MODELS[model_kind]["seed_offset"])
@@ -2261,6 +2305,7 @@ def build_model(
         AutoModelForMaskedLM,
         AutoTokenizer,
     )
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
     spec = EXPECTED_MODELS[model_kind]
     objective = model_objective(model_kind)
@@ -2280,6 +2325,8 @@ def build_model(
         "trust_remote_code": trust_remote_code,
     }
     injected_config_values: dict[str, Any] = {}
+    legacy_tied_weights_compat_applied = False
+    remote_model_class: type[Any] | None = None
     if trust_remote_code:
         model_config = AutoConfig.from_pretrained(
             snapshot_path,
@@ -2289,6 +2336,26 @@ def build_model(
         if model_kind == "chatglm2":
             injected_config_values = apply_legacy_chatglm_config_compat(
                 model_config
+            )
+            auto_map = getattr(model_config, "auto_map", None)
+            class_reference = (
+                auto_map.get("AutoModelForCausalLM")
+                if isinstance(auto_map, dict)
+                else None
+            )
+            if not isinstance(class_reference, str) or not class_reference:
+                raise RuntimeError(
+                    "ChatGLM config lacks its pinned AutoModelForCausalLM class"
+                )
+            remote_model_class = get_class_from_dynamic_module(
+                class_reference,
+                snapshot_path,
+                local_files_only=True,
+            )
+            legacy_tied_weights_compat_applied = (
+                apply_legacy_transformers_tied_weights_compat(
+                    remote_model_class, model_config
+                )
             )
         model_load_kwargs["config"] = model_config
     targets = list(spec["target_modules"])
@@ -2312,10 +2379,18 @@ def build_model(
                 tokenizer.pad_token = tokenizer.unk_token
             else:
                 raise RuntimeError(f"{model_kind} tokenizer has no usable pad token")
-        base = AutoModelForCausalLM.from_pretrained(
-            snapshot_path,
-            **model_load_kwargs,
-        )
+        if remote_model_class is None:
+            base = AutoModelForCausalLM.from_pretrained(
+                snapshot_path,
+                **model_load_kwargs,
+            )
+        else:
+            direct_load_kwargs = dict(model_load_kwargs)
+            direct_load_kwargs.pop("trust_remote_code", None)
+            base = remote_model_class.from_pretrained(
+                snapshot_path,
+                **direct_load_kwargs,
+            )
         base.config.use_cache = False
         lora_config = LoraConfig(
             r=rank,
@@ -2332,6 +2407,10 @@ def build_model(
     return model, tokenizer, targets, {
         "legacy_padding_api_shim_applied": legacy_padding_compat_applied,
         "legacy_config_values_injected": injected_config_values,
+        "legacy_tied_weights_metadata_shim_applied": (
+            legacy_tied_weights_compat_applied
+        ),
+        "loaded_model_class": type(base).__name__,
         "model_snapshot_modified": False,
     }
 
@@ -5142,6 +5221,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             "padding_side keyword; an instance-local compatibility shim is "
             "applied without modifying the pinned model snapshot."
         )
+        assumptions.append(
+            "The immutable ChatGLM2 remote model predates Transformers 5 tied-"
+            "weight metadata; because the pinned config disables embedding "
+            "tying, an empty mapping is attached to its in-memory dynamic "
+            "class without modifying the pinned model snapshot."
+        )
     if slaclip_contract is not None:
         assert config.method in ADAPTIVE_METHODS
         controller_input = CONTROLLER_INPUT_BY_METHOD[config.method]
@@ -5231,6 +5316,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             "legacy_tokenizer_padding_compatibility": {
                 "eligible_models": ["chatglm2"],
                 "instance_local": True,
+                "model_snapshot_modified": False,
+            },
+            "legacy_model_tied_weights_compatibility": {
+                "eligible_models": ["chatglm2"],
+                "dynamic_class_in_memory_only": True,
+                "requires_tie_word_embeddings_false": True,
+                "requires_no_legacy_tied_weight_mapping": True,
                 "model_snapshot_modified": False,
             },
             "initial_clip_threshold_by_group": dict(

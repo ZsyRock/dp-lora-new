@@ -126,11 +126,13 @@ def validate_runtime(runtime_lock: Path, hf_home: Path) -> dict[str, Any]:
         from paper_repro.train_federated import (
             apply_legacy_chatglm_config_compat,
             apply_legacy_tokenizer_padding_compat,
+            apply_legacy_transformers_tied_weights_compat,
         )
     except ModuleNotFoundError:  # direct-script execution
         from train_federated import (  # type: ignore[no-redef]
             apply_legacy_chatglm_config_compat,
             apply_legacy_tokenizer_padding_compat,
+            apply_legacy_transformers_tied_weights_compat,
         )
 
     snapshot = Path(snapshot_download(
@@ -160,11 +162,27 @@ def validate_runtime(runtime_lock: Path, hf_home: Path) -> dict[str, Any]:
         snapshot,
         local_files_only=True,
     )
+    tied_weights_compat_applied = (
+        apply_legacy_transformers_tied_weights_compat(model_class, config)
+    )
     from accelerate import init_empty_weights
     from peft import LoraConfig, TaskType, get_peft_model
+    import torch
 
     with init_empty_weights():
-        base = model_class(config)
+        # Exercise Transformers 5's actual post-load finalizer without reading
+        # or materializing the 6B checkpoint on the login node.  The prior
+        # constructor-only check could not detect missing tied-weight metadata.
+        base = model_class.from_pretrained(
+            None,
+            config=config,
+            state_dict={},
+            torch_dtype=torch.float32,
+        )
+        tied_weights = getattr(base, "all_tied_weights_keys", None)
+        if not isinstance(tied_weights, dict):
+            raise RuntimeError("ChatGLM post-init tied-weight metadata is absent")
+        base.mark_tied_weights_as_initialized()
         base.config.use_cache = False
         model = get_peft_model(base, LoraConfig(
             r=512,
@@ -192,6 +210,11 @@ def validate_runtime(runtime_lock: Path, hf_home: Path) -> dict[str, Any]:
         "chatglm_legacy_config_values_injected": injected_config_values,
         "chatglm_tokenizer_class": type(tokenizer).__name__,
         "chatglm_legacy_padding_compat_applied": padding_compat_applied,
+        "chatglm_legacy_tied_weights_compat_applied": (
+            tied_weights_compat_applied
+        ),
+        "chatglm_tied_weight_key_count": len(tied_weights),
+        "chatglm_state_dict_free_load_finalizer_passed": True,
         "chatglm_model_class": model_class.__name__,
         "chatglm_lora_tensor_count": lora_tensor_count,
         "chatglm_preflight_token_count": len(encoded["input_ids"]),

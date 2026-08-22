@@ -18,6 +18,7 @@ from paper_repro.train_federated import (
     acquire_run_lock,
     apply_legacy_chatglm_config_compat,
     apply_legacy_tokenizer_padding_compat,
+    apply_legacy_transformers_tied_weights_compat,
     canonical_adapter_state_sha256,
     clip_noise_and_step,
     equal_record_loss,
@@ -106,6 +107,85 @@ class TokenizerPaddingCompatibilityTests(unittest.TestCase):
         original = tokenizer._pad
         self.assertFalse(apply_legacy_tokenizer_padding_compat(tokenizer))
         self.assertEqual(tokenizer._pad, original)
+
+    def test_legacy_model_gets_empty_tied_mapping_when_tying_is_disabled(self) -> None:
+        class LegacyModel:
+            _tied_weights_keys = None
+
+        class Config:
+            tie_word_embeddings = False
+
+        self.assertTrue(
+            apply_legacy_transformers_tied_weights_compat(LegacyModel, Config())
+        )
+        self.assertEqual(LegacyModel.all_tied_weights_keys, {})
+        self.assertFalse(
+            apply_legacy_transformers_tied_weights_compat(LegacyModel, Config())
+        )
+
+    def test_legacy_tied_mapping_refuses_enabled_embedding_tying(self) -> None:
+        class LegacyModel:
+            _tied_weights_keys = None
+
+        class Config:
+            tie_word_embeddings = True
+
+        with self.assertRaisesRegex(RuntimeError, "tie_word_embeddings=false"):
+            apply_legacy_transformers_tied_weights_compat(LegacyModel, Config())
+
+    def test_existing_tied_mapping_is_not_overwritten(self) -> None:
+        class ModernModel:
+            all_tied_weights_keys = {"target": "source"}
+
+        class Config:
+            tie_word_embeddings = True
+
+        self.assertFalse(
+            apply_legacy_transformers_tied_weights_compat(ModernModel, Config())
+        )
+        self.assertEqual(
+            ModernModel.all_tied_weights_keys, {"target": "source"}
+        )
+
+    def test_installed_empty_mapping_still_fails_closed_for_new_config(self) -> None:
+        class LegacyModel:
+            _tied_weights_keys = None
+
+        class UntiedConfig:
+            tie_word_embeddings = False
+
+        class TiedConfig:
+            tie_word_embeddings = True
+
+        self.assertTrue(
+            apply_legacy_transformers_tied_weights_compat(
+                LegacyModel, UntiedConfig()
+            )
+        )
+        with self.assertRaisesRegex(RuntimeError, "tie_word_embeddings=false"):
+            apply_legacy_transformers_tied_weights_compat(
+                LegacyModel, TiedConfig()
+            )
+
+    def test_non_mapping_tied_metadata_is_rejected(self) -> None:
+        class BrokenModel:
+            all_tied_weights_keys = []
+
+        class Config:
+            tie_word_embeddings = False
+
+        with self.assertRaisesRegex(RuntimeError, "is not a mapping"):
+            apply_legacy_transformers_tied_weights_compat(BrokenModel, Config())
+
+    def test_nonempty_legacy_tied_metadata_is_rejected(self) -> None:
+        class LegacyModel:
+            _tied_weights_keys = ["output.weight"]
+
+        class Config:
+            tie_word_embeddings = False
+
+        with self.assertRaisesRegex(RuntimeError, "empty mapping is unsafe"):
+            apply_legacy_transformers_tied_weights_compat(LegacyModel, Config())
 
 
 def paper_config(*, rounds: int = 3, eval_every: int = 1) -> EffectiveConfig:
