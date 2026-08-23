@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "campaign_name": "paper_default_baseline_groupwise_fixed_followup_v1",
+  "description": "Development-only strong groupwise fixed-C screen derived from the completed 27-arm paper-default baseline. No adaptive controller and no SlaClip method is executable in this campaign.",
+  "expected_arm_count": 180,
+  "source_calibration": {
+    "round_min": 2,
+    "round_max": 10,
+    "groups": ["A", "B"],
+    "raw_norm_quantiles": [0.05, 0.2, 0.5],
+    "anchor_clip_norm_by_group": {"A": 10.0, "B": 10.0},
+    "source_privacy_label": "NON_DP_PRIVATE_DIAGNOSTIC"
+  },
+  "development": {
+    "domains": ["meddialog", "slimpajama", "finance"],
+    "models": ["bert", "gpt2", "chatglm2"],
+    "seeds": [1300, 1301],
+    "top_k_per_setting": 3,
+    "selection_rule": [
+      "lowest_mean_final_internal_validation_loss",
+      "lowest_mean_normalized_internal_validation_loss_auc",
+      "lowest_final_loss_sample_std",
+      "lowest_groupwise_noise_scale_l2",
+      "smaller_C_A",
+      "smaller_C_B"
+    ]
+  },
+  "paper_defaults": {
+    "method": "paper_dp_lora",
+    "num_clients": 5,
+    "rounds": 50,
+    "batch_size": 8,
+    "noise_multiplier": 2.0,
+    "learning_rate": 0.0005,
+    "rank": 512,
+    "max_seq_length": 128,
+    "max_validation_records": 512,
+    "eval_every": 10,
+    "checkpoint_every": 10,
+    "data_split_seed": 1729,
+    "evaluation_seed": 2718,
+    "delta": 0.00001
+  },
+  "scientific_boundary": {
+    "analysis_role": "development_only_groupwise_fixed_comparator_discovery",
+    "full_slaclip_run": false,
+    "slaclip_q_run": false,
+    "adaptive_threshold_run": false,
+    "confirmation_data_used": false,
+    "external_test_set_used": false,
+    "paper_result_reproduced": false,
+    "end_to_end_dp_certified": false,
+    "single_allocation": true,
+    "nested_sbatch_or_array": false,
+    "all_candidates_reported": true
+  }
+}
