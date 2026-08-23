@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "campaign_name": "identified_full_slaclip_gpt2_n128_v1",
+  "description": "Hash-locked downstream GPT-2 campaign: select one eligible baseline-followup domain, re-screen all ten predeclared fixed groupwise thresholds at N=128, calibrate five Full SlaClip profiles, and independently confirm against the strongest screened fixed comparator.",
+  "expected_stage_arm_counts": {
+    "fixed_screen": 20,
+    "profile_development": 10,
+    "confirmation": 12,
+    "total": 42
+  },
+  "upstream": {
+    "required_slurm_job_id": "1425084",
+    "campaign_name": "paper_default_baseline_groupwise_fixed_followup_v1",
+    "repository_sha": "fcfbc490f664c64e4463c501cc0631a599f2cb25",
+    "expected_arm_count": 180,
+    "expected_setting_count": 9,
+    "eligible_model": "gpt2",
+    "domain_order": ["meddialog", "slimpajama", "finance"],
+    "candidate_policy": "a_domain_is_eligible_when_at_least_one_of_its_ten_ranked_fixed_candidates_passes_both_group_gates;_use_the_highest_upstream_ranked_eligible_candidate_only_for_domain_ranking_evidence"
+  },
+  "common": {
+    "model": "gpt2",
+    "num_clients": 128,
+    "rounds": 50,
+    "batch_size": 8,
+    "noise_multiplier": 2.0,
+    "learning_rate": 0.0005,
+    "rank": 512,
+    "max_seq_length": 128,
+    "max_validation_records": 512,
+    "eval_every": 10,
+    "checkpoint_every": 10,
+    "data_split_seed": 1729,
+    "evaluation_seed": 2718,
+    "delta": 0.00001,
+    "slaclip_num_slots": 5,
+    "automatic_num_slots_upper_bound": 5,
+    "theoretical_normalized_endpoint_noise_std": 0.39528470752104744,
+    "slaclip_eta": 0.05,
+    "slaclip_c_min": 0.025,
+    "slaclip_c_max": 50.0,
+    "slaclip_endpoint_epsilon": 0.000001
+  },
+  "eligibility": {
+    "groups": ["A", "B"],
+    "calibration_round_min": 2,
+    "calibration_round_max": 50,
+    "quantiles": [0.1, 0.9],
+    "hard_rate_floor": 0.05,
+    "hard_rate_ceiling": 0.85,
+    "minimum_robust_interval_width": 0.2,
+    "minimum_distinct_pooled_hard_rate_strata": 5,
+    "maximum_fully_clipped_round_fraction": 0.2,
+    "maximum_mean_hard_clipped_fraction": 0.9,
+    "minimum_remaining_non_small_gradient_mass": 0.1,
+    "require_positive_cross_seed_overlap": true,
+    "require_beta_identifiable": true,
+    "require_box_constraint_feasible": true,
+    "require_beta_strictly_inside_bounds": true,
+    "profile_interpolation_positions": [0.0, 0.25, 0.5, 0.75, 1.0],
+    "domain_selection_rule": [
+      "largest_minimum_group_robust_interval_width",
+      "smallest_maximum_group_fully_clipped_round_fraction",
+      "largest_minimum_group_distinct_hard_rate_strata",
+      "largest_minimum_group_P10_remaining_mass",
+      "lowest_upstream_rank_of_first_eligible_candidate",
+      "lowest_upstream_mean_final_loss",
+      "preregistered_domain_order"
+    ]
+  },
+  "fixed_screen": {
+    "seeds": [1400, 1401],
+    "candidate_policy": "all_ten_hash_locked_upstream_groupwise_fixed_profiles",
+    "strongest_screened_fixed_selection_rule": [
+      "lowest_mean_final_internal_validation_loss",
+      "lowest_mean_normalized_internal_validation_loss_auc",
+      "lowest_final_loss_sample_std",
+      "lowest_groupwise_noise_scale_l2",
+      "smaller_C_A",
+      "smaller_C_B"
+    ],
+    "calibration_C0_policy": "highest_best_of_10_screened_fixed_rank_that_repasses_all_N128_per_group_eligibility_and_five_profile_beta_feasibility_gates"
+  },
+  "profile_development": {
+    "seeds": [1400, 1401],
+    "profile_count": 5,
+    "eta": 0.05,
+    "initial_C_policy": "N128_locked_calibration_C0",
+    "comparison_policy": "pair_each_profile_with_the_existing_same_seed_strongest_screened_fixed_C_star_arm_using_a_shared_sample_supervision_and_standard_Gaussian_noise_schedule;_evaluate_rounds_2_to_50_hard_target_error_per_seed_without_cross_seed_cancellation",
+    "selection_rule": [
+      "feasible_beta_and_maximum_absolute_per_seed_both_group_target_error_at_most_0.15",
+      "lowest_mean_paired_final_validation_loss_delta_vs_strongest_screened_fixed_C_star",
+      "lowest_mean_paired_normalized_loss_auc_delta_vs_strongest_screened_fixed_C_star",
+      "fewest_controller_instability_events",
+      "lower_profile_index"
+    ],
+    "hard_target_absolute_tolerance": 0.15
+  },
+  "confirmation": {
+    "seeds": [1500, 1501, 1502, 1503, 1504, 1505],
+    "methods": ["paper_dp_lora", "slaclip_dp_lora"],
+    "primary_metric": "paired_final_internal_validation_loss_delta_SlaClip_minus_fixed",
+    "secondary_metric": "paired_normalized_internal_validation_loss_auc_delta_SlaClip_minus_fixed",
+    "alpha": 0.05,
+    "minimum_wins": 6,
+    "mechanism_rounds": [2, 50],
+    "mechanism_mean_abs_error_tolerance": 0.15,
+    "mechanism_seed_abs_error_tolerance": 0.2,
+    "mechanism_minimum_passing_seeds_per_group": 5,
+    "overall_positive_claim_rule": "utility_success_gate_AND_mechanism_validity_gate",
+    "success_gate": [
+      "mean_final_loss_delta_below_zero",
+      "paired_two_sided_95pct_CI_upper_below_zero",
+      "exact_two_sided_magnitude_preserving_sign_flip_p_below_0.05",
+      "6_of_6_final_loss_wins",
+      "mean_normalized_loss_auc_delta_not_positive",
+      "mean_final_token_accuracy_delta_not_negative"
+    ]
+  },
+  "scientific_boundary": {
+    "full_slaclip_only": true,
+    "desired_hard_clip_rate_is_distinct_from_beta_and_dynamic_target": true,
+    "beta_source_is_per_group_only": true,
+    "any_group_clipped_fraction_never_used_for_beta": true,
+    "cdf_reconstruction_evidence_role": "descriptive_NON_DP_exact_vs_noisy_telemetry_without_accuracy_gate",
+    "private_diagnostic_label": "NON_DP_PRIVATE_DIAGNOSTIC",
+    "external_test_set_used": false,
+    "paper_result_reproduced": false,
+    "end_to_end_dp_certified": false,
+    "single_allocation": true,
+    "nested_sbatch_or_array": false,
+    "all_arms_sequential": true,
+    "comparator_scope": "strongest_screened_fixed_C_star_is_best_of_10_predeclared_groupwise_candidates_not_a_global_optimum"
+  }
+}
