@@ -547,7 +547,9 @@ def test_single_allocation_wrapper_resources_dependency_and_test_only_boundary()
     assert "sbatch " not in executable_worker.lower()
     assert "--array" not in worker
     assert "--signal=B:USR1@300" in submitter
-    assert '--dependency="afterok:$dependency_job_id"' in submitter
+    assert 'upstream_job_record="$(' in submitter
+    assert 'upstream_job=verified_completed:$dependency_job_id:0:0' in submitter
+    assert '--dependency=' not in submitter
     assert 'gres="${DPLORA_IDENTIFIED_GRES:-gpu:a100:1}"' in submitter
     assert 'host_memory="${DPLORA_IDENTIFIED_HOST_MEMORY:-80G}"' in submitter
     assert 'walltime="${DPLORA_IDENTIFIED_WALLTIME:-24:00:00}"' in submitter

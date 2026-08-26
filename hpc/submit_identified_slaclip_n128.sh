@@ -12,7 +12,7 @@ while [[ $# -gt 0 ]]; do
         --dependency-job-id)
             [[ $# -ge 2 ]] || { echo "ERROR: --dependency-job-id needs a value" >&2; exit 2; }
             dependency_job_id="$2"; shift 2 ;;
-        *) echo "usage: $0 [--test-only] [--resume (requires DPLORA_IDENTIFIED_RUN_ID)] [--dependency-job-id 1425084]" >&2; exit 2 ;;
+        *) echo "usage: $0 [--test-only] [--resume (requires DPLORA_IDENTIFIED_RUN_ID)] [--dependency-job-id 1425084 (verified complete, not reattached)]" >&2; exit 2 ;;
     esac
 done
 if [[ "$test_only" -eq 1 && "$resume" -eq 1 ]]; then
@@ -20,7 +20,15 @@ if [[ "$test_only" -eq 1 && "$resume" -eq 1 ]]; then
     exit 2
 fi
 if [[ ! "$dependency_job_id" =~ ^[1-9][0-9]*$ || "$dependency_job_id" != "1425084" ]]; then
-    echo "ERROR: this preregistration requires afterok dependency on job 1425084" >&2
+    echo "ERROR: this preregistration requires completed upstream job 1425084" >&2
+    exit 2
+fi
+upstream_job_record="$(
+    sacct -X -n -P -j "$dependency_job_id" --format=JobIDRaw,State,ExitCode |
+        awk -F'|' -v expected="$dependency_job_id" '$1 == expected {print $2 "|" $3; exit}'
+)"
+if [[ "$upstream_job_record" != "COMPLETED|0:0" ]]; then
+    echo "ERROR: upstream job $dependency_job_id is not COMPLETED with exit 0:0: ${upstream_job_record:-missing}" >&2
     exit 2
 fi
 
@@ -147,7 +155,7 @@ sbatch_args=(
     --parsable --account="$account" --partition="$partition" --qos="$qos"
     --nodes=1 --ntasks=1 --cpus-per-task="$cpus"
     --gres="$gres" --mem="$host_memory" --time="$walltime"
-    --signal=B:USR1@300 --dependency="afterok:$dependency_job_id"
+    --signal=B:USR1@300
     --job-name=dp-lora-id-n128 --output="$output_path" --error="$error_path"
     --export=NONE
 )
@@ -157,7 +165,7 @@ if [[ -n "$exclude_nodes" ]]; then sbatch_args+=(--exclude="$exclude_nodes"); fi
 echo "repository=$repository"
 echo "repository_sha=$expected_sha"
 echo "upstream_campaign=$upstream_root"
-echo "dependency=afterok:$dependency_job_id"
+echo "upstream_job=verified_completed:$dependency_job_id:0:0"
 echo "campaign_root=$campaign_root"
 echo "critical_results_backup=$backup_root"
 echo "resources=account:$account qos:$qos partition:$partition gres:$gres cpus:$cpus mem:$host_memory time:$walltime signal:USR1@300 exclude:${exclude_nodes:-none}"
