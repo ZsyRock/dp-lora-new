@@ -69,6 +69,7 @@ cpus="${DPLORA_IDENTIFIED_CPUS:-8}"
 host_memory="${DPLORA_IDENTIFIED_HOST_MEMORY:-80G}"
 walltime="${DPLORA_IDENTIFIED_WALLTIME:-24:00:00}"
 minimum_vram_gib="${DPLORA_IDENTIFIED_MINIMUM_VRAM_GIB:-75}"
+exclude_nodes="${DPLORA_IDENTIFIED_EXCLUDE_NODES:-}"
 
 for path in \
     "$repository" "$env_prefix/bin/python" "$hf_home" "$upstream_root" \
@@ -94,6 +95,10 @@ if [[ "$account" != "normal" || "$partition" != "a100" || "$qos" != "normal" || 
 fi
 if [[ ! "$cpus" =~ ^[1-9][0-9]*$ || "$cpus" -gt 12 ]]; then
     echo "ERROR: CPUs must be between 1 and 12" >&2
+    exit 2
+fi
+if [[ -n "$exclude_nodes" && ! "$exclude_nodes" =~ ^[A-Za-z0-9][A-Za-z0-9,._-]*$ ]]; then
+    echo "ERROR: unsafe Slurm node exclusion list: $exclude_nodes" >&2
     exit 2
 fi
 
@@ -147,6 +152,7 @@ sbatch_args=(
     --export=NONE
 )
 if [[ "$test_only" -eq 1 ]]; then sbatch_args+=(--test-only); fi
+if [[ -n "$exclude_nodes" ]]; then sbatch_args+=(--exclude="$exclude_nodes"); fi
 
 echo "repository=$repository"
 echo "repository_sha=$expected_sha"
@@ -154,7 +160,7 @@ echo "upstream_campaign=$upstream_root"
 echo "dependency=afterok:$dependency_job_id"
 echo "campaign_root=$campaign_root"
 echo "critical_results_backup=$backup_root"
-echo "resources=account:$account qos:$qos partition:$partition gres:$gres cpus:$cpus mem:$host_memory time:$walltime signal:USR1@300"
+echo "resources=account:$account qos:$qos partition:$partition gres:$gres cpus:$cpus mem:$host_memory time:$walltime signal:USR1@300 exclude:${exclude_nodes:-none}"
 
 sbatch "${sbatch_args[@]}" "$worker" \
     "$repository" "$expected_sha" "$env_prefix" "$scratch_root" "$hf_home" \

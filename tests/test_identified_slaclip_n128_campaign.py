@@ -551,6 +551,8 @@ def test_single_allocation_wrapper_resources_dependency_and_test_only_boundary()
     assert 'gres="${DPLORA_IDENTIFIED_GRES:-gpu:a100:1}"' in submitter
     assert 'host_memory="${DPLORA_IDENTIFIED_HOST_MEMORY:-80G}"' in submitter
     assert 'walltime="${DPLORA_IDENTIFIED_WALLTIME:-24:00:00}"' in submitter
+    assert 'exclude_nodes="${DPLORA_IDENTIFIED_EXCLUDE_NODES:-}"' in submitter
+    assert 'sbatch_args+=(--exclude="$exclude_nodes")' in submitter
     assert "Prospective paths only" in submitter
     assert "do not create a campaign directory" in submitter
     assert submitter.count('sbatch "${sbatch_args[@]}" "$worker"') == 1
