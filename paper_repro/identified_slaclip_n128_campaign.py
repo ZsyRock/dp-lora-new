@@ -95,6 +95,7 @@ def load_spec(path: Path) -> dict[str, Any]:
         spec,
         {
             "schema_version", "campaign_name", "description",
+            "protocol_amendment",
             "expected_stage_arm_counts", "upstream", "common", "eligibility",
             "fixed_screen", "profile_development", "confirmation",
             "scientific_boundary",
@@ -103,6 +104,29 @@ def load_spec(path: Path) -> dict[str, Any]:
     )
     if spec["schema_version"] != SCHEMA_VERSION or spec["expected_stage_arm_counts"] != EXPECTED_COUNTS:
         raise ValueError("identified N128 schema/counts differ")
+
+    amendment = spec["protocol_amendment"]
+    _exact_keys(
+        amendment,
+        {
+            "reason", "failed_job_id",
+            "n128_training_arms_observed_before_amendment",
+            "canonical_full_slaclip_controller_changed",
+            "selection_or_outcome_rule_changed", "amended_behavior",
+            "amendment_scope",
+        },
+        "protocol amendment",
+    )
+    if (
+        spec.get("campaign_name") != "identified_full_slaclip_gpt2_n128_v2"
+        or amendment.get("failed_job_id") != "1425569"
+        or amendment.get("n128_training_arms_observed_before_amendment") != 0
+        or amendment.get("canonical_full_slaclip_controller_changed") is not False
+        or amendment.get("selection_or_outcome_rule_changed") is not False
+        or amendment.get("amendment_scope")
+        != "eligibility_control_flow_and_audit_telemetry_only"
+    ):
+        raise ValueError("protocol amendment differs")
 
     upstream = spec["upstream"]
     _exact_keys(
@@ -174,6 +198,8 @@ def load_spec(path: Path) -> dict[str, Any]:
             "require_positive_cross_seed_overlap", "require_beta_identifiable",
             "require_box_constraint_feasible",
             "require_beta_strictly_inside_bounds",
+            "require_all_exact_endpoint_z_in_unit_interval",
+            "invalid_exact_endpoint_z_policy",
             "profile_interpolation_positions", "domain_selection_rule",
         },
         "eligibility preregistration",
@@ -200,10 +226,13 @@ def load_spec(path: Path) -> dict[str, Any]:
         or eligibility.get("maximum_mean_hard_clipped_fraction") != 0.9
         or eligibility.get("minimum_remaining_non_small_gradient_mass") != 0.1
         or eligibility.get("profile_interpolation_positions") != [0.0, 0.25, 0.5, 0.75, 1.0]
+        or eligibility.get("invalid_exact_endpoint_z_policy")
+        != "mark_candidate_ineligible_and_continue_without_beta_calibration"
         or eligibility.get("domain_selection_rule") != expected_domain_rule
         or any(eligibility.get(name) is not True for name in (
             "require_positive_cross_seed_overlap", "require_beta_identifiable",
             "require_box_constraint_feasible", "require_beta_strictly_inside_bounds",
+            "require_all_exact_endpoint_z_in_unit_interval",
         ))
     ):
         raise ValueError("eligibility preregistration differs")
@@ -303,6 +332,7 @@ def load_spec(path: Path) -> dict[str, Any]:
         boundary,
         {
             "full_slaclip_only",
+            "canonical_full_slaclip_endpoint_formula",
             "desired_hard_clip_rate_is_distinct_from_beta_and_dynamic_target",
             "beta_source_is_per_group_only",
             "any_group_clipped_fraction_never_used_for_beta",
@@ -316,6 +346,8 @@ def load_spec(path: Path) -> dict[str, Any]:
     )
     if (
         boundary.get("full_slaclip_only") is not True
+        or boundary.get("canonical_full_slaclip_endpoint_formula")
+        != "z_t=normalized_slack_endpoint_K/(C_t+1e-6)"
         or boundary.get("desired_hard_clip_rate_is_distinct_from_beta_and_dynamic_target") is not True
         or boundary.get("beta_source_is_per_group_only") is not True
         or boundary.get("any_group_clipped_fraction_never_used_for_beta") is not True
@@ -446,8 +478,7 @@ def _fixed_trajectory_rows(
                     threshold, slots, len(norms),
                 )
                 raw_z = float(exact[-1]) / (threshold + epsilon)
-                if not -1e-12 <= raw_z <= 1.0 + 1e-12:
-                    raise RuntimeError("exact endpoint z lies outside its domain")
+                endpoint_domain_valid = -1e-12 <= raw_z <= 1.0 + 1e-12
                 z_value = min(1.0, max(0.0, raw_z))
                 surrogate = min(1.0, max(0.0, 1.0 - float(exact[0])))
                 rows.append({
@@ -457,7 +488,10 @@ def _fixed_trajectory_rows(
                     "actual_clipped_fraction": actual,
                     "exact_q_endpoint_1": float(exact[0]),
                     "exact_r_endpoint_K": float(exact[-1]),
+                    "raw_z_r_over_C_plus_epsilon": raw_z,
                     "z_r_over_C_plus_epsilon": z_value,
+                    "exact_endpoint_z_in_unit_interval": endpoint_domain_valid,
+                    "z_runtime_clamped": z_value != raw_z,
                     "remaining_non_small_gradient_fraction": 1.0 - z_value,
                     "stationary_surrogate_target_clipped": surrogate,
                     "hard_minus_stationary_surrogate_target": actual - surrogate,
@@ -506,12 +540,21 @@ def assess_fixed_eligibility(
         distinct = len(set(actual))
         fully_fraction = sum(value == 1.0 for value in actual) / len(actual)
         mean_hard = statistics.fmean(actual)
+        raw_z_values = [
+            float(row["raw_z_r_over_C_plus_epsilon"]) for row in subset
+        ]
+        endpoint_domain_violation_count = sum(
+            not bool(row["exact_endpoint_z_in_unit_interval"]) for row in subset
+        )
+        all_endpoints_in_domain = endpoint_domain_violation_count == 0
         remaining_p10 = float(staged._linear_quantile(
             [float(row["remaining_non_small_gradient_fraction"]) for row in subset], 0.1
         ))
         profiles: list[dict[str, Any]] = []
         calibration_error: str | None = None
-        if robust_lower <= robust_upper:
+        if not all_endpoints_in_domain:
+            calibration_error = "exact_endpoint_z_outside_unit_interval"
+        elif robust_lower <= robust_upper:
             for position in positions:
                 desired = robust_lower + position * (robust_upper - robust_lower)
                 try:
@@ -536,6 +579,7 @@ def assess_fixed_eligibility(
             "fully_clipped_round_fraction_below_0p20": fully_fraction < float(policy["maximum_fully_clipped_round_fraction"]),
             "positive_cross_seed_overlap": robust_lower < robust_upper,
             "P10_remaining_non_small_gradient_mass_above_0p10": remaining_p10 > float(policy["minimum_remaining_non_small_gradient_mass"]),
+            "all_exact_endpoint_z_in_unit_interval": all_endpoints_in_domain,
             "all_five_betas_identifiable_feasible_and_non_bound": beta_feasible,
         }
         groups[group] = {
@@ -546,6 +590,8 @@ def assess_fixed_eligibility(
             "robust_width": robust_width, "mean_hard_clipped_fraction": mean_hard,
             "distinct_pooled_hard_rate_strata": distinct,
             "fully_clipped_round_fraction": fully_fraction,
+            "raw_z_min": min(raw_z_values), "raw_z_max": max(raw_z_values),
+            "exact_endpoint_domain_violation_count": endpoint_domain_violation_count,
             "P10_remaining_non_small_gradient_mass": remaining_p10,
             "profiles": profiles, "calibration_error": calibration_error,
             "gates": gates, "eligible": all(gates.values()),
@@ -747,6 +793,9 @@ def derive_upstream_eligibility(
                     "robust_width": evidence["robust_width"],
                     "distinct_hard_rate_strata": evidence["distinct_pooled_hard_rate_strata"],
                     "fully_clipped_round_fraction": evidence["fully_clipped_round_fraction"],
+                    "raw_z_min": evidence["raw_z_min"],
+                    "raw_z_max": evidence["raw_z_max"],
+                    "exact_endpoint_domain_violation_count": evidence["exact_endpoint_domain_violation_count"],
                     "P10_remaining_non_small_gradient_mass": evidence["P10_remaining_non_small_gradient_mass"],
                 })
         eligible_candidates = [record for record in candidates if record["eligibility"]["eligible"]]

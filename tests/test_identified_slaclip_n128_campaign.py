@@ -29,6 +29,8 @@ def _eligible_rows() -> list[dict[str, float | int | str]]:
                 rows.append({
                     "seed": seed, "round": round_index, "group": group,
                     "actual_clipped_fraction": hard,
+                    "raw_z_r_over_C_plus_epsilon": 0.2,
+                    "exact_endpoint_z_in_unit_interval": True,
                     "remaining_non_small_gradient_fraction": 0.8,
                     "stationary_surrogate_target_clipped": hard * 0.5,
                 })
@@ -145,6 +147,63 @@ def test_eligibility_rejects_fully_clipped_or_no_cross_seed_overlap() -> None:
     result = campaign.assess_fixed_eligibility(rows, [1300, 1301], spec)
     assert result["eligible"] is False
     assert result["groups"]["B"]["gates"]["fully_clipped_round_fraction_below_0p20"] is False
+
+
+def test_endpoint_domain_violation_rejects_only_that_candidate_fail_closed() -> None:
+    spec = campaign.load_spec(SPEC)
+    rows = _eligible_rows()
+    rows[0]["raw_z_r_over_C_plus_epsilon"] = 1.25
+    rows[0]["exact_endpoint_z_in_unit_interval"] = False
+    rows[0]["remaining_non_small_gradient_fraction"] = 0.0
+    result = campaign.assess_fixed_eligibility(rows, [1300, 1301], spec)
+    evidence = result["groups"][str(rows[0]["group"])]
+    assert result["eligible"] is False
+    assert evidence["exact_endpoint_domain_violation_count"] == 1
+    assert evidence["gates"]["all_exact_endpoint_z_in_unit_interval"] is False
+    assert evidence["calibration_error"] == "exact_endpoint_z_outside_unit_interval"
+    assert evidence["profiles"] == []
+
+
+def test_fixed_trajectory_audits_out_of_domain_endpoint_without_aborting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_load(path: Path, _label: str) -> dict:
+        round_index = int(path.stem.split("-")[-1])
+        records = [
+            {
+                "gradient_groups": {
+                    group: {
+                        "raw_norm": 0.0,
+                        "clip_threshold": 0.5,
+                        "noise_std_per_coordinate": 1.0,
+                    }
+                    for group in campaign.GROUPS
+                }
+            }
+            for _ in range(2)
+        ]
+        return {
+            "round": round_index, "model": "gpt2",
+            "method": campaign.FIXED_METHOD, "client_records": records,
+            "round_summary": {
+                group: {"clipped_fraction": 0.0} for group in campaign.GROUPS
+            },
+        }
+
+    monkeypatch.setattr(full, "load_object", fake_load)
+    arm = {
+        "arm_id": "source", "model": "gpt2", "models": ["gpt2"],
+        "method": campaign.FIXED_METHOD, "seed": 1300, "rounds": 50,
+        "num_clients": 2, "noise_multiplier": 2.0,
+        "initial_clip_norm_by_group": {"A": 0.5, "B": 0.5},
+    }
+    rows = campaign._fixed_trajectory_rows(
+        tmp_path, [arm], slots=5, epsilon=1e-6, round_min=2, round_max=50
+    )
+    assert len(rows) == 49 * 2
+    assert all(row["raw_z_r_over_C_plus_epsilon"] > 1.0 for row in rows)
+    assert all(row["exact_endpoint_z_in_unit_interval"] is False for row in rows)
+    assert all(row["z_r_over_C_plus_epsilon"] == 1.0 for row in rows)
 
 
 def test_calibration_trajectory_excludes_gpt2_round_one(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

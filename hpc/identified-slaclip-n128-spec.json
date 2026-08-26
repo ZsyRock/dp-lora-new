@@ -1,7 +1,16 @@
 {
   "schema_version": 1,
-  "campaign_name": "identified_full_slaclip_gpt2_n128_v1",
-  "description": "Hash-locked downstream GPT-2 campaign: select one eligible baseline-followup domain, re-screen all ten predeclared fixed groupwise thresholds at N=128, calibrate five Full SlaClip profiles, and independently confirm against the strongest screened fixed comparator.",
+  "campaign_name": "identified_full_slaclip_gpt2_n128_v2",
+  "description": "Hash-locked downstream GPT-2 campaign: select one eligible baseline-followup domain, re-screen all ten predeclared fixed groupwise thresholds at N=128, calibrate five Full SlaClip profiles, and independently confirm against the strongest screened fixed comparator. Version 2 records the pre-training eligibility-control-flow amendment after failed job 1425569.",
+  "protocol_amendment": {
+    "reason": "Job 1425569 exposed an implementation-only fail-fast bug while validating an ineligible development candidate before any N128 training arm started.",
+    "failed_job_id": "1425569",
+    "n128_training_arms_observed_before_amendment": 0,
+    "canonical_full_slaclip_controller_changed": false,
+    "selection_or_outcome_rule_changed": false,
+    "amended_behavior": "An exact endpoint z outside its unit-interval interpretation makes only that fixed candidate ineligible; the preregistered scan continues over the remaining candidates.",
+    "amendment_scope": "eligibility_control_flow_and_audit_telemetry_only"
+  },
   "expected_stage_arm_counts": {
     "fixed_screen": 20,
     "profile_development": 10,
@@ -57,6 +66,8 @@
     "require_beta_identifiable": true,
     "require_box_constraint_feasible": true,
     "require_beta_strictly_inside_bounds": true,
+    "require_all_exact_endpoint_z_in_unit_interval": true,
+    "invalid_exact_endpoint_z_policy": "mark_candidate_ineligible_and_continue_without_beta_calibration",
     "profile_interpolation_positions": [0.0, 0.25, 0.5, 0.75, 1.0],
     "domain_selection_rule": [
       "largest_minimum_group_robust_interval_width",
@@ -119,6 +130,7 @@
   },
   "scientific_boundary": {
     "full_slaclip_only": true,
+    "canonical_full_slaclip_endpoint_formula": "z_t=normalized_slack_endpoint_K/(C_t+1e-6)",
     "desired_hard_clip_rate_is_distinct_from_beta_and_dynamic_target": true,
     "beta_source_is_per_group_only": true,
     "any_group_clipped_fraction_never_used_for_beta": true,
